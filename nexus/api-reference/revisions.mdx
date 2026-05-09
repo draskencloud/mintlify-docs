@@ -1,0 +1,85 @@
+---
+title: Revisions
+description: Configure backend upstreams and traffic routing per revision.
+---
+
+## List Revisions
+
+<ParamField query="GET /api/v1/apps/:app_id/versions/:version_id/revisions" />
+
+```bash
+curl http://localhost:9090/api/v1/apps/payments/versions/{version_id}/revisions \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+---
+
+## Create Revision
+
+<ParamField query="POST /api/v1/apps/:app_id/versions/:version_id/revisions" />
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps/payments/versions/{version_id}/revisions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  -d '{
+    "revision": "r1",
+    "backend_scheme": "https",
+    "backend_host": "api.internal.example.com",
+    "backend_port": 443,
+    "backend_base_path": "/",
+    "strip_gateway_path": true,
+    "traffic_weight": 100,
+    "health_check_path": "/health"
+  }'
+```
+
+**Body Parameters**
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `revision` | required | Revision label |
+| `backend_scheme` | `https` | `http` or `https` |
+| `backend_host` | required | Upstream hostname |
+| `backend_port` | `443` | Upstream port |
+| `backend_base_path` | `/` | Path prefix prepended to upstream requests |
+| `strip_gateway_path` | `true` | Strip version gateway_path before forwarding |
+| `traffic_weight` | `100` | Relative weight for weighted routing |
+| `health_check_path` | — | Path for circuit breaker health probe |
+| `default_policy` | — | Policy for all requests through this revision |
+
+---
+
+## Get Revision
+
+<ParamField query="GET /api/v1/apps/:app_id/versions/:version_id/revisions/:revision_id" />
+
+---
+
+## Update Revision
+
+<ParamField query="PATCH /api/v1/apps/:app_id/versions/:version_id/revisions/:revision_id" />
+
+```bash
+curl -X PATCH .../revisions/{id} \
+  -d '{"traffic_weight": 10}'
+```
+
+---
+
+## Activate Revision
+
+<ParamField query="POST /api/v1/apps/:app_id/versions/:version_id/revisions/:revision_id/activate" />
+
+Marks this revision as `is_current: true`, making it eligible to receive traffic.
+
+```bash
+curl -X POST .../revisions/{id}/activate \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+---
+
+## Delete Revision
+
+<ParamField query="DELETE /api/v1/apps/:app_id/versions/:version_id/revisions/:revision_id" />

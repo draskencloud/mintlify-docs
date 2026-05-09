@@ -1,0 +1,97 @@
+---
+title: Audit Logging
+description: Structured audit trail for every request through the gateway.
+---
+
+Nexus maintains a structured audit log of all requests. By default, audit records are stored in the database. Configure forwarders to ship them to external systems.
+
+## Enable Audit Logging
+
+Audit logging is always-on. Configure forwarders to send records externally:
+
+```bash
+GATEWAY_AUDIT__BUFFER_SIZE=10000
+GATEWAY_AUDIT__BATCH_SIZE=500
+GATEWAY_AUDIT__FLUSH_INTERVAL_MS=5000
+GATEWAY_AUDIT__RETRY_MAX_ATTEMPTS=3
+```
+
+## Query Audit Logs
+
+```bash
+curl http://localhost:9090/api/v1/audit \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+## Forwarder Types
+
+### File
+
+```toml
+[[audit.forwarders]]
+name = "file"
+type = "file"
+enabled = true
+path = "logs/audit.jsonl"
+max_mb = 200
+max_days = 30
+compress = false
+event_types = []  # empty = all event types
+```
+
+### Webhook / SIEM
+
+```toml
+[[audit.forwarders]]
+name = "siem"
+type = "webhook"
+enabled = true
+url = "https://siem.example.com/ingest"
+timeout_secs = 10
+event_types = ["security", "auth_failure"]
+
+[audit.forwarders.headers]
+Authorization = "Bearer siem-token"
+```
+
+### PostgreSQL
+
+```toml
+[[audit.forwarders]]
+name = "postgres"
+type = "postgres"
+enabled = true
+event_types = []
+batch_size = 500
+flush_interval_ms = 5000
+```
+
+## Logging Pipeline
+
+Enable request/response logging in addition to audit:
+
+```bash
+GATEWAY_LOGGING__ENABLED=true
+GATEWAY_LOGGING__SLOW_REQUEST_THRESHOLD_MS=1000  # log slow requests
+```
+
+### Log Types
+
+| Type | Variable | Default |
+|------|----------|---------|
+| Access logs | `GATEWAY_LOGGING__TYPES__ACCESS` | `true` |
+| Audit logs | `GATEWAY_LOGGING__TYPES__AUDIT` | `true` |
+| Error logs | `GATEWAY_LOGGING__TYPES__ERROR` | `true` |
+| Security events | `GATEWAY_LOGGING__TYPES__SECURITY` | `true` |
+| Policy events | `GATEWAY_LOGGING__TYPES__POLICY` | `true` |
+| Health checks | `GATEWAY_LOGGING__TYPES__HEALTH` | `true` |
+| Cache events | `GATEWAY_LOGGING__TYPES__CACHE` | `false` |
+| Slow requests | `GATEWAY_LOGGING__TYPES__SLOW_REQUEST` | `true` |
+
+## Dead Letter
+
+When forwarding fails after all retries, records are written to the dead-letter file:
+
+```bash
+GATEWAY_AUDIT__DEAD_LETTER_PATH=logs/audit_dead_letter.jsonl
+```

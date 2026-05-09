@@ -1,0 +1,66 @@
+---
+title: Metrics
+description: Prometheus-compatible metrics exposed by Nexus.
+---
+
+Nexus exposes Prometheus metrics at `/metrics` on the management port (`9090`).
+
+## Scrape Endpoint
+
+```
+GET http://localhost:9090/metrics
+```
+
+No authentication is required for the metrics endpoint.
+
+## Prometheus Configuration
+
+Add Nexus as a scrape target:
+
+```yaml
+scrape_configs:
+  - job_name: nexus
+    static_configs:
+      - targets: ["nexus:9090"]
+```
+
+In Kubernetes, use a `ServiceMonitor` if you have the Prometheus Operator:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: nexus
+  namespace: drasken-infra-dev
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nexus
+  endpoints:
+    - port: mgmt
+      path: /metrics
+      interval: 30s
+```
+
+## Key Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `gateway_requests_total` | Counter | Total proxy requests by app, version, status |
+| `gateway_request_duration_seconds` | Histogram | Request latency distribution |
+| `gateway_upstream_errors_total` | Counter | Backend errors by revision |
+| `gateway_circuit_breaker_state` | Gauge | Circuit state per revision (0=closed, 1=open, 2=half-open) |
+| `gateway_cache_hits_total` | Counter | Cache hit count |
+| `gateway_cache_misses_total` | Counter | Cache miss count |
+| `gateway_rate_limit_hits_total` | Counter | Rate limit rejections |
+| `gateway_auth_failures_total` | Counter | Auth failures by type |
+| `gateway_uptime_seconds` | Gauge | Process uptime |
+
+## Grafana Dashboard
+
+Import the dashboard using the Prometheus datasource. Key panels to build:
+
+- Request rate by app (`rate(gateway_requests_total[5m])`)
+- P99 latency (`histogram_quantile(0.99, gateway_request_duration_seconds_bucket)`)
+- Error rate (`rate(gateway_upstream_errors_total[5m])`)
+- Circuit breaker state (`gateway_circuit_breaker_state`)

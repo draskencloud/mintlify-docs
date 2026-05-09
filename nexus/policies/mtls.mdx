@@ -1,0 +1,69 @@
+---
+title: mTLS (Mutual TLS)
+description: Secure backend connections with mutual TLS certificate authentication.
+---
+
+Nexus supports mTLS for connections to backend services. Configure named mTLS profiles via environment variables, then reference them in revision policies.
+
+## Configure a Profile
+
+Set the following environment variables (replace `MYPROFILE` with your profile name):
+
+```bash
+GATEWAY_MTLS_PROFILE_MYPROFILE_CERT_PATH=/certs/client.crt
+GATEWAY_MTLS_PROFILE_MYPROFILE_KEY_PATH=/certs/client.key
+GATEWAY_MTLS_PROFILE_MYPROFILE_CA_PATH=/certs/ca.crt
+```
+
+Multiple profiles are supported by using different profile names.
+
+## Reference in a Revision
+
+```bash
+curl -X POST .../revisions \
+  -d '{
+    "revision": "r1",
+    "backend_scheme": "https",
+    "backend_host": "secure-api.internal",
+    "backend_port": 443,
+    "default_policy": {
+      "auth": {
+        "backend_mtls_profile": "myprofile"
+      }
+    }
+  }'
+```
+
+## Kubernetes Setup
+
+Mount the certificates as a Kubernetes secret:
+
+```bash
+kubectl create secret generic nexus-mtls-certs \
+  --from-file=client.crt=./client.crt \
+  --from-file=client.key=./client.key \
+  --from-file=ca.crt=./ca.crt \
+  -n drasken-infra-dev
+```
+
+Reference in the Helm values:
+
+```yaml
+extraEnv:
+  - name: GATEWAY_MTLS_PROFILE_MYPROFILE_CERT_PATH
+    value: /certs/client.crt
+  - name: GATEWAY_MTLS_PROFILE_MYPROFILE_KEY_PATH
+    value: /certs/client.key
+  - name: GATEWAY_MTLS_PROFILE_MYPROFILE_CA_PATH
+    value: /certs/ca.crt
+
+extraVolumes:
+  - name: mtls-certs
+    secret:
+      secretName: nexus-mtls-certs
+
+extraVolumeMounts:
+  - name: mtls-certs
+    mountPath: /certs
+    readOnly: true
+```

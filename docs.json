@@ -42,11 +42,37 @@
             ]
           },
           {
+            "group": "Backends",
+            "pages": [
+              "nexus/backends/versions-revisions",
+              "nexus/backends/endpoints"
+            ]
+          },
+          {
             "group": "Authentication",
             "pages": [
               "nexus/auth/overview",
               "nexus/auth/sso-jwt",
               "nexus/auth/api-keys"
+            ]
+          },
+          {
+            "group": "Policies",
+            "pages": [
+              "nexus/policies/rate-limiting",
+              "nexus/policies/cors",
+              "nexus/policies/ip-filtering",
+              "nexus/policies/circuit-breaker",
+              "nexus/policies/response-caching",
+              "nexus/policies/header-injection",
+              "nexus/policies/mtls"
+            ]
+          },
+          {
+            "group": "Observability",
+            "pages": [
+              "nexus/observability/metrics",
+              "nexus/observability/audit-logging"
             ]
           }
         ]
@@ -58,6 +84,27 @@
             "group": "Overview",
             "pages": [
               "nexus/api-reference/introduction"
+            ]
+          },
+          {
+            "group": "Apps",
+            "pages": [
+              "nexus/api-reference/apps",
+              "nexus/api-reference/tokens"
+            ]
+          },
+          {
+            "group": "Versions & Revisions",
+            "pages": [
+              "nexus/api-reference/versions",
+              "nexus/api-reference/revisions",
+              "nexus/api-reference/endpoints"
+            ]
+          },
+          {
+            "group": "System",
+            "pages": [
+              "nexus/api-reference/system"
             ]
           }
         ]

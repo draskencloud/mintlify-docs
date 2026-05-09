@@ -1,0 +1,58 @@
+---
+title: IP Filtering
+description: Restrict access by IP address using allowlists or denylists.
+---
+
+IP filtering is applied before rate limiting. Configure it via the `ip_filter` field in any policy.
+
+## Allowlist (only listed CIDRs pass)
+
+```json
+{
+  "ip_filter": {
+    "mode": "allow",
+    "cidrs": ["10.0.0.0/8", "192.168.1.50/32"]
+  }
+}
+```
+
+All requests from IPs not in the list receive `403 Forbidden`.
+
+## Denylist (listed CIDRs are blocked)
+
+```json
+{
+  "ip_filter": {
+    "mode": "deny",
+    "cidrs": ["198.51.100.0/24"]
+  }
+}
+```
+
+## Fields
+
+| Field | Description |
+|-------|-------------|
+| `mode` | `allow` — only listed CIDRs pass. `deny` — listed CIDRs are blocked |
+| `cidrs` | List of CIDR ranges (IPv4 or IPv6) |
+
+## Apply to an App
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps \
+  -d '{
+    "name": "Internal API",
+    "slug": "internal-api",
+    "gateway_path": "/internal",
+    "default_policy": {
+      "ip_filter": {
+        "mode": "allow",
+        "cidrs": ["10.0.0.0/8", "172.16.0.0/12"]
+      }
+    }
+  }'
+```
+
+<Note>
+  When Nexus is behind a load balancer or Kubernetes ingress, set `GATEWAY_TRUSTED_PROXY_IPS` so the real client IP is extracted from `X-Forwarded-For` rather than the proxy IP.
+</Note>

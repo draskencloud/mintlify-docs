@@ -1,0 +1,102 @@
+---
+title: Rate Limiting
+description: Control request rates per app, version, revision, or endpoint.
+---
+
+Rate limiting is configured via the `rate_limit` field in any policy. It applies after authentication and before proxying.
+
+## Basic Configuration
+
+```json
+{
+  "rate_limit": {
+    "enabled": true,
+    "requests": 1000,
+    "window_seconds": 60,
+    "algorithm": "fixed_window"
+  }
+}
+```
+
+## Fields
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `false` | Enable rate limiting |
+| `requests` | — | Maximum requests allowed per window |
+| `window_seconds` | — | Window duration in seconds |
+| `algorithm` | `fixed_window` | Algorithm to use (see below) |
+
+## Algorithms
+
+| Algorithm | Description |
+|-----------|-------------|
+| `fixed_window` | Resets the counter at fixed intervals. Fast, simple, but allows bursts at window boundaries |
+| `sliding_window` | Smooths out bursts by tracking a rolling time window |
+| `token_bucket` | Allows short bursts up to a capacity, then enforces a steady refill rate |
+
+## Applying at Different Levels
+
+### App-level (applies to all requests)
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps \
+  -d '{
+    "name": "My API",
+    "slug": "my-api",
+    "gateway_path": "/my-api",
+    "default_policy": {
+      "rate_limit": {
+        "enabled": true,
+        "requests": 5000,
+        "window_seconds": 60
+      }
+    }
+  }'
+```
+
+### Endpoint-level override (stricter on a specific route)
+
+```json
+{
+  "policy_override": {
+    "rate_limit": {
+      "enabled": true,
+      "requests": 10,
+      "window_seconds": 60,
+      "algorithm": "sliding_window"
+    }
+  }
+}
+```
+
+## Global Rate Limit
+
+A global default can be set via environment variables:
+
+```bash
+GATEWAY_RATE_LIMIT_REQUESTS=1000
+GATEWAY_RATE_LIMIT_WINDOW_SECS=60
+```
+
+## Per-IP Rate Limiting
+
+Enable per-IP rate limiting globally:
+
+```bash
+GATEWAY_PER_IP_RATE_LIMIT_ENABLED=true
+GATEWAY_PER_IP_RATE_LIMIT_REQUESTS=100
+GATEWAY_PER_IP_RATE_LIMIT_WINDOW_SECS=60
+GATEWAY_TRUSTED_PROXY_IPS=10.0.0.1,10.0.0.2
+```
+
+Set `GATEWAY_TRUSTED_PROXY_IPS` when behind a load balancer so the real client IP is extracted from `X-Forwarded-For`.
+
+## Rate Limit Response
+
+When a client exceeds the limit, the gateway returns:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 60
+```

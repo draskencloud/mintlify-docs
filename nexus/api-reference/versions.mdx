@@ -1,0 +1,65 @@
+---
+title: Versions
+description: Manage public API versions for an app.
+---
+
+## List Versions
+
+<ParamField query="GET /api/v1/apps/:app_id/versions" />
+
+```bash
+curl http://localhost:9090/api/v1/apps/payments/versions \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+---
+
+## Create Version
+
+<ParamField query="POST /api/v1/apps/:app_id/versions" />
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps/payments/versions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  -d '{
+    "version": "v1",
+    "gateway_path": "/payments/v1"
+  }'
+```
+
+**Body Parameters**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `version` | Yes | Version label (e.g. `v1`, `v2`, `2026-01`) |
+| `gateway_path` | No | Full mount path. Auto-derived as `<app_path>/<version>` if omitted |
+
+---
+
+## Get Version
+
+<ParamField query="GET /api/v1/apps/:app_id/versions/:version_id" />
+
+---
+
+## Update Version Status
+
+<ParamField query="PATCH /api/v1/apps/:app_id/versions/:version_id" />
+
+```bash
+curl -X PATCH http://localhost:9090/api/v1/apps/payments/versions/{id} \
+  -d '{"status": "deprecated"}'
+```
+
+| Status | Effect |
+|--------|--------|
+| `active` | Normal traffic |
+| `deprecated` | Traffic allowed, deprecation warning logged |
+| `retired` | Returns `410 Gone` |
+
+---
+
+## Delete Version
+
+<ParamField query="DELETE /api/v1/apps/:app_id/versions/:version_id" />

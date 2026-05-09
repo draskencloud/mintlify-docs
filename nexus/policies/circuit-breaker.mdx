@@ -1,0 +1,61 @@
+---
+title: Circuit Breaker
+description: Automatic failure detection and recovery for backend services.
+---
+
+The circuit breaker monitors backend health per revision and stops forwarding requests to unhealthy backends automatically.
+
+## States
+
+```
+CLOSED → (failures ≥ threshold) → OPEN → (timeout elapsed) → HALF-OPEN → (success) → CLOSED
+                                                                          → (failure) → OPEN
+```
+
+| State | Behaviour |
+|-------|-----------|
+| `closed` | Normal operation — requests flow through |
+| `open` | Backend is unhealthy — requests immediately return `503` |
+| `half_open` | One probe request is allowed through to test recovery |
+
+## Configuration
+
+Set globally via environment variables:
+
+```bash
+GATEWAY_CIRCUIT_BREAKER__THRESHOLD=5      # failures before opening
+GATEWAY_CIRCUIT_BREAKER__TIMEOUT_SECS=30  # seconds before attempting half-open
+```
+
+## Health Probe
+
+Set a `health_check_path` on a revision to enable active health probing:
+
+```bash
+curl -X POST .../revisions \
+  -d '{
+    "revision": "r1",
+    "backend_host": "api.internal.example.com",
+    "health_check_path": "/health"
+  }'
+```
+
+The gateway probes `GET <backend>/<health_check_path>` on the interval set by `GATEWAY_HEALTH__INTERVAL_SECS` (default `30`).
+
+## Viewing Circuit State
+
+The current circuit state is returned on revision list responses:
+
+```json
+{
+  "id": "...",
+  "revision": "r1",
+  "circuit_state": "closed"
+}
+```
+
+Possible values: `closed`, `open`, `half_open`.
+
+## Weighted Routing Interaction
+
+If one revision's circuit opens and others remain closed, the gateway routes all traffic to the healthy revisions, ignoring the configured weights until the unhealthy revision recovers.

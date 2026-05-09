@@ -1,0 +1,106 @@
+---
+title: Apps
+description: Register and manage applications on the Nexus gateway.
+---
+
+## List Apps
+
+<ParamField query="GET /api/v1/apps" />
+
+```bash
+curl http://localhost:9090/api/v1/apps \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+**Response**
+```json
+{
+  "status": 200,
+  "message": "success",
+  "data": [
+    {
+      "id": "uuid",
+      "name": "Payments API",
+      "slug": "payments",
+      "gateway_path": "/payments",
+      "routing_mode": "pass_through",
+      "default_policy": null,
+      "is_active": true,
+      "created_at": "2026-05-09T00:00:00Z"
+    }
+  ]
+}
+```
+
+---
+
+## Create App
+
+<ParamField query="POST /api/v1/apps" />
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  -d '{
+    "name": "Payments API",
+    "slug": "payments",
+    "gateway_path": "/payments",
+    "routing_mode": "pass_through",
+    "default_policy": {
+      "auth": {"auth_type": "api_key", "required": true}
+    }
+  }'
+```
+
+**Body Parameters**
+
+| Field | Required | Type | Description |
+|-------|----------|------|-------------|
+| `name` | Yes | string | Human-readable name |
+| `slug` | Yes | string | Unique identifier |
+| `gateway_path` | Yes | string | Proxy path prefix |
+| `routing_mode` | No | string | `pass_through` (default) or `managed_endpoint` |
+| `default_policy` | No | object | Default policy for all requests |
+
+---
+
+## Get App
+
+<ParamField query="GET /api/v1/apps/:id" />
+
+```bash
+curl http://localhost:9090/api/v1/apps/payments \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+---
+
+## Update App
+
+<ParamField query="PATCH /api/v1/apps/:id" />
+
+```bash
+curl -X PATCH http://localhost:9090/api/v1/apps/payments \
+  -H "Content-Type: application/json" \
+  -d '{"is_active": false}'
+```
+
+**Body Parameters**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | New display name |
+| `is_active` | boolean | Enable or disable the app |
+| `default_policy` | object | Replace the default policy |
+
+---
+
+## Delete App
+
+<ParamField query="DELETE /api/v1/apps/:id" />
+
+```bash
+curl -X DELETE http://localhost:9090/api/v1/apps/payments \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
