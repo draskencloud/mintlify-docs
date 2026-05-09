@@ -1,0 +1,65 @@
+---
+title: SSO / JWT
+description: Authenticate requests using JWT tokens from any SSO provider.
+---
+
+Nexus validates JWTs using JWKS (JSON Web Key Sets), allowing integration with any standard SSO provider such as Auth0, Keycloak, Okta, or Azure AD.
+
+## Configure an App with SSO
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  -d '{
+    "name": "My SSO App",
+    "slug": "my-sso-app",
+    "gateway_path": "/my-app",
+    "routing_mode": "pass_through",
+    "default_policy": {
+      "auth": {
+        "auth_type": "jwt",
+        "required": true,
+        "jwks_url": "https://your-sso-provider.com/.well-known/jwks.json",
+        "issuer": "https://your-sso-provider.com",
+        "audience": "your-app-client-id",
+        "required_claims": ["sub", "email"],
+        "forward_claims_as_headers": {
+          "sub": "X-User-Id",
+          "email": "X-User-Email"
+        }
+      }
+    }
+  }'
+```
+
+## Provider JWKS URLs
+
+| Provider | JWKS URL |
+|----------|----------|
+| Auth0 | `https://<tenant>.auth0.com/.well-known/jwks.json` |
+| Keycloak | `https://<host>/realms/<realm>/protocol/openid-connect/certs` |
+| Okta | `https://<tenant>.okta.com/oauth2/default/v1/keys` |
+| Azure AD | `https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys` |
+| Google | `https://www.googleapis.com/oauth2/v3/certs` |
+
+## Auth Policy Fields
+
+| Field | Description |
+|-------|-------------|
+| `jwks_url` | URL of the JWKS endpoint — keys are fetched and cached automatically |
+| `issuer` | Expected `iss` claim value — requests with a different issuer are rejected |
+| `audience` | Expected `aud` claim value — your app's client ID |
+| `required_claims` | List of claim names that must be present in the token |
+| `forward_claims_as_headers` | Map of claim name → header name forwarded to the backend |
+| `jwt_secret_env` | Env var containing HS256 secret (alternative to JWKS) |
+| `jwt_public_key_env` | Env var containing RS256 PEM public key (alternative to JWKS) |
+
+## How it Works
+
+1. Client sends request with `Authorization: Bearer <token>`
+2. Nexus fetches signing keys from `jwks_url` (cached per `GATEWAY_JWKS__CACHE_TTL_SECS`)
+3. Token signature, expiry, issuer, and audience are validated
+4. Required claims are checked
+5. Matched claims are injected as headers on the backend request
+6. Request is proxied to the backend

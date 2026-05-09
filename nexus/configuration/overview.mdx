@@ -1,0 +1,45 @@
+---
+title: Configuration Overview
+description: How Nexus loads and applies configuration.
+---
+
+## Sources
+
+Nexus loads configuration in this order (later sources win):
+
+1. `config/default.toml` — bundled defaults
+2. Environment variables prefixed with `GATEWAY_`
+
+## Environment Variable Format
+
+Nested TOML sections map to double-underscore `__` separators:
+
+| TOML | Environment Variable |
+|------|---------------------|
+| `[server] proxy_port` | `GATEWAY_SERVER__PROXY_PORT` |
+| `[server] admin_token` | `GATEWAY_SERVER__ADMIN_TOKEN` |
+| `[cache] enabled` | `GATEWAY_CACHE__ENABLED` |
+| `[cache.redis] url` | `GATEWAY_CACHE__REDIS__URL` |
+
+## Hot Reload
+
+Some runtime tunables can be patched without restart via:
+
+```bash
+PATCH http://localhost:9090/api/v1/config
+```
+
+Static values (ports, TLS paths, DB driver) require a restart.
+
+## Database Drivers
+
+| Driver | Value | Notes |
+|--------|-------|-------|
+| SQLite | `sqlite` | Default, zero-dependency, single instance |
+| PostgreSQL | `postgres` | Recommended for production / multi-instance |
+| MySQL | `mysql` | Full support |
+| CockroachDB | `cockroach` | Uses PostgreSQL wire protocol |
+
+<Note>
+  Migrations are embedded in the binary. Set `GATEWAY_AUTO_MIGRATE=true` to apply them on startup.
+</Note>

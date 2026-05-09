@@ -1,0 +1,31 @@
+---
+title: Routing Modes
+description: Understand the two routing modes available in Nexus.
+---
+
+## pass_through
+
+Requests are forwarded directly to the backend URL defined on the app's active revision. The gateway acts as a transparent proxy — it validates auth, applies policies, then forwards the full request including path and query string.
+
+```
+Client: GET /payments/invoices?page=2
+Gateway: → Backend: GET /invoices?page=2  (strips gateway_path prefix)
+```
+
+## managed_endpoint
+
+Each endpoint is individually defined in the gateway with its own upstream URL, allowed methods, and policy. Requests not matching a registered endpoint return `404`.
+
+Use this mode when you need fine-grained control over which paths are exposed.
+
+## Choosing a Mode
+
+| Scenario | Recommended Mode |
+|----------|-----------------|
+| Proxying all traffic to a backend | `pass_through` |
+| Exposing only specific endpoints | `managed_endpoint` |
+| Gradual migration / versioning | `managed_endpoint` |
+
+<Note>
+  Routing mode is set at app creation and is immutable. Create a new app to change it.
+</Note>

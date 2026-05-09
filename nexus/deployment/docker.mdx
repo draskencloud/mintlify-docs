@@ -1,0 +1,63 @@
+---
+title: Docker
+description: Deploy Nexus using Docker or Docker Compose.
+---
+
+## Docker Run
+
+```bash
+docker run -d \
+  --name nexus \
+  -p 8080:8080 \
+  -p 9090:9090 \
+  -e GATEWAY_AUTO_MIGRATE=true \
+  -e GATEWAY_DATABASE_URL="sqlite:///app/data/gateway.db?mode=rwc" \
+  -e GATEWAY_SERVER__ADMIN_TOKEN="your-secret-token" \
+  -e GATEWAY_SERVER__LOG_FORMAT=json \
+  -v nexus-data:/app/data \
+  ghcr.io/draskencloud/nexus:latest
+```
+
+## Docker Compose
+
+```yaml
+services:
+  nexus:
+    image: ghcr.io/draskencloud/nexus:latest
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment:
+      GATEWAY_AUTO_MIGRATE: "true"
+      GATEWAY_DATABASE_URL: "sqlite:///app/data/gateway.db?mode=rwc"
+      GATEWAY_SERVER__ADMIN_TOKEN: "your-secret-token"
+      GATEWAY_SERVER__LOG_FORMAT: "json"
+    volumes:
+      - nexus-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  nexus-data:
+```
+
+## Private Registry Login
+
+The image is hosted on GitHub Container Registry. If the repo is private:
+
+```bash
+echo "YOUR_PAT" | docker login ghcr.io --username YOUR_GITHUB_USERNAME --password-stdin
+```
+
+## Using PostgreSQL
+
+For multi-instance or production deployments, replace SQLite with PostgreSQL:
+
+```bash
+-e GATEWAY_DB_DRIVER=postgres \
+-e GATEWAY_DATABASE_URL="postgresql://user:pass@host:5432/nexus"
+```

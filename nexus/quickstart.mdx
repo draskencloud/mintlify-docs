@@ -1,0 +1,78 @@
+---
+title: Quickstart
+description: Run Nexus locally in under five minutes.
+---
+
+## Prerequisites
+
+- Docker, or a Rust toolchain (`cargo`)
+- Port `8080` and `9090` available
+
+## Run with Docker
+
+```bash
+docker run -d \
+  -p 8080:8080 \
+  -p 9090:9090 \
+  -e GATEWAY_AUTO_MIGRATE=true \
+  -e GATEWAY_DATABASE_URL="sqlite:///app/data/gateway.db?mode=rwc" \
+  -v nexus-data:/app/data \
+  ghcr.io/draskencloud/nexus:latest
+```
+
+## Run from Binary
+
+Download the latest binary for your platform from the [GitHub Releases](https://github.com/draskencloud/DraskenCloud.Gateway.Service/releases) page.
+
+```bash
+# Extract and run
+tar -xzf nexus-linux-x86_64.tar.gz
+GATEWAY_AUTO_MIGRATE=true ./nexus
+```
+
+## Verify
+
+```bash
+curl http://localhost:9090/api/v1/health
+```
+
+Expected response:
+
+```json
+{
+  "status": 200,
+  "message": "success",
+  "data": {
+    "db": "ok",
+    "db_driver": "sqlite",
+    "uptime_secs": 5
+  }
+}
+```
+
+## Create Your First App
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "My API",
+    "slug": "my-api",
+    "gateway_path": "/my-api",
+    "routing_mode": "pass_through"
+  }'
+```
+
+Requests to `http://localhost:8080/my-api/*` will now be routed through the gateway.
+
+## Swagger UI
+
+The management API ships with a built-in Swagger UI at:
+
+```
+http://localhost:9090/swagger-ui/
+```
+
+<Note>
+  Swagger is disabled by default in production. Enable it with `GATEWAY_SERVER__SWAGGER_ENABLED=true`.
+</Note>

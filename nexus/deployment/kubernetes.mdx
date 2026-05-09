@@ -1,0 +1,89 @@
+---
+title: Kubernetes
+description: Deploy Nexus on Kubernetes using the official Helm chart.
+---
+
+## Prerequisites
+
+- Kubernetes cluster (k3s, EKS, GKE, etc.)
+- Helm 3.8+
+- Access to `ghcr.io` (login required for private registry)
+
+## Registry Login
+
+```bash
+helm registry login ghcr.io \
+  --username YOUR_GITHUB_USERNAME \
+  --password YOUR_GITHUB_PAT
+```
+
+## Install
+
+```bash
+helm install nexus oci://ghcr.io/draskencloud/charts/nexus \
+  --version 0.1.0 \
+  --namespace drasken-infra-dev \
+  --create-namespace
+```
+
+## Install with Traefik Ingress
+
+```bash
+helm install nexus oci://ghcr.io/draskencloud/charts/nexus \
+  --version 0.1.0 \
+  --namespace drasken-infra-dev \
+  --set ingress.enabled=true \
+  --set ingress.className=traefik \
+  --set ingress.hosts[0].host=dev.draskenapis.com \
+  --set ingress.hosts[0].paths[0].path=/ \
+  --set ingress.hosts[0].paths[0].pathType=Prefix \
+  --set-string ingress.annotations."traefik\.ingress\.kubernetes\.io/router\.entrypoints"=websecure \
+  --set-string ingress.annotations."traefik\.ingress\.kubernetes\.io/router\.tls"="true" \
+  --set ingress.tls[0].secretName=nexus-tls \
+  --set ingress.tls[0].hosts[0]=dev.draskenapis.com
+```
+
+## Upgrade
+
+```bash
+helm upgrade nexus oci://ghcr.io/draskencloud/charts/nexus \
+  --version 0.1.0 \
+  --namespace drasken-infra-dev \
+  --reuse-values
+```
+
+## Accessing the Management API
+
+The management port (`9090`) is internal only. Access it via port-forward:
+
+```bash
+kubectl port-forward svc/nexus 9090:9090 -n drasken-infra-dev
+```
+
+Or via SSH tunnel from your local machine:
+
+```bash
+ssh -L 9090:localhost:9090 ubuntu@YOUR_SERVER_IP \
+  "kubectl port-forward svc/nexus 9090:9090 -n drasken-infra-dev"
+```
+
+Then access `http://localhost:9090/api/v1/health` locally.
+
+## Key Values
+
+| Value | Default | Description |
+|-------|---------|-------------|
+| `image.repository` | `ghcr.io/draskencloud/nexus` | Image repository |
+| `image.tag` | `latest` | Image tag |
+| `config.dbDriver` | `sqlite` | Database driver (`sqlite`, `postgres`, `mysql`) |
+| `config.databaseUrl` | SQLite path | Database connection URL |
+| `config.autoMigrate` | `true` | Run migrations on startup |
+| `config.logLevel` | `info` | Log level |
+| `ingress.enabled` | `false` | Enable ingress |
+| `persistence.enabled` | `true` | Enable PVC for SQLite data |
+| `persistence.size` | `1Gi` | PVC storage size |
+| `secret.adminToken` | `""` | Management API admin token |
+
+<Warning>
+  Always set `secret.adminToken` in production. Without it the management API is unauthenticated.
+</Warning>

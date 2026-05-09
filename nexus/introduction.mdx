@@ -1,0 +1,43 @@
+---
+title: Introduction
+description: Nexus is a high-performance API gateway built by Drasken Cloud.
+---
+
+## What is Nexus?
+
+Nexus is a self-hosted API gateway written in Rust. It sits in front of your backend services and handles:
+
+- **Routing** — forward requests to backend services by app slug or path
+- **Authentication** — API keys, JWT/SSO, and Basic auth out of the box
+- **Rate limiting** — per-app or per-IP with fixed window, sliding window, or token bucket algorithms
+- **CORS** — configurable per app or endpoint
+- **Circuit breaking** — automatic failure detection and recovery
+- **Metrics** — Prometheus-compatible metrics on the management port
+- **Audit logging** — structured audit trail for every request
+
+## Ports
+
+| Port | Purpose |
+|------|---------|
+| `8080` | Proxy — public-facing, forwards requests to backends |
+| `9090` | Management API — configure apps, view metrics, health check |
+
+## Architecture
+
+```
+Client → :8080 (Proxy) → Backend Services
+Admin  → :9090 (Management API) → Gateway Config
+```
+
+The proxy and management API run as separate servers in the same process. The management port should never be exposed publicly.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="bolt" href="/nexus/quickstart">
+    Run Nexus locally in minutes
+  </Card>
+  <Card title="Deploy on Kubernetes" icon="dharmachakra" href="/nexus/deployment/kubernetes">
+    Deploy with Helm on k3s or any Kubernetes cluster
+  </Card>
+</CardGroup>

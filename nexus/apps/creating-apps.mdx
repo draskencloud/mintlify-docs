@@ -1,0 +1,71 @@
+---
+title: Creating Apps
+description: Register a backend service with the Nexus gateway.
+---
+
+An **app** represents a backend service registered with the gateway. All requests to the gateway's proxy port are matched against app `gateway_path` prefixes.
+
+## Create an App
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  -d '{
+    "name": "Payments API",
+    "slug": "payments",
+    "gateway_path": "/payments",
+    "routing_mode": "pass_through"
+  }'
+```
+
+## Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Human-readable name |
+| `slug` | Yes | Unique identifier, used in API paths |
+| `gateway_path` | Yes | Path prefix the proxy matches on (e.g. `/payments`) |
+| `routing_mode` | No | `pass_through` (default) or `managed_endpoint` |
+| `default_policy` | No | Default policy applied to all requests |
+
+## List Apps
+
+```bash
+curl http://localhost:9090/api/v1/apps \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
+```
+
+## Update an App
+
+```bash
+curl -X PATCH http://localhost:9090/api/v1/apps/{slug} \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  -d '{"is_active": false}'
+```
+
+## Apply a Default Policy
+
+The `default_policy` is applied to all requests through this app unless overridden at the revision or endpoint level.
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Payments API",
+    "slug": "payments",
+    "gateway_path": "/payments",
+    "default_policy": {
+      "auth": {
+        "auth_type": "api_key",
+        "required": true
+      },
+      "rate_limit": {
+        "enabled": true,
+        "requests": 500,
+        "window_seconds": 60
+      }
+    }
+  }'
+```

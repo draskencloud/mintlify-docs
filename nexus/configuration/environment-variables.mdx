@@ -1,0 +1,59 @@
+---
+title: Environment Variables
+description: Full reference of all GATEWAY_ environment variables.
+---
+
+## Database
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GATEWAY_DB_DRIVER` | `sqlite` | `sqlite` \| `postgres` \| `mysql` \| `cockroach` |
+| `GATEWAY_DATABASE_URL` | `sqlite://gateway.db?mode=rwc` | Database connection URL |
+| `GATEWAY_AUTO_MIGRATE` | `true` | Apply migrations on startup |
+| `GATEWAY_DB_MAX_CONNECTIONS` | `10` | Max pool connections (non-SQLite) |
+| `GATEWAY_DB_MIN_CONNECTIONS` | `2` | Min pool connections (non-SQLite) |
+| `GATEWAY_DB_CONNECT_TIMEOUT_SECS` | `5` | Connection timeout |
+
+## Server
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GATEWAY_SERVER__PROXY_PORT` | `8080` | Public proxy port |
+| `GATEWAY_SERVER__MGMT_PORT` | `9090` | Management API port |
+| `GATEWAY_SERVER__ADMIN_TOKEN` | — | Bearer token for management API |
+| `GATEWAY_SERVER__LOG_LEVEL` | `info` | `trace` \| `debug` \| `info` \| `warn` \| `error` |
+| `GATEWAY_SERVER__LOG_FORMAT` | `text` | `text` \| `json` |
+| `GATEWAY_SERVER__SWAGGER_ENABLED` | `false` | Enable Swagger UI on mgmt port |
+| `GATEWAY_SERVER__SHUTDOWN_TIMEOUT_SECS` | `30` | Graceful shutdown timeout |
+
+## Rate Limiting
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GATEWAY_RATE_LIMIT_REQUESTS` | `1000` | Requests per window |
+| `GATEWAY_RATE_LIMIT_WINDOW_SECS` | `60` | Window duration in seconds |
+| `GATEWAY_PER_IP_RATE_LIMIT_ENABLED` | `false` | Enable per-IP rate limiting |
+| `GATEWAY_PER_IP_RATE_LIMIT_REQUESTS` | `1000` | Per-IP requests per window |
+
+## Cache
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GATEWAY_CACHE__ENABLED` | `false` | Enable response caching |
+| `GATEWAY_CACHE__BACKEND` | `memory` | `memory` \| `redis` \| `memcached` |
+| `GATEWAY_CACHE__DEFAULT_TTL_SECS` | `60` | Default cache TTL |
+| `GATEWAY_CACHE__REDIS__URL` | `redis://localhost:6379` | Redis URL |
+
+## Circuit Breaker
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GATEWAY_CIRCUIT_BREAKER__THRESHOLD` | `5` | Failures before opening circuit |
+| `GATEWAY_CIRCUIT_BREAKER__TIMEOUT_SECS` | `30` | Time before retrying |
+
+## License
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GATEWAY_LICENSE_KEY` | — | License key for non-community tiers |
+| `GATEWAY_LICENSE__VALIDATOR` | `offline_jwt` | `offline_jwt` \| `online_api` \| `none` |

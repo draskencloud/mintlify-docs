@@ -1,0 +1,47 @@
+---
+title: API Reference
+description: Management API reference for Nexus gateway.
+---
+
+The management API runs on port `9090` and is used to configure apps, tokens, endpoints, and runtime settings.
+
+## Base URL
+
+```
+http://localhost:9090/api/v1
+```
+
+In production, access it via port-forward — it should never be exposed publicly.
+
+## Authentication
+
+When `GATEWAY_SERVER__ADMIN_TOKEN` is set, all management API requests require:
+
+```
+Authorization: Bearer YOUR_ADMIN_TOKEN
+```
+
+## Interactive Docs
+
+Enable Swagger UI by setting `GATEWAY_SERVER__SWAGGER_ENABLED=true`, then open:
+
+```
+http://localhost:9090/swagger-ui/
+```
+
+## Key Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/health` | Health check |
+| `GET` | `/api/v1/version` | Version and build info |
+| `GET` | `/api/v1/apps` | List all apps |
+| `POST` | `/api/v1/apps` | Create an app |
+| `PATCH` | `/api/v1/apps/{slug}` | Update an app |
+| `DELETE` | `/api/v1/apps/{slug}` | Delete an app |
+| `GET` | `/api/v1/apps/{slug}/tokens` | List API tokens |
+| `POST` | `/api/v1/apps/{slug}/tokens` | Create an API token |
+| `DELETE` | `/api/v1/apps/{slug}/tokens/{id}` | Revoke a token |
+| `GET` | `/api/v1/metrics` | Prometheus metrics |
+| `GET` | `/api/v1/config` | Get runtime config |
+| `PATCH` | `/api/v1/config` | Update runtime config |

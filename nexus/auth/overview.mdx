@@ -1,0 +1,48 @@
+---
+title: Authentication Overview
+description: How Nexus authenticates incoming requests.
+---
+
+Nexus supports three authentication types, configured per app via the `default_policy.auth` field.
+
+## Auth Types
+
+| Type | Description |
+|------|-------------|
+| `api_key` | Validates a bearer token against stored API keys |
+| `jwt` | Validates a signed JWT — supports HS256, RS256, and JWKS |
+| `basic` | HTTP Basic auth against stored credentials |
+| `none` | No authentication required |
+
+## Policy Inheritance
+
+Auth policy is resolved in this order, with more specific levels overriding broader ones:
+
+```
+App → Version → Revision → Endpoint
+```
+
+If an endpoint has no auth policy, it inherits from the revision, which inherits from the app.
+
+## Requiring Auth
+
+By default `required: true` — unauthenticated requests return `401`. Set `required: false` to allow anonymous access while still extracting identity when a token is present.
+
+## Forwarding Claims as Headers
+
+JWT claims can be forwarded to the backend as request headers:
+
+```json
+{
+  "auth": {
+    "auth_type": "jwt",
+    "forward_claims_as_headers": {
+      "sub": "X-User-Id",
+      "email": "X-User-Email",
+      "role": "X-User-Role"
+    }
+  }
+}
+```
+
+The backend receives these headers on every authenticated request.

@@ -1,0 +1,64 @@
+---
+title: API Keys
+description: Authenticate requests using bearer API keys.
+---
+
+API key authentication validates the `Authorization: Bearer <key>` header against keys stored in the gateway database.
+
+## Configure an App with API Key Auth
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  -d '{
+    "name": "My API",
+    "slug": "my-api",
+    "gateway_path": "/my-api",
+    "default_policy": {
+      "auth": {
+        "auth_type": "api_key",
+        "required": true
+      }
+    }
+  }'
+```
+
+## Create an API Key
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps/my-api/tokens \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  -d '{
+    "name": "Mobile App Key",
+    "scopes": ["read", "write"]
+  }'
+```
+
+The response includes the token value — save it, it is not shown again.
+
+## Using the Key
+
+Clients send the key as a bearer token:
+
+```bash
+curl https://dev.draskenapis.com/my-api/endpoint \
+  -H "Authorization: Bearer <api-key>"
+```
+
+## Scopes
+
+Scopes are arbitrary strings attached to a key. Enforce them on specific endpoints via `required_scopes` in the policy:
+
+```json
+{
+  "auth": {
+    "auth_type": "api_key",
+    "required": true
+  },
+  "required_scopes": ["write"]
+}
+```
+
+Requests with a key missing the required scope receive a `403`.
