@@ -120,7 +120,7 @@ The JWKS (JSON Web Key Set) option is recommended for managed identity providers
 
 ```
 1. Parse the incoming JWT header → extract "kid" claim
-2. Look up DashMap<url, (JwkSet, fetched_at)> for jwks_url
+2. Look up the in-process JWKS cache by jwks_url
    ├── Cache HIT and key with matching kid exists
    │     → use cached JWK to verify signature
    └── Cache MISS or kid not found in cached set

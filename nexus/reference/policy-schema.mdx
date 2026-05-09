@@ -41,7 +41,7 @@ Authentication requirements applied by the auth middleware.
 | `issuer` | string \| null | — | JWT only. Expected `iss` claim |
 | `audience` | string \| null | — | JWT only. Expected `aud` claim |
 | `required_claims` | string[] \| null | — | JWT only. Claim names that must be present |
-| `forward_claims_as_headers` | object<string,string> \| null | — | JWT only. Map of claim name → upstream header name |
+| `forward_claims_as_headers` | `object<string,string>` \| null | — | JWT only. Map of claim name → upstream header name |
 | `jwt_secret_env` | string \| null | — | HS256 only. Env-var name holding the secret |
 | `jwt_public_key_env` | string \| null | — | RS256/ES256 only. Env-var name holding the PEM public key |
 | `backend_mtls_profile` | string \| null | — | Name of an mTLS profile to use for backend connections |
@@ -100,10 +100,10 @@ Required request headers and validation rules. Enforced before forwarding.
 | Field | Type | Description |
 |-------|------|-------------|
 | `required` | string[] | Header names that must be present (case-insensitive) |
-| `inject` | object<string,string> | Static or templated headers added to forwarded requests |
-| `validate` | object<string,string> | Map of header name → regex pattern to match values |
+| `inject` | `object<string,string>` | Static or templated headers added to forwarded requests |
+| `validate` | `object<string,string>` | Map of header name → regex pattern to match values |
 | `from_token_metadata` | string[] | Token metadata keys to forward as headers |
-| `from_jwt_claims` | object<string,string> | Map of JWT claim name → header name |
+| `from_jwt_claims` | `object<string,string>` | Map of JWT claim name → header name |
 
 See [Header Validation](/nexus/policies/header-validation), [Header Injection](/nexus/policies/header-injection).
 
