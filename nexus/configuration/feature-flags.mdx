@@ -1,144 +1,111 @@
 ---
-title: "Cargo Feature Flags"
-description: "Compile-time switches for storage backends, cache backends, and observability integrations."
+title: "Feature Flags"
+description: "Optional integrations included in the official binary and Docker image, and how to enable each at runtime."
 ---
 
-Nexus API Gateway by Drasken Cloud is built as a single binary. Compile-time feature flags control which storage backends, cache backends, and observability integrations are included. Unused features add no binary size or runtime overhead.
+Some integrations are bundled as **optional features**. Whether each integration is available depends on which build of Nexus you run; whether it is *active* is then controlled by configuration.
 
-## Available Feature Flags
+This page lists the optional features, what is included in the official distributions, and how to turn each one on at runtime.
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `store-sqlite` | enabled | SQLite storage backend via sqlx |
-| `store-postgres` | | PostgreSQL storage backend via sqlx |
-| `store-mysql` | | MySQL storage backend via sqlx |
-| `store-cockroach` | | CockroachDB (uses the Postgres wire protocol) |
-| `memcached` | | Memcached cache backend via async-memcache |
-| `otlp` | | OpenTelemetry OTLP trace export via opentelemetry-otlp |
+---
 
-## Building with Features
+## What ships in the official distributions
 
-```bash
-# Default build — SQLite only, no OTLP, no Memcached
-cargo build --release
+| Distribution | Always included | Optional features compiled in |
+|--------------|----------------|-------------------------------|
+| Official Docker image (`ghcr.io/draskencloud/nexus:<tag>`) | SQLite storage | PostgreSQL storage, OpenTelemetry trace export |
+| Official Linux / macOS binaries (GitHub Releases) | SQLite storage | PostgreSQL storage, OpenTelemetry trace export |
 
-# Add PostgreSQL support
-cargo build --release --features store-postgres
+For most production deployments, the official image covers the common cases (SQLite for single-instance, PostgreSQL for multi-replica, OTLP for tracing).
 
-# Add PostgreSQL + MySQL
-cargo build --release --features store-postgres,store-mysql
+If you need a feature that is **not** compiled into the official image — MySQL/MariaDB, CockroachDB, or Memcached — you have two options:
 
-# Add OpenTelemetry OTLP export
-cargo build --release --features otlp
+1. Run a community-published image that includes the feature, or
+2. Build a custom image. See the [Nexus repository on GitHub](https://github.com/draskencloud/nexus) for build instructions.
 
-# Full feature build (all storage backends + OTLP + Memcached)
-cargo build --release --features store-postgres,store-mysql,store-cockroach,memcached,otlp
-```
+---
 
-## Feature Details
+## Available features
 
-### `store-sqlite` (default)
+| Feature | Use case | Available in official image |
+|---------|----------|-----------------------------|
+| **SQLite storage** | Single-instance deployments, dev environments | Yes (always) |
+| **PostgreSQL storage** | Multi-instance / horizontally scaled deployments | Yes |
+| **OpenTelemetry (OTLP)** | Distributed tracing export | Yes |
+| **MySQL / MariaDB storage** | When your operations team standardizes on MySQL | Custom build |
+| **CockroachDB storage** | Geo-distributed deployments needing CockroachDB | Custom build |
+| **Memcached cache** | Memcached as the cache backend instead of Redis | Custom build |
 
-Enables the SQLite storage backend. Included by default — suitable for development, single-instance deployments, and zero-external-dependency setups.
+---
 
-SQLite uses a local file (configured via `DATABASE_URL`, e.g., `sqlite:./gateway.db` or `sqlite:/data/gateway.db`).
+## Enabling each feature at runtime
 
-**Limitations:** Not suitable for multi-instance deployments (file locking prevents concurrent writes from multiple processes). Use `store-postgres` for horizontal scaling.
+### SQLite (default)
 
-### `store-postgres`
-
-Enables the PostgreSQL storage backend. Required for multi-instance (horizontally scaled) deployments.
+Used unless you configure another driver. Suitable for dev and single-instance production:
 
 ```bash
-cargo build --release --features store-postgres
+export GATEWAY_DATABASE__DRIVER=sqlite
+export GATEWAY_DATABASE__URL="sqlite:./data/gateway.db?mode=rwc"
 ```
 
-Set `DATABASE_URL` to a PostgreSQL connection string:
+<Note>
+SQLite cannot be shared across replicas — use PostgreSQL for multi-instance deployments.
+</Note>
+
+### PostgreSQL
 
 ```bash
-export DATABASE_URL="postgres://user:password@host:5432/gateway"
-export GATEWAY_DB_DRIVER=postgres
+export GATEWAY_DATABASE__DRIVER=postgres
+export GATEWAY_DATABASE__URL="postgres://user:password@host:5432/gateway"
 ```
 
-### `store-mysql`
+### OpenTelemetry trace export
 
-Enables the MySQL/MariaDB storage backend.
+Compiled in to the official image, but dormant unless an endpoint is set:
 
 ```bash
-cargo build --release --features store-mysql
+export GATEWAY_OTLP_ENDPOINT=http://otel-collector:4318
 ```
+
+If `GATEWAY_OTLP_ENDPOINT` is unset, no traces are exported and there is no performance impact.
+
+See [Distributed Tracing](/nexus/observability/distributed-tracing) for full setup.
+
+### MySQL / MariaDB (custom build only)
 
 ```bash
-export DATABASE_URL="mysql://user:password@host:3306/gateway"
-export GATEWAY_DB_DRIVER=mysql
+export GATEWAY_DATABASE__DRIVER=mysql
+export GATEWAY_DATABASE__URL="mysql://user:password@host:3306/gateway"
 ```
 
-### `store-cockroach`
+### CockroachDB (custom build only)
 
-Enables CockroachDB support. CockroachDB is compatible with the PostgreSQL wire protocol, so this flag uses the Postgres driver with CockroachDB-specific query compatibility shims.
+CockroachDB uses the PostgreSQL wire protocol with compatibility shims:
 
 ```bash
-cargo build --release --features store-cockroach
+export GATEWAY_DATABASE__DRIVER=cockroach
+export GATEWAY_DATABASE__URL="postgres://user:password@host:26257/gateway?sslmode=verify-full"
 ```
 
-```bash
-export DATABASE_URL="postgres://user:password@host:26257/gateway?sslmode=verify-full"
-export GATEWAY_DB_DRIVER=cockroach
-```
-
-### `memcached`
-
-Enables the Memcached cache backend for response caching and auth token caching.
-
-```bash
-cargo build --release --features memcached
-```
+### Memcached cache (custom build only)
 
 ```bash
 export GATEWAY_CACHE__BACKEND=memcached
 export GATEWAY_CACHE__MEMCACHED__URL=memcached://localhost:11211
 ```
 
-### `otlp`
+---
 
-Enables OpenTelemetry OTLP trace export. When compiled in, activating it requires setting the `GATEWAY_OTLP_ENDPOINT` environment variable at runtime.
+## What happens if a feature is missing
 
-```bash
-cargo build --release --features otlp
-```
+If a runtime configuration asks for a feature that is not bundled into the running build:
 
-```bash
-export GATEWAY_OTLP_ENDPOINT=http://otel-collector:4318
-```
+| Situation | Behaviour |
+|-----------|-----------|
+| `GATEWAY_DATABASE__DRIVER=postgres` but PostgreSQL not bundled | Startup fails with a clear "driver not available" error |
+| `GATEWAY_CACHE__BACKEND=memcached` but Memcached not bundled | Startup fails with a clear "backend not available" error |
+| `GATEWAY_OTLP_ENDPOINT` set but OTLP not bundled | Variable is ignored; no traces exported |
+| `GATEWAY_DATABASE__DRIVER=sqlite` (always available) | Always works |
 
-If `GATEWAY_OTLP_ENDPOINT` is not set, the `otlp` feature compiles in but is dormant — no traces are exported and there is no performance impact.
-
-See [Distributed Tracing](/nexus/observability/distributed-tracing) for full setup instructions.
-
-## Docker Images
-
-The official Docker image is built with `store-postgres,otlp` enabled in addition to the default `store-sqlite`, providing the most common production combination without requiring a custom build.
-
-To use a storage backend or feature not included in the official image, build a custom image:
-
-```dockerfile
-FROM rust:1.78 AS builder
-WORKDIR /app
-COPY . .
-RUN cargo build --release --features store-postgres,store-mysql,memcached,otlp
-
-FROM debian:bookworm-slim
-COPY --from=builder /app/target/release/draskencloud-gateway /usr/local/bin/
-ENTRYPOINT ["/usr/local/bin/draskencloud-gateway"]
-```
-
-## Feature Flag vs Runtime Config
-
-Feature flags are **compile-time** switches. If a feature is not compiled in, the corresponding runtime config key is ignored (or produces a startup error if set to an unsupported value).
-
-| Situation | What Happens |
-|-----------|-------------|
-| `db_driver=postgres` but no `store-postgres` feature | Startup error: driver not compiled in |
-| `cache.backend=memcached` but no `memcached` feature | Startup error: backend not compiled in |
-| `GATEWAY_OTLP_ENDPOINT` set but no `otlp` feature | Variable ignored; no traces exported |
-| `store-postgres` compiled in but `db_driver=sqlite` | SQLite used; Postgres driver dormant |
+When startup fails, the error message names the missing feature so you can switch to a build that includes it.

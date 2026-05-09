@@ -166,14 +166,14 @@ For each request with a `Basic` auth header where `auth_type = "basic"`:
 5. Redis cache lookup
    ├── Cache HIT  → deserialise cached scopes and credential_id
    │               → perform constant-time bcrypt verify(password, cached_hash)
-   │               → return AuthIdentity if verify passes; 401 if not
+   │               → authenticated if verify passes; 401 if not
    └── Cache MISS → query PostgreSQL WHERE app_id = $1 AND username = $2
                    ├── Row not found
                    │     → perform dummy bcrypt verify (prevents timing oracle)
                    │     → return 401
                    └── Row found
                          → perform constant-time bcrypt verify(password, stored_hash)
-                         ├── Verify passes → write metadata to Redis; return AuthIdentity
+                         ├── Verify passes → write metadata to cache; request authenticated
                          └── Verify fails  → return 401
 ```
 

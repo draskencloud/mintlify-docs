@@ -190,24 +190,18 @@ This setting helps the gateway survive transient database unavailability during 
 
 ---
 
-## Cargo Feature Flags
+## Driver availability
 
-The driver must be compiled into the binary. The default build includes only SQLite.
+Storage drivers are bundled into the build at distribution time:
 
-| Feature flag | Driver | Command |
-|---|---|---|
-| `store-sqlite` | SQLite | Included by default — `cargo build --release` |
-| `store-postgres` | PostgreSQL | `cargo build --release --features store-postgres` |
-| `store-mysql` | MySQL / MariaDB | `cargo build --release --features store-mysql` |
-| `store-cockroach` | CockroachDB | `cargo build --release --features store-cockroach` |
+| Driver | Available in official Docker image / binaries |
+|--------|----------------------------------------------|
+| SQLite | Yes (always) |
+| PostgreSQL | Yes |
+| MySQL / MariaDB | Custom build only |
+| CockroachDB | Custom build only |
 
-Multiple drivers can be compiled into the same binary:
-
-```bash
-cargo build --release --features store-sqlite,store-postgres,store-mysql
-```
-
-The driver used at runtime is determined by `db_driver`.
+If `db_driver` is set to a driver that is not bundled, the gateway exits at startup with a clear error. Switch to a build that includes the driver, or pick one that is bundled. See [Feature Flags](/nexus/configuration/feature-flags) for the full list and runtime behaviour.
 
 ---
 

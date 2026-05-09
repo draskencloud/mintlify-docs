@@ -233,7 +233,7 @@ API tokens are credentials scoped to an App. The raw token value is returned onc
 
 Token lifecycle:
 1. **Create** — `POST /api/v1/apps/:app_id/tokens`; receive raw token value once.
-2. **Validate** — presented as `Authorization: Bearer <token>` on proxy requests; validated against RuntimeStore → Redis → database.
+2. **Validate** — presented as `Authorization: Bearer <token>` on proxy requests; validated against routing cache → Redis → database.
 3. **Revoke** — `DELETE /api/v1/apps/:app_id/tokens/:token_id`; invalidates the Redis cache entry immediately.
 
 Tokens support optional `expires_at` and `scopes` (e.g. `["proxy:read", "proxy:write"]`). Required scopes can be enforced at the Revision or Endpoint policy level using `required_scopes`.

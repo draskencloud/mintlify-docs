@@ -166,7 +166,7 @@ The query string is forwarded **verbatim** to the backend. The gateway does not 
 
 ## Body Streaming
 
-In the normal path (body under the configured `max_body_bytes` limit), the request body is streamed zero-copy from the client to the backend using Hyper's chunked transfer. The gateway does not buffer the entire body in memory.
+In the normal path (body under the configured `max_body_bytes` limit), the request body is streamed zero-copy from the client to the backend using chunked transfer. The gateway does not buffer the entire body in memory.
 
 The body limit middleware checks the `Content-Length` header first. If the header indicates a body larger than the limit, the request is rejected before any data is read. For requests without `Content-Length`, the stream is measured as it flows.
 

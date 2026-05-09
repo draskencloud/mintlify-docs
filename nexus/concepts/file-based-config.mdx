@@ -9,7 +9,7 @@ The gateway can load App, Version, Revision, and Endpoint definitions from TOML 
 
 ## Overview
 
-At startup, the gateway reads all `*.toml` files from the directory specified by `apps_dir` (default: `config/apps`). Each file can define one or more Apps with their full hierarchy. The gateway upserts the definitions into its in-memory `RuntimeStore` and optionally syncs them to the database.
+At startup, the gateway reads all `*.toml` files from the directory specified by `apps_dir` (default: `config/apps`). Each file can define one or more Apps with their full hierarchy. The gateway upserts the definitions into its in-memory `routing cache` and optionally syncs them to the database.
 
 When `file_watch_enabled = true`, the gateway monitors the directory for changes and reloads modified files automatically without restarting.
 

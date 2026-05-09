@@ -105,18 +105,18 @@ crash_log_path = "./crash.log"
   "timestamp": "2026-05-09T12:34:56.789Z",
   "version": "0.1.0",
   "build_hash": "abc123def456",
-  "thread": "tokio-runtime-worker",
-  "message": "panicked at 'attempt to subtract with overflow', src/proxy/handler.rs:142:18"
+  "thread": "worker-thread-2",
+  "message": "internal error: attempt to subtract with overflow"
 }
 ```
 
 | Field | Description |
 |---|---|
-| `timestamp` | ISO 8601 UTC timestamp of the panic |
-| `version` | Binary version from `Cargo.toml` |
-| `build_hash` | Short git commit hash embedded at build time |
-| `thread` | Name of the thread that panicked |
-| `message` | Full panic message including file and line number |
+| `timestamp` | ISO 8601 UTC timestamp of the failure |
+| `version` | Running gateway version |
+| `build_hash` | Short build identifier embedded at build time |
+| `thread` | Name of the worker thread where the failure occurred |
+| `message` | Full failure message |
 
 ### Notes
 
@@ -228,15 +228,9 @@ Timeout for all JWKS HTTP fetches — both validation probes (at startup/reload)
 
 The gateway can export traces and metrics via OpenTelemetry Protocol (OTLP) to any compatible backend (Jaeger, Tempo, Honeycomb, Datadog, etc.).
 
-### Build Requirement
+### Availability
 
-OTLP support is an **optional Cargo feature** and must be compiled in:
-
-```bash
-cargo build --release --features otlp
-```
-
-The standard Docker image includes the `otlp` feature.
+OpenTelemetry is bundled into the official Docker image and binaries — no special build is required. See [Feature Flags](/nexus/configuration/feature-flags) for the full distribution matrix.
 
 ### Activation
 
@@ -246,7 +240,7 @@ OTLP export is activated by setting `GATEWAY_OTLP_ENDPOINT`:
 export GATEWAY_OTLP_ENDPOINT=http://otel-collector:4318
 ```
 
-No TOML key is required — the presence of this environment variable activates the feature. If the binary was not built with `--features otlp`, setting this variable has no effect and a warning is logged.
+No TOML key is required — the presence of this environment variable activates the feature. If the running build does not include OpenTelemetry support, setting this variable has no effect and a warning is logged.
 
 ### OTLP Endpoint Formats
 

@@ -1,6 +1,6 @@
 ---
 title: "Authentication Overview"
-description: "Per-policy auth configuration, middleware position, AuthIdentity, scope enforcement, and unauthenticated pass-through."
+description: "Per-policy auth configuration, middleware position, authenticated identity, scope enforcement, and unauthenticated pass-through."
 ---
 
 Nexus API Gateway by Drasken Cloud enforces authentication at the policy level. Every request that enters the proxy port (`:8080`) passes through the authentication middleware before it reaches a backend. This document explains how authentication is configured, where it sits in the middleware stack, what it produces, and how access control is enforced downstream.
@@ -12,7 +12,7 @@ Nexus API Gateway by Drasken Cloud enforces authentication at the policy level. 
 - [Policy-Level Configuration](#policy-level-configuration)
 - [AuthPolicy Reference](#authpolicy-reference)
 - [Middleware Stack Position](#middleware-stack-position)
-- [What Auth Produces: AuthIdentity](#what-auth-produces-authidentity)
+- [The Authenticated Identity](#the-authenticated-identity)
 - [Scope Enforcement](#scope-enforcement)
 - [Unauthenticated Pass-Through (`required = false`)](#unauthenticated-pass-through-required--false)
 - [Auth Methods Summary](#auth-methods-summary)
@@ -76,69 +76,58 @@ The `AuthPolicy` object is embedded in the policy JSONB column. All fields are o
 
 ## Middleware Stack Position
 
-The full Tower middleware stack, from outermost to innermost, is:
+Every request passes through the middleware stack in this fixed order, from outermost to innermost:
 
 ```
-IpRateLimitLayer
-  → TraceLayer
-    → AuthLayer              ← authentication happens here
-      → RateLimitLayer       ← token-based rate limiting uses AuthIdentity
-        → HeaderValidationLayer
-          → IpFilterLayer
-            → BodyLimitLayer
-              → TimeoutLayer
-                → CorsLayer
-                  → LoggerLayer
-                    → ProxyEngine
+Per-IP rate limit
+  → Trace context
+    → Authentication              ← credential validated here
+      → Per-token rate limit      ← keyed off the validated identity
+        → Header validation
+          → IP filter
+            → Body size limit
+              → Timeout
+                → CORS
+                  → Access logger
+                    → Proxy engine
 ```
 
 **Before auth:**
 
-- `IpRateLimitLayer` — enforces IP-level request rate limits. Runs before auth so that unauthenticated flood attacks are dropped cheaply before credential validation.
-- `TraceLayer` — attaches a trace context (request ID, span) to every request, regardless of auth outcome.
+- **Per-IP rate limit** runs first so that unauthenticated flood attacks are dropped cheaply before any credential validation work.
+- **Trace context** attaches a request ID and span to every request, regardless of auth outcome.
 
 **Auth layer responsibilities:**
 
 1. Extract the credential from the request (Bearer token, JWT, Basic header).
 2. Validate the credential against the configured `auth_type`.
-3. Produce an `AuthIdentity` on success.
+3. Produce an authenticated identity on success.
 4. Return `401 Unauthorized` or `403 Forbidden` on failure.
-5. Attach `AuthIdentity` to request extensions so downstream layers and the proxy engine can read it.
+5. Attach the identity to the request so downstream layers and the proxy engine can read it.
 
 **After auth:**
 
-- `RateLimitLayer` — uses `AuthIdentity.token_id` (or username for basic auth) as the rate limit key, enabling per-token quota enforcement.
-- All other middleware and the proxy engine assume a valid `AuthIdentity` is present when `required = true`.
+- The **per-token rate limit** uses the validated identity (token ID, or username for basic auth) as the rate limit key, enabling per-token quota enforcement.
+- All other middleware and the proxy engine assume a valid identity is present when `required = true`.
 
 ---
 
-## What Auth Produces: AuthIdentity
+## The Authenticated Identity
 
-On successful authentication, the auth layer produces an `AuthIdentity` struct and attaches it to the request extensions:
+On successful authentication, the gateway derives an authenticated identity for the request and carries it through the rest of the middleware stack. The identity has the following fields:
 
-```rust
-pub struct AuthIdentity {
-    /// ID of the app this credential belongs to.
-    pub app_id: Uuid,
+| Field | Description |
+|-------|-------------|
+| `app_id` | The App this credential belongs to |
+| `token_id` | For API key and JWT: the token's ID. For Basic auth: the credential's ID. Absent when `required = false` and no credential was presented |
+| `username` | For Basic auth: the authenticated username |
+| `scopes` | Scopes granted by this credential |
 
-    /// For API key and JWT auth: the token's database ID.
-    /// For basic auth: the credential's database ID.
-    /// None when required = false and no credential was presented.
-    pub token_id: Option<Uuid>,
+The gateway uses the identity to:
 
-    /// For basic auth: the authenticated username.
-    pub username: Option<String>,
-
-    /// Scopes granted by this credential.
-    pub scopes: Vec<String>,
-}
-```
-
-The proxy engine uses `AuthIdentity` to:
-
-- Log the `token_id` in the audit log for every proxied request.
+- Log the token ID in the audit log for every proxied request.
 - Enforce scope rules before forwarding.
-- Pass `token_id` as the rate limit key.
+- Use the token ID as the per-token rate limit key.
 
 ---
 
@@ -185,9 +174,9 @@ Setting `required = false` in an `AuthPolicy` allows requests with no credential
 When a request arrives without a credential and `required = false`:
 
 - The gateway does **not** attempt credential validation.
-- A **generic `AuthIdentity`** is produced with no `token_id`, no `username`, and an empty `scopes` array.
+- A generic anonymous identity is produced with no token ID, no username, and no scopes.
 - The request proceeds through the rest of the middleware stack and is forwarded to the backend.
-- Scope enforcement is also relaxed: if `AuthIdentity.scopes` is empty and `required = false`, the 403 scope check is skipped.
+- Scope enforcement is also relaxed: if the identity has no scopes and `required = false`, the 403 scope check is skipped.
 
 When a credential **is** presented but fails validation, and `required = false`:
 

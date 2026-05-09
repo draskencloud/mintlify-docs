@@ -207,11 +207,7 @@ url = "memcache://localhost:11211"
 | Env var | `GATEWAY_CACHE__MEMCACHED__URL` |
 | Runtime reload | No — requires restart |
 
-Memcached server URL. Requires a binary built with `--features memcached`. The `memcache://` scheme is used.
-
-```bash
-cargo build --release --features memcached
-```
+Memcached server URL using the `memcache://` scheme. Memcached support is not bundled in the official distribution — it requires a custom build that includes it. See [Feature Flags](/nexus/configuration/feature-flags).
 
 ---
 

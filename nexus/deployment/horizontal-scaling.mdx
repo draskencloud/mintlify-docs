@@ -37,12 +37,9 @@ The Nexus API Gateway by Drasken Cloud is designed as a stateless proxy layer. M
 
 SQLite uses file-level locking and cannot safely serve concurrent writers from separate processes. **SQLite must not be used for multi-instance deployments.** Any attempt to point two gateway instances at the same SQLite file will result in write serialization errors or database corruption.
 
-Switch to PostgreSQL (or CockroachDB):
+Switch to PostgreSQL (or CockroachDB). The official Docker image and binaries already include PostgreSQL support:
 
 ```bash
-# Build with Postgres support
-cargo build --release --features store-postgres
-
 # Configure all instances identically
 GATEWAY_DB_DRIVER=postgres
 GATEWAY_DATABASE_URL=postgres://gateway:pass@db-primary:5432/gateway

@@ -59,15 +59,11 @@ Two conditions must both be met to enable OTLP span export:
 
 | Requirement | How to satisfy |
 |---|---|
-| Build with the `otlp` feature | `cargo build --features otlp` or add `otlp` to your `Cargo.toml` features |
+| OpenTelemetry support bundled in the running build | Use the official Docker image or binaries (OpenTelemetry is bundled). See [Feature Flags](/nexus/configuration/feature-flags) |
 | Set `GATEWAY_OTLP_ENDPOINT` | Export the env var pointing to your OTLP collector gRPC endpoint |
 
 ```bash
-# Build
-cargo build --release --features otlp
-
-# Run
-GATEWAY_OTLP_ENDPOINT=http://otel-collector:4317 ./gateway
+GATEWAY_OTLP_ENDPOINT=http://otel-collector:4317 ./nexus
 ```
 
 Without `GATEWAY_OTLP_ENDPOINT` set, the gateway starts normally with request-ID propagation only — no OTLP errors, no missing functionality.
@@ -132,13 +128,11 @@ export GATEWAY_OTLP_ENDPOINT=http://tempo:4317
 
 ## Subscriber Integration
 
-At startup, when `GATEWAY_OTLP_ENDPOINT` is set and the binary was compiled with `--features otlp`, the gateway:
+At startup, when `GATEWAY_OTLP_ENDPOINT` is set and the running build includes OpenTelemetry support, the gateway:
 
 1. Initialises an OTLP trace exporter pointing to `GATEWAY_OTLP_ENDPOINT`.
-2. Registers the exporter with the `tracing` subscriber alongside the console formatter.
-3. All `tracing` spans (including those from Tower middleware layers) are sent to the collector.
-
-This means you get spans from Tower's `TraceLayer` (HTTP server spans), the proxy engine span, and any `tracing::info_span!` calls in middleware — all correlated.
+2. Registers the exporter alongside the console log formatter.
+3. All instrumented spans (including HTTP server spans, the proxy engine span, and middleware spans) are sent to the collector — correlated by request ID.
 
 ---
 

@@ -164,9 +164,7 @@ gateway_request_retries_total{revision_id="<uuid>"}
 gateway_backend_health{app_id="<uuid>", revision_id="<uuid>"}
 ```
 
-The `gateway_request_retries_total` counter increments for each retry attempt, which also reflects circuit breaker activity. The `gateway_backend_health` gauge drops to `0` when a revision is unhealthy (detected by the health probe), which can align with circuit Open state.
-
-> A dedicated `gateway_circuit_breaker_state` metric is on the roadmap. For now, use `gateway_request_retries_total` rate and `gateway_backend_health` together to infer circuit breaker activity.
+The `gateway_request_retries_total` counter increments for each retry attempt, which also reflects circuit breaker activity. The `gateway_backend_health` gauge drops to `0` when a revision is unhealthy (detected by the health probe), which can align with circuit Open state. Use the two together to infer circuit breaker activity.
 
 ---
 

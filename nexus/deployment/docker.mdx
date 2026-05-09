@@ -294,17 +294,6 @@ docker run -d \
 
 The gateway loads `/config/default.toml` on startup. App-level TOML files can be placed in `/config/apps/`. Environment variables still override any value from the file.
 
-## Building a Custom Image
+## Custom images
 
-```bash
-# Default: SQLite only
-docker build -t my-gateway .
-
-# With Postgres support
-docker build --build-arg FEATURES="store-postgres" -t my-gateway-pg .
-
-# All storage backends + OTLP
-docker build --build-arg FEATURES="store-postgres,store-mysql,otlp,memcached" -t my-gateway-full .
-```
-
-If you pass `FEATURES` you will need a matching multi-stage Dockerfile that forwards the argument to `cargo build --features $FEATURES`. The official image includes `store-postgres` support by default.
+The official image (`ghcr.io/draskencloud/nexus:<tag>`) bundles SQLite, PostgreSQL, and OpenTelemetry — sufficient for the vast majority of deployments. If you need a feature that is not bundled (MySQL, CockroachDB, or Memcached), see [Feature Flags](/nexus/configuration/feature-flags) for the build path on the public repository.

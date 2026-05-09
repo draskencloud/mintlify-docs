@@ -17,7 +17,7 @@ Symptoms: a freshly activated Revision is producing errors, latency, or incorrec
    curl -X POST .../revisions/<good_revision_id>/activate \
      -H "Authorization: Bearer $ADMIN_TOKEN"
    ```
-3. Traffic immediately shifts to the previous Revision (RuntimeStore updates in-process; multi-replica installs propagate via Redis pub/sub or polling interval).
+3. Traffic immediately shifts to the previous Revision (routing cache updates in-process; multi-replica installs propagate via Redis pub/sub or polling interval).
 4. (Optional) Set `traffic_weight: 0` on the bad Revision so it does not receive any canary traffic in the meantime, then investigate.
 
 ---
@@ -173,7 +173,7 @@ The audit pipeline records every management mutation.
 
 1. Run two replicas behind a load balancer. Both connect to the same database (and Redis if configured).
 2. Drain replica A (`SIGTERM`); the load balancer marks it unhealthy via the `/api/v1/health` readiness probe. Graceful shutdown waits for in-flight requests to finish.
-3. Replace replica A's image / binary and start it; it warms RuntimeStore from the database and rejoins the pool.
+3. Replace replica A's image / binary and start it; it warms routing cache from the database and rejoins the pool.
 4. Repeat for replica B.
 5. Migrations run automatically on startup. Migrations must be backwards-compatible with the previous version's runtime — Nexus follows the expand–migrate–contract pattern; check the changelog before each upgrade.
 

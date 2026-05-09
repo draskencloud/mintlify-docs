@@ -340,7 +340,7 @@ export GATEWAY_SERVER__TRUSTED_PROXY_IPS="10.0.0.1/32,10.0.0.2/32"
 
 ## Network-Level Rate Limiting and DDoS Protection
 
-The gateway provides application-layer rate limiting (`IpRateLimitLayer` and `RateLimitLayer`), but these operate after the TCP connection is established and the HTTP request is parsed. They cannot protect against volumetric Layer 3/4 attacks (SYN floods, UDP floods, etc.).
+The gateway provides application-layer rate limiting (per-IP and per-token), but these operate after the TCP connection is established and the HTTP request is parsed. They cannot protect against volumetric Layer 3/4 attacks (SYN floods, UDP floods, etc.).
 
 **Recommended complementary protections:**
 
@@ -349,8 +349,8 @@ The gateway provides application-layer rate limiting (`IpRateLimitLayer` and `Ra
 | L3/L4 | Upstream ISP / cloud DDoS scrubbing | Volumetric floods before they reach your network |
 | L4 | Cloud WAF or DDoS protection (AWS Shield, Cloudflare, GCP Armor) | SYN floods, reflection attacks |
 | L7 | CDN (Cloudflare, Fastly, CloudFront) | HTTP flood mitigation, caching to reduce origin load |
-| L7 | Gateway `IpRateLimitLayer` | Per-IP request rate limiting at the application level |
-| L7 | Gateway `RateLimitLayer` | Per-token/per-user rate limiting at the application level |
+| L7 | Gateway per-IP rate limit | Per-IP request rate limiting at the application level |
+| L7 | Gateway per-token rate limit | Per-token/per-user rate limiting at the application level |
 
 **Recommended architecture for high-traffic deployments:**
 
@@ -383,4 +383,4 @@ token_rps = 50                  # env: GATEWAY_RATE_LIMIT__TOKEN_RPS
 token_burst = 100               # env: GATEWAY_RATE_LIMIT__TOKEN_BURST
 ```
 
-The IP rate limit fires before authentication (`IpRateLimitLayer` is outermost), so volumetric unauthenticated attacks are dropped before consuming bcrypt or database resources.
+The per-IP rate limit fires before authentication (it sits outermost in the middleware stack), so volumetric unauthenticated attacks are dropped before consuming bcrypt or database resources.

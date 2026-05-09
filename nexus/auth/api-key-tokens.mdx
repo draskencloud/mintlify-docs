@@ -78,13 +78,13 @@ For each request with a Bearer token where `auth_type = "api_key"`:
    ├── Cache HIT  → deserialise cached metadata
    │               → check revoked_at (reject if set)
    │               → check expires_at (reject if < now)
-   │               → return AuthIdentity ✓
+   │               → request authenticated ✓
    └── Cache MISS → query PostgreSQL WHERE token_hash = $1
                    ├── Row not found → 401
                    └── Row found     → check revoked_at (reject if set)
                                      → check expires_at (reject if < now)
                                      → write metadata to Redis (see Cache Behaviour)
-                                     → return AuthIdentity ✓
+                                     → request authenticated ✓
 ```
 
 **On cache hit, no database call is made.** The entire validation path — including revocation and expiry checks — is served from Redis metadata.

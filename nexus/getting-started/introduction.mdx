@@ -3,7 +3,7 @@ title: "Introduction to Nexus API Gateway by Drasken Cloud"
 description: "High-performance, open-core reverse-proxy API gateway in Rust handling auth, rate limiting, routing, and policy."
 ---
 
-Nexus API Gateway by Drasken Cloud is a high-performance, open-core reverse-proxy API gateway written in **Rust** using [Tokio](https://tokio.rs/) and [Axum](https://github.com/tokio-rs/axum). It sits in front of your backend services, handling authentication, rate limiting, routing, and policy enforcement so your backends do not have to.
+Nexus API Gateway by Drasken Cloud is a high-performance, open-core reverse-proxy API gateway. It sits in front of your backend services, handling authentication, rate limiting, routing, and policy enforcement so your backends do not have to.
 
 ---
 
@@ -29,7 +29,7 @@ Every API registered with the gateway gets authentication, rate limiting, IP fil
 
 ### Zero-copy streaming proxy
 
-The proxy engine forwards request and response bodies as byte streams using Hyper. Large payloads are not buffered in gateway memory; they are streamed from client to backend and back. The configurable `max_body_bytes` limit applies only to the enforce-before-forward check.
+The proxy engine forwards request and response bodies as byte streams. Large payloads are not buffered in gateway memory; they are streamed from client to backend and back. The configurable `max_body_bytes` limit applies only to the enforce-before-forward check.
 
 ### Multi-tenant API hierarchy
 
@@ -96,25 +96,7 @@ Traffic flows through port `8080` (the proxy / data plane). Configuration change
 **Storage**
 - SQLite (default, zero external deps) or PostgreSQL
 - Redis (optional; required only for multi-replica shared cache and distributed token revocation)
-- In-process `RuntimeStore` holds all routing data; proxy hot path performs zero database I/O
-
----
-
-## Current Status
-
-Nexus API Gateway by Drasken Cloud v1 is built in phases:
-
-| Phase | Status |
-|-------|--------|
-| Phase 1 — Foundation (proxy, auth, rate limit, management API) | **Complete** |
-| Phase 2 — Hardening (circuit breaker, retry, JWKS, health probing, graceful shutdown) | **Complete** |
-| Phase 3 — Observability (metrics, structured logging, audit pipeline) | **Complete** |
-| Phase 3.5 — Auth & Policy (full policy hierarchy, IP filter, header validation, CORS) | **Complete** |
-| Phase 4 — Production Readiness (TLS, mTLS to backends, OTel export) | **In progress** |
-| Phase 5 — Productization | Planned |
-| Phase 6 — BFF Orchestration | Planned |
-
-The gateway is production-ready for single-instance and multi-replica deployments. Phase 4 items (TLS termination, mTLS to backends, OpenTelemetry) are under active development and tracked separately.
+- In-process routing cache; the proxy request path performs zero database I/O
 
 ---
 

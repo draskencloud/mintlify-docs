@@ -36,27 +36,18 @@ For major version upgrades, read the migration notes for that version end-to-end
 
 ## Releases
 
-### v0.x — Phase 1–3.5
+For per-version patch notes consult [GitHub Releases](https://github.com/draskencloud/nexus/releases). The list below summarises the feature surface of the current line.
 
-Initial release line covering the core proxy, authentication, policy engine, observability, and deployment paths.
+### Available today
 
-Highlights across the line:
-
-- Phase 1: HTTP/1.1 reverse proxy, app/version/revision/endpoint hierarchy, API key auth, per-IP and per-token rate limits, management API, SQLite + Postgres backends.
-- Phase 2: Circuit breaker, retry on idempotent methods, JWKS-backed JWT, background health probing, graceful shutdown.
-- Phase 3: Prometheus metrics, structured JSON logging, async audit pipeline, dead letter queue.
-- Phase 3.5: Full policy inheritance (App → Version → Revision → Endpoint), IP filtering, header validation and injection, CORS, allowed methods, scope enforcement.
-
-For specific patch notes between releases, consult [GitHub Releases](https://github.com/draskencloud/nexus/releases).
-
-### v1.0 (Phase 4 — Production Readiness)
-
-In progress. Focus areas:
-
-- TLS termination at the gateway (server-side).
-- mTLS for backend connections, with reusable mTLS profiles.
-- OpenTelemetry trace export (OTLP) for distributed tracing.
-- Hardening of horizontal-scaling story (Redis-backed shared state, rolling upgrade tests).
+- **Proxy and routing.** HTTP/1.1 reverse proxy with the App → Version → Revision → Endpoint hierarchy. Pass-through and managed-endpoint routing modes. Path rewriting and weighted (canary) traffic routing.
+- **Authentication.** API key tokens, JWT (HS256, RS256, RS384, RS512, ES256, ES384) with JWKS support, HTTP Basic auth.
+- **Policy engine.** Full inheritance (App → Version → Revision → Endpoint) for auth, rate limits, CORS, IP filter, allowed methods, required scopes, header validation and injection, body size limit, and timeout.
+- **Resilience.** Per-Revision circuit breaker, automatic retry on idempotent methods, background health probing, graceful shutdown.
+- **Observability.** Prometheus metrics, structured JSON / text logs, async audit pipeline with dead-letter queue, optional OpenTelemetry trace export.
+- **Storage.** SQLite (default) and PostgreSQL. In-process or Redis-backed cache for multi-replica deployments.
+- **Security.** Server-side TLS termination, mutual TLS to backends via reusable mTLS profiles.
+- **Deployment.** Single binary, official Docker image, Helm chart for Kubernetes.
 
 ---
 

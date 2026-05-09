@@ -83,7 +83,7 @@ Likely the **circuit breaker has opened** for one or more Revisions.
 
 | Change type | How to apply |
 |-------------|-------------|
-| Policy / app / version / revision via management API | Immediate. RuntimeStore updates in-process. |
+| Policy / app / version / revision via management API | Immediate. The routing cache updates in-process. |
 | `config/default.toml` static settings (port, DB, TLS) | Restart required. |
 | `config/default.toml` runtime tunables (rate limits, timeouts) | `POST /api/v1/config/reload` or `PATCH /api/v1/config`. |
 | `config/apps/*.toml` file-based app definitions | Hot-reloaded via filesystem watcher (when enabled), or `POST /api/v1/config/apps/reload`. |
@@ -94,7 +94,7 @@ If a `PATCH /config` request returns `422`, the new value failed validation; the
 
 ## JWT signature validation failing
 
-1. Decode the JWT at jwt.io or via `cargo run --bin jwt-decode`. Confirm:
+1. Decode the JWT at jwt.io. Confirm:
    - `alg` matches what the policy expects (HS256 vs RS256, etc.).
    - `iss` and `aud` match policy fields.
    - `exp` is in the future.
@@ -116,7 +116,7 @@ If a `PATCH /config` request returns `422`, the new value failed validation; the
 
 ## Multi-replica deployment shows inconsistent state
 
-In a multi-replica setup, each replica maintains its own RuntimeStore. State changes propagate via:
+In a multi-replica setup, each replica maintains its own routing cache. State changes propagate via:
 
 - **Database polling** (default): each replica refreshes from the database every `poll_interval_secs`.
 - **Redis pub/sub** (when configured): immediate invalidation broadcasts.
@@ -133,7 +133,7 @@ If you see drift, confirm:
 
 ## Slow first request after a deploy
 
-The proxy populates RuntimeStore from the database on startup. On Kubernetes, set `readinessProbe` on `/api/v1/health` so the pod does not receive traffic until warm-up completes (sub-second for typical workloads, but visible under heavy app counts).
+The proxy populates routing cache from the database on startup. On Kubernetes, set `readinessProbe` on `/api/v1/health` so the pod does not receive traffic until warm-up completes (sub-second for typical workloads, but visible under heavy app counts).
 
 ---
 

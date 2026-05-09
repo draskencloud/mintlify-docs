@@ -24,14 +24,13 @@ Port `9090` does not require a network-level request to carry an admin token in 
 
 ## Full Middleware Stack
 
-Every request arriving on `:8080` passes through the Tower middleware stack in strict order. Each layer is a `tower::Service` implementation that either short-circuits (returns a response directly to the client) or calls the next layer.
+Every request arriving on `:8080` passes through the middleware stack in strict order. Each layer either short-circuits (returns a response directly to the client) or calls the next layer.
 
 ```
                                     :8080
                                       │
                               ┌───────▼────────┐
                               │  TCP Accept     │
-                              │  (Tokio async)  │
                               └───────┬────────┘
                                       │
                     ┌─────────────────▼──────────────────┐
@@ -49,7 +48,7 @@ Every request arriving on `:8080` passes through the Tower middleware stack in s
                     ┌─────────────────▼──────────────────┐
                     │  3. Auth                             │
                     │     API key / JWT / Basic Auth       │
-                    │     Check RuntimeStore → Redis → DB  │
+                    │     Check routing cache → cache → DB │
                     │     Short-circuit: 401 on failure    │
                     └─────────────────┬──────────────────┘
                                       │
@@ -111,11 +110,11 @@ Every request arriving on `:8080` passes through the Tower middleware stack in s
                                       │
                     ┌─────────────────▼──────────────────┐
                     │  12. Proxy Engine                    │
-                    │     Resolve route from RuntimeStore  │
+                    │     Resolve route from routing cache │
                     │     Match managed endpoints if mode  │
                     │     Rewrite URL (strip + base_path)  │
                     │     Copy headers (drop hop-by-hop)   │
-                    │     Forward via Hyper HTTP client    │
+                    │     Forward to backend               │
                     │     Stream response body back        │
                     │     Optionally populate cache        │
                     └─────────────────┬──────────────────┘
@@ -124,11 +123,11 @@ Every request arriving on `:8080` passes through the Tower middleware stack in s
 ```
 
 **Key invariants:**
-- Layers are stateless per-request; shared state lives in `Arc<AppState>`.
+- Layers are stateless per-request; shared state is held centrally and read concurrently.
 - Auth short-circuits before rate-limit work begins, so unauthenticated requests do not consume token rate-limit quota.
 - IP Filter runs after Auth so denied IPs do not consume per-token rate-limit counters.
 - CORS sits after Timeout so preflight responses include CORS headers even when the gateway is under load.
-- Audit log writes are async (`tokio::spawn`) — they never add to response latency.
+- Audit log writes are async — they never add to response latency.
 
 ---
 
@@ -166,14 +165,14 @@ Audit log entry is written asynchronously by the Logger layer after the response
 │  ┌──────────────────────────┐    ┌──────────────────────────────┐   │
 │  │   Data Plane  :8080      │    │  Control Plane  :9090        │   │
 │  │                          │    │                              │   │
-│  │  Tower middleware stack  │    │  Axum router                 │   │
+│  │  Middleware stack        │    │  Management API              │   │
 │  │  (12 layers, see above)  │    │  ├─ /api/v1/apps             │   │
 │  │                          │    │  ├─ /api/v1/apps/:id/        │   │
 │  │  Proxy Engine            │    │  │    versions               │   │
-│  │  ├─ RuntimeStore lookup  │    │  ├─ .../revisions            │   │
+│  │  ├─ Routing cache lookup │    │  ├─ .../revisions            │   │
 │  │  ├─ Canary weight select │    │  ├─ .../endpoints            │   │
 │  │  ├─ Circuit breaker check│    │  ├─ /api/v1/tokens           │   │
-│  │  └─ Hyper HTTP client    │    │  ├─ /api/v1/health           │   │
+│  │  └─ Forward to backend   │    │  ├─ /api/v1/health           │   │
 │  │                          │    │  ├─ /metrics (Prometheus)    │   │
 │  └──────────────────────────┘    │  └─ /swagger-ui              │   │
 │              │                   └──────────────────────────────┘   │
@@ -181,8 +180,8 @@ Audit log entry is written asynchronously by the Logger layer after the response
 │  ┌───────────▼─────────────────────────────────▼──────────────┐     │
 │  │                    Store Layer                               │     │
 │  │  ┌───────────────────────┐   ┌──────────────────────────┐  │     │
-│  │  │  RuntimeStore         │   │  Cache Layer              │  │     │
-│  │  │  (Arc<RwLock<...>>)   │   │  (memory / Redis /        │  │     │
+│  │  │  Routing cache        │   │  Response cache           │  │     │
+│  │  │  (in-process)         │   │  (memory / Redis /        │  │     │
 │  │  │  routing_table        │   │   Memcached)              │  │     │
 │  │  │  endpoints            │   └──────────────────────────┘  │     │
 │  │  │  token_cache          │   ┌──────────────────────────┐  │     │
@@ -193,36 +192,36 @@ Audit log entry is written asynchronously by the Logger layer after the response
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### RuntimeStore
+### Routing cache
 
-The `RuntimeStore` is an in-process, `Arc<RwLock<...>>` structure that holds all routing and policy data. The proxy hot path reads from it without any I/O:
+An in-process, lock-protected structure that holds all routing and policy data. The proxy request path reads from it without any I/O:
 
-- **`routing_table`** — sorted by path length (longest-prefix first); each entry is a fully merged `CachedRevision` with app + version + revision policy already combined.
-- **`endpoints`** — per-revision endpoint list for `managed_endpoint` mode apps; each entry has the resolved `policy_override`.
-- **`token_cache`** — in-process validated token store (LRU-bounded, default 50,000 entries); checked before Redis.
-- **`jwks_cache`** — JWT signing key sets keyed by JWKS URL; refreshed in the background.
-- **`app_index`** — slug → UUID lookup for management API operations.
+- **Routing table** — sorted by path length (longest-prefix first); each entry has the fully merged effective policy (app + version + revision) already combined.
+- **Endpoint registry** — per-revision endpoint list for `managed_endpoint` mode apps; each entry has the resolved policy override.
+- **Token cache** — validated token store (LRU-bounded, default 50,000 entries); checked before any external cache.
+- **JWKS cache** — JWT signing key sets keyed by JWKS URL; refreshed in the background.
+- **App index** — slug → ID lookup for management API operations.
 
-### Cache Layer
+### Response cache
 
-Separate from the RuntimeStore. The response cache (for HTTP response bodies) is configurable: `memory` (default, in-process LRU), `redis` (shared across replicas), or `memcached`.
+Separate from the routing cache. Caches successful upstream responses for the configured TTL. Configurable backend: in-process (default), Redis (shared across replicas), or Memcached.
 
 ### Database (SQLite / PostgreSQL)
 
-Stores API tokens and optional audit history. App, version, revision, and endpoint definitions live in TOML files and the RuntimeStore — not the database.
+Stores API tokens and optional audit history. App, version, revision, and endpoint definitions live in TOML files and the routing cache — not the database.
 
 ---
 
 ## Background Tasks
 
-The gateway starts several background Tokio tasks at process startup. They share the same `AppState` and run independently of request handling:
+The gateway starts several background tasks at process startup. They share state with the request path and run independently of request handling:
 
 | Task | Description |
 |------|-------------|
 | **Health prober** | Periodically sends HTTP requests to each revision's `health_check_path`. Marks revisions unhealthy in the in-memory health map; the proxy engine excludes unhealthy revisions from routing. |
 | **JWKS refresh** | Re-fetches JWKS key sets from configured IdP URLs before their cache TTL expires. Ensures JWT validation uses current signing keys without per-request fetches. |
 | **Update check** | Polls the GitHub releases API to detect newer gateway versions; logs a notice when a newer release is available. |
-| **File watcher** | (Optional, when `file_watch_enabled = true`) Watches `config/apps/` for changes using OS filesystem events; reloads changed TOML files and applies them to the RuntimeStore with a debounce delay (`file_watch_debounce_ms`). |
+| **File watcher** | (Optional, when `file_watch_enabled = true`) Watches `config/apps/` for changes using OS filesystem events; reloads changed TOML files and applies them to the routing cache with a debounce delay (`file_watch_debounce_ms`). |
 | **Audit pipeline drain** | Receives audit records from the Logger middleware via an async channel. Batches writes to the database and configured forwarders. Drains the buffer gracefully on shutdown before the process exits. |
 
 ---
@@ -242,26 +241,26 @@ The gateway starts several background Tokio tasks at process startup. They share
 
 | Operation | Storage hit | Why |
 |-----------|------------|-----|
-| Route lookup (every proxied request) | RuntimeStore (in-process, zero I/O) | Routing table is pre-built at startup and updated on config changes |
-| Token validation (cache hit) | RuntimeStore token cache | Zero I/O; LRU-bounded |
+| Route lookup (every proxied request) | Routing cache (in-process, zero I/O) | Routing table is pre-built at startup and updated on config changes |
+| Token validation (cache hit) | In-process token cache | Zero I/O; LRU-bounded |
 | Token validation (cache miss) | Redis → database | Redis is the fast path; database is source of truth |
-| Rate limit counter | Redis `INCR` + `EXPIRE` | Atomic increment + TTL reset maps exactly to Redis primitives |
+| Rate limit counter | Redis (atomic increment + TTL) | Maps exactly to Redis primitives |
 | Response cache lookup | In-process or Redis | Configurable; Redis for shared cache across replicas |
 | Audit log write | Async channel → database | Non-blocking; writes are buffered and batched |
-| Token revocation | Database `UPDATE` + Redis `DEL` | Database is source of truth; Redis entry deleted immediately to avoid serving revoked tokens within TTL |
+| Token revocation | Database update + cache invalidation | Database is source of truth; cache entry invalidated immediately to avoid serving revoked tokens within TTL |
 
 ---
 
 ## Concurrency Model
 
-The gateway runs a single **Tokio multi-threaded runtime**. All I/O — TCP connections, database queries, Redis commands, upstream HTTP requests — is async. No blocking work is done on async task threads. CPU-bound work (e.g. token hashing) uses `tokio::task::spawn_blocking` to avoid stalling the async executor.
+The gateway is fully asynchronous. All I/O — TCP connections, database queries, cache commands, upstream HTTP requests — is non-blocking. CPU-bound work (such as token hashing) is offloaded to a dedicated thread pool so the request loop is never stalled.
 
-Shared state is in `Arc`-wrapped types and cloned cheaply into each handler or middleware instance. There is no `Mutex` on the request hot path — all per-request state is local to the async task.
+Shared state is read concurrently and updated atomically. There is no exclusive lock on the request path — per-request state is isolated to the request handler.
 
 **Connection pools:**
 
 | Pool | Default size | Notes |
 |------|-------------|-------|
-| sqlx database pool | 10 (`db_max_connections`) | SQLite: intentionally 1; Postgres: tune for workload |
-| deadpool-redis | 10 (`cache.redis.pool_max_size`) | Redis connections are cheap; rarely the bottleneck |
-| Hyper HTTP client | Unlimited (per-host keepalive) | Connection reuse per backend host; configured via `[http]` section |
+| Database pool | 10 (`db_max_connections`) | SQLite: intentionally 1; Postgres: tune for workload |
+| Redis pool | 10 (`cache.redis.pool_max_size`) | Redis connections are cheap; rarely the bottleneck |
+| Backend HTTP client | Unlimited (per-host keepalive) | Connection reuse per backend host; configured via `[http]` section |

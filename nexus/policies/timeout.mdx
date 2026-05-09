@@ -77,14 +77,14 @@ The backend request is cancelled when the timeout fires. No partial response is 
 
 ---
 
-## Implementation Detail
+## How It Differs from the HTTP Client Timeout
 
-The timeout is enforced by a [Tower](https://github.com/tower-rs/tower) `Timeout` middleware layer that wraps the proxy engine. It is distinct from the outbound HTTP client's connection and read timeouts (`http.request_timeout_ms`), which are enforced at the transport layer.
+The policy timeout sits at the request-handling layer in front of the proxy engine. It is distinct from the outbound HTTP client's connection and read timeouts (`http.request_timeout_ms`), which are enforced at the transport layer.
 
 | Setting | What it controls |
 |---------|-----------------|
-| `proxy_timeout_ms` (policy) | Time allowed for the backend to start responding (Tower layer) |
-| `http.request_timeout_ms` (server config) | Total time for the outbound HTTP client connection + read (Hyper/Reqwest layer) |
+| `proxy_timeout_ms` (policy) | Time allowed for the backend to start responding |
+| `http.request_timeout_ms` (server config) | Total time for the outbound HTTP client connection + read |
 
 In most deployments you only need to tune `proxy_timeout_ms`. Set `http.request_timeout_ms` only if you need tighter control over the TCP-level timeout for the outbound connection.
 

@@ -76,15 +76,16 @@ The gateway operates on two distinct control planes:
 
 | Threat | Mitigation |
 |---|---|
-| **Unauthenticated requests** | `AuthLayer` validates credentials before forwarding. `required = true` (default) blocks unauthenticated traffic with `401`. |
+| **Unauthenticated requests** | The auth middleware validates credentials before forwarding. `required = true` (default) blocks unauthenticated traffic with `401`. |
 | **Credential replay / token theft** | Tokens stored as SHA-256 hashes. Revocation takes effect within milliseconds via cache invalidation. Short-lived tokens (configurable `expires_at`) limit replay window. |
 | **Scope escalation** | Scope enforcement blocks callers with insufficient scope from using unauthorized HTTP methods. `proxy:read` tokens cannot invoke write endpoints. |
-| **Rate abuse / DoS** | `IpRateLimitLayer` (per-IP) and `RateLimitLayer` (per-token) enforce configurable request rate limits. Requests over the limit receive `429`. |
-| **IP-based attacks** | `IpFilterLayer` enforces allow/deny lists of IP ranges per policy. |
-| **Oversized request bodies** | `BodyLimitLayer` enforces a configurable maximum body size, rejecting oversized requests with `413` before they reach the backend. |
-| **Timing attacks on secrets** | All credential comparisons use constant-time operations (`subtle::ConstantTimeEq`). bcrypt for basic auth is inherently constant-time. |
-| **Header injection from clients** | Gateway strips and rewrites specific headers (e.g., `X-Token-Meta-*`, `X-Forwarded-For`) before forwarding, preventing clients from spoofing injected context headers. |
-| **Malformed requests** | The Axum HTTP parser rejects structurally invalid HTTP before any middleware runs. |
+| **Rate abuse / DoS** | Per-IP and per-token rate limits enforce configurable request rate quotas. Requests over the limit receive `429`. |
+| **IP-based attacks** | The IP filter middleware enforces allow/deny lists of IP ranges per policy. |
+| **Oversized request bodies** | The body size limit middleware rejects oversized requests with `413` before they reach the backend. |
+| **Timing attacks on secrets** | All credential comparisons use constant-time operations. bcrypt for basic auth is inherently constant-time. |
+| **Header injection from clients** | The gateway strips and rewrites specific headers (e.g., `X-Token-Meta-*`, `X-Forwarded-For`) before forwarding, preventing clients from spoofing injected context headers. |
+| **Malformed requests** | The HTTP parser rejects structurally invalid HTTP before any middleware runs. |
+
 | **Expired credentials** | Expiry checked on every request (both cache hit and DB path). Expired tokens always receive `401`. |
 | **Password brute-force** | bcrypt with cost factor 12 makes each basic-auth verification take ~200–400 ms. Combined with rate limiting, brute-force attacks are computationally infeasible. |
 
@@ -151,9 +152,9 @@ Authorization: Bearer your-admin-token-value
 
 Requests without a valid admin token receive `401 Unauthorized`.
 
-**Implementation details:**
+**How it works:**
 
-- Comparison uses `subtle::ConstantTimeEq` to prevent timing-based token extraction.
+- Comparison is constant-time to prevent timing-based token extraction.
 - The admin token is not stored in the database. It is compared directly against the environment variable value in memory.
 - If `GATEWAY_SERVER__ADMIN_TOKEN` is not set, the management API is **unauthenticated** — all requests are accepted. This is suitable only for development. In production, always set this variable.
 

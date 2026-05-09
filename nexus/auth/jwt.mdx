@@ -125,14 +125,14 @@ The JWKS (JSON Web Key Set) option is recommended for managed identity providers
    │     → use cached JWK to verify signature
    └── Cache MISS or kid not found in cached set
          → fetch JWKS from jwks_url (timeout: jwks.fetch_timeout_ms)
-         → update DashMap entry with fresh JwkSet + now()
+         → update cache entry with fresh JWKS
          → select JWK by kid
          → verify signature
 3. Validate claims (exp, iss, aud, required_claims)
-4. Produce AuthIdentity
+4. Request authenticated
 ```
 
-The JWKS cache is an **in-process `DashMap`** keyed by URL. It is **not** stored in Redis — it is local to each gateway instance. This is intentional: JWKS responses can be large, and key material is not shared state in the same way tokens are.
+The JWKS cache is **in-process** and keyed by URL. It is **not** stored in Redis — it is local to each gateway instance. This is intentional: JWKS responses can be large, and key material is not shared state in the same way tokens are.
 
 ---
 
@@ -146,7 +146,7 @@ The JWKS cache is an **in-process `DashMap`** keyed by URL. It is **not** stored
 
 **Proactive background refresh:**
 
-A background Tokio task refreshes each JWKS URL at `cache_ttl_secs / 2` intervals. This means:
+A background task refreshes each JWKS URL at `cache_ttl_secs / 2` intervals. This means:
 
 - With the default 3600 s TTL, the background task refreshes every 1800 s.
 - Key rotations at the identity provider propagate within at most `cache_ttl_secs / 2` seconds.

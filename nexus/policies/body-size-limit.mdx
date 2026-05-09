@@ -15,7 +15,7 @@ The body limit middleware evaluates the request body size in two phases:
 
 2. **Streaming check** — for requests without `Content-Length` (e.g., chunked transfer encoding), the gateway measures the body as it streams in. If the running total exceeds the limit, the connection is dropped and `413` is returned.
 
-In the normal path (body under the limit), the body is streamed **zero-copy** from the client to the backend using Hyper. The gateway does not buffer the entire body in memory.
+In the normal path (body under the limit), the body is streamed **zero-copy** from the client to the backend. The gateway does not buffer the entire body in memory.
 
 ---
 

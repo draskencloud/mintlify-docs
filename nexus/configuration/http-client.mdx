@@ -61,8 +61,8 @@ These two settings are different and complementary:
 
 | Setting | Scope | Enforcement point |
 |---|---|---|
-| `http.request_timeout_ms` | Per outbound HTTP request on the shared client | reqwest client |
-| `server.proxy_timeout_ms` | Entire handler execution (middleware deadline) | Tower middleware |
+| `http.request_timeout_ms` | Per outbound HTTP request on the shared client | HTTP client |
+| `server.proxy_timeout_ms` | Entire handler execution (middleware deadline) | Request-handling layer |
 
 `proxy_timeout_ms` wraps the entire handler — including database lookups, cache operations, and the upstream call. `request_timeout_ms` applies only to the HTTP call itself, and only for the shared client. In practice, `proxy_timeout_ms` should be set equal to or slightly less than `request_timeout_ms` to ensure the middleware deadline fires before the client timeout.
 

@@ -31,7 +31,7 @@ All fields are optional. Omitted fields inherit from the parent.
 
 ## `auth`
 
-Authentication requirements applied by the `AuthLayer`.
+Authentication requirements applied by the auth middleware.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -52,7 +52,7 @@ Examples and decision trees: [Authentication Overview](/nexus/auth/overview), [J
 
 ## `rate_limit`
 
-Per-token rate limit applied by `RateLimitLayer` after auth.
+Per-token rate limit applied after auth.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

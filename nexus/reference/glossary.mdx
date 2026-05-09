@@ -149,7 +149,7 @@ This glossary is the single source of truth for terminology. When in doubt about
 
 **Routing mode** — `pass_through` or `managed_endpoint`. Set on App creation, immutable thereafter.
 
-**RuntimeStore** — In-process cache of all routing data. The proxy hot path reads from RuntimeStore exclusively — zero database I/O per request.
+**Routing cache** — In-process cache of all routing data, populated at startup and updated on config changes. The proxy request path reads from it exclusively — zero database I/O per request.
 
 ---
 

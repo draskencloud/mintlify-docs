@@ -202,28 +202,28 @@ The complete flow from request to backend, focusing on scope:
 ```
 Request arrives at proxy port 8080
   │
-  ├── [IpRateLimitLayer] — check IP rate limit
-  ├── [TraceLayer] — attach trace context
+  ├── Per-IP rate limit          — check IP rate limit
+  ├── Trace context              — attach request ID and span
   │
-  ├── [AuthLayer]
+  ├── Authentication
   │     ├── Extract credential from Authorization header
-  │     ├── Validate credential (token hash / JWT sig / bcrypt)
+  │     ├── Validate credential (token hash / JWT signature / bcrypt)
   │     ├── On failure → 401 Unauthorized
-  │     └── On success → produce AuthIdentity{scopes: [...]}
+  │     └── On success → derive identity with scopes attached
   │
-  ├── [AuthLayer — scope check]
-  │     ├── Determine required scope from HTTP method (or required_scopes override)
-  │     ├── Check if AuthIdentity.scopes contains the required scope
-  │     ├── On mismatch → 403 Forbidden {"status":403,"message":"insufficient scope","data":null}
-  │     └── On match → pass AuthIdentity downstream
+  ├── Scope check
+  │     ├── Determine required scope from HTTP method (or `required_scopes` override)
+  │     ├── Check if the identity's scopes contain the required scope
+  │     ├── On mismatch → 403 Forbidden  {"status":403,"message":"insufficient scope","data":null}
+  │     └── On match → pass identity downstream
   │
-  ├── [RateLimitLayer] — per-token rate limit using AuthIdentity.token_id
-  ├── [HeaderValidationLayer]
-  ├── [IpFilterLayer]
-  ├── [BodyLimitLayer]
-  ├── [TimeoutLayer]
-  ├── [CorsLayer]
-  ├── [LoggerLayer]
+  ├── Per-token rate limit       — keyed by the authenticated identity
+  ├── Header validation
+  ├── IP filter
+  ├── Body size limit
+  ├── Timeout
+  ├── CORS
+  ├── Access logger
   │
-  └── [ProxyEngine] — forward request to backend
+  └── Proxy engine               — forward request to backend
 ```
