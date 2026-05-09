@@ -1,0 +1,248 @@
+---
+title: "Health Probing"
+description: "Background probe per active revision; unhealthy backends are excluded from routing automatically."
+---
+
+The Nexus API Gateway by Drasken Cloud runs a background health probe task that periodically checks whether each active backend revision is healthy. Unhealthy revisions are automatically excluded from request routing, protecting clients from being routed to broken backends.
+
+---
+
+## How It Works
+
+The health probe task runs continuously in the background (independent of the request path). For each active revision that has a `health_check_path` configured, the task sends a `GET` request to the backend at the configured interval and records the result in an in-memory health map.
+
+```
+Background task (every health_interval_secs):
+  For each active revision with health_check_path:
+    1. Send: GET <backend_scheme>://<backend_host>:<backend_port><health_check_path>
+    2. If 2xx response within timeout → mark is_healthy = true
+    3. If connection error, timeout, or non-2xx → mark is_healthy = false
+    4. Log state transitions at WARN level
+```
+
+The proxy engine reads from this health map at request time. The health map lookup is a fast in-process read with no I/O.
+
+---
+
+## Configuration
+
+Health probing is configured in the server configuration:
+
+```toml
+[server]
+health_interval_secs = 30
+```
+
+| Config field | Default | Description |
+|--------------|---------|-------------|
+| `health_interval_secs` | `30` | Interval between health probes in seconds |
+
+Via environment variable:
+
+```bash
+GATEWAY_SERVER__HEALTH_INTERVAL_SECS=30
+```
+
+The health check timeout uses the server's outbound HTTP client timeout (`http.request_timeout_ms`), which defaults to 10 seconds. A probe that does not receive a response within this timeout is treated as a failure.
+
+---
+
+## Configuring a Revision for Health Probing
+
+Set `health_check_path` on the revision to enable probing:
+
+```bash
+curl -s -X POST \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "revision": "prod-1",
+    "backend_scheme": "http",
+    "backend_host": "orders-svc",
+    "backend_port": 8080,
+    "health_check_path": "/health"
+  }' | jq
+```
+
+### When `health_check_path` is absent
+
+If `health_check_path` is `null` or not set on a revision:
+
+- No probe is sent to that revision.
+- The revision is **always treated as healthy** (`is_healthy = true` permanently).
+- No `gateway_backend_health` metric is emitted for that revision.
+
+Use this for backends that do not expose a health endpoint, or for testing revisions where you want to control health manually.
+
+---
+
+## What Counts as Healthy
+
+| Condition | Result |
+|-----------|--------|
+| HTTP 2xx response (`200`, `204`, etc.) received within timeout | Healthy |
+| HTTP 3xx redirect | Unhealthy (gateway does not follow redirects for health probes) |
+| HTTP 4xx or 5xx response | Unhealthy |
+| TCP connection refused | Unhealthy |
+| DNS resolution failure | Unhealthy |
+| Response not received within timeout | Unhealthy |
+
+A single failed probe marks the revision as unhealthy immediately. A single successful probe after a failure returns the revision to healthy.
+
+---
+
+## Health State Storage
+
+Health state is stored in `AppState.backend_health`, a `DashMap<Uuid, bool>` keyed on revision ID:
+
+- `true` — revision is healthy; eligible for routing.
+- `false` — revision is unhealthy; excluded from routing.
+
+The DashMap is in-process and not shared across gateway replicas. Each replica probes backends independently and maintains its own health map. In a multi-replica deployment, different instances may briefly disagree on the health of a backend (convergence within one probe interval).
+
+---
+
+## Effect on Request Routing
+
+The proxy engine checks the health map during revision selection:
+
+```
+Candidate revisions for this request:
+  revision-2  (is_current=true,  is_healthy=true)   ← selected
+  revision-3  (is_current=false, is_healthy=false)  ← excluded
+```
+
+When canary weights are configured:
+
+```
+Candidate revisions:
+  revision-2  (weight=90, is_healthy=true)   ← eligible
+  revision-3  (weight=10, is_healthy=false)  ← excluded
+
+Effective weight: 100% to revision-2 (only eligible candidate)
+```
+
+### All revisions unhealthy
+
+If all candidate revisions are unhealthy, the gateway returns:
+
+```json
+{"status": 503, "message": "no healthy revision available", "data": null}
+```
+
+This is a terminal state. The gateway does not attempt to bypass health exclusion or route to an unhealthy revision under any circumstances. An operator must intervene — either fix the backend or promote a different revision.
+
+---
+
+## State Transitions
+
+Health state transitions are logged at `WARN` level:
+
+```
+WARN gateway::health_probe: revision b2c3d4e5 became unhealthy (connection refused to orders-svc:8080)
+WARN gateway::health_probe: revision b2c3d4e5 recovered (200 OK from orders-svc:8080/health)
+```
+
+This makes it easy to correlate backend failures with alert thresholds in your log aggregation system.
+
+---
+
+## Metrics
+
+```
+gateway_backend_health{app_id="<uuid>", revision_id="<uuid>"} 1
+gateway_backend_health{app_id="<uuid>", revision_id="<uuid>"} 0
+```
+
+This is a **gauge** metric:
+- `1` — revision is currently healthy.
+- `0` — revision is currently unhealthy.
+
+Use this metric to build alerting rules:
+
+```promql
+# Alert when any revision is unhealthy for more than 2 minutes
+gateway_backend_health == 0 for 2m
+
+# Alert when ALL revisions for an app are unhealthy (traffic is blocked)
+sum by (app_id) (gateway_backend_health) == 0
+```
+
+---
+
+## Operator Responsibilities
+
+The gateway **never** automatically removes or modifies revisions based on health state. It only excludes unhealthy revisions from routing. When a backend becomes unhealthy, the operator must decide:
+
+| Situation | Recommended action |
+|-----------|--------------------|
+| Backend is temporarily down (deploy in progress) | Wait for backend to recover; gateway re-includes automatically |
+| Backend is permanently broken | Activate an alternate revision (`POST /revisions/:id/activate`) |
+| All revisions are unhealthy | Fix the backend or promote a revision from a known-good backup |
+| Backend passes health check but serves errors | Health probing only checks HTTP status, not response body. Use circuit breaking for error-rate based isolation. |
+
+---
+
+## Recommended Health Endpoint Design
+
+Your backend's health endpoint should:
+
+1. **Return `200 OK`** when the service is ready to accept traffic.
+2. **Return `503 Service Unavailable`** when the service cannot handle requests (e.g., database unavailable, dependencies not ready).
+3. **Respond quickly** — under 1 second. Slow health checks delay state transitions.
+4. **Check real dependencies** — not just "process is running" but also "database connection works", "cache reachable", etc.
+
+Example health endpoint (Go):
+
+```go
+http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+    if db.Ping() != nil {
+        w.WriteHeader(http.StatusServiceUnavailable)
+        return
+    }
+    w.WriteHeader(http.StatusOK)
+})
+```
+
+---
+
+## Complete Example
+
+```bash
+APP_ID=<app-uuid>
+VERSION_ID=<version-uuid>
+
+# Create revision with health check
+curl -s -X POST \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "revision": "prod-1",
+    "backend_scheme": "http",
+    "backend_host": "orders-svc",
+    "backend_port": 8080,
+    "backend_base_path": "/",
+    "strip_gateway_path": true,
+    "health_check_path": "/health"
+  }' | jq
+
+REVISION_ID=<revision-uuid>
+
+# Activate it
+curl -s -X POST \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID/activate" \
+  | jq
+
+# Check health metric (on management port)
+curl -s http://localhost:9090/metrics | grep gateway_backend_health
+# gateway_backend_health{app_id="...",revision_id="..."} 1
+```
+
+---
+
+## Related Topics
+
+- [Circuit Breaker](/nexus/backends/circuit-breaker) — error-rate based isolation (complements health probing)
+- [Backend Configuration](/nexus/backends/configuration) — `health_check_path`, `traffic_weight`, `is_current`
+- [Routing Overview](/nexus/routing/overview) — how unhealthy revisions affect request routing
+- [Retry Logic](/nexus/backends/retry-logic) — automatic retry on backend errors

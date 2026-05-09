@@ -1,0 +1,346 @@
+---
+title: "Header Validation"
+description: "Required headers, value validation rules, static add/remove, response add/remove, and dynamic header injection."
+---
+
+The `headers` policy field controls which headers must be present on incoming requests, how header values are validated, which headers are stripped or added before forwarding, and which dynamic values are injected based on runtime context. These rules apply before the request reaches the backend.
+
+---
+
+## The `HeadersPolicy` Object
+
+All header enforcement is configured within the `headers` key of the policy document:
+
+```json
+{
+  "headers": {
+    "required": [...],
+    "validate": {...},
+    "add": {...},
+    "remove": [...],
+    "response_add": {...},
+    "response_remove": [...],
+    "inject": [...]
+  }
+}
+```
+
+Each sub-field is optional. Absent sub-fields have no effect.
+
+---
+
+## `required` — Require Specific Headers
+
+An array of header names that must be present in the incoming request. If any listed header is absent, the request is rejected before reaching the backend.
+
+```json
+{
+  "headers": {
+    "required": ["x-api-version", "x-request-source", "x-idempotency-key"]
+  }
+}
+```
+
+**Response on violation:**
+
+```json
+{"status": 400, "message": "missing required header: x-api-version", "data": null}
+```
+
+Header name matching is case-insensitive (HTTP/1.1 headers are case-insensitive per RFC 7230).
+
+---
+
+## `validate` — Validate Header Values
+
+A map of header name → validation rule. The request must pass all validation rules; a single failed rule rejects the request.
+
+```json
+{
+  "headers": {
+    "validate": {
+      "x-api-version": {"oneof": ["v1", "v2", "v3"]},
+      "content-type": {"exact": "application/json"},
+      "x-request-source": {"regex": "^[a-z][a-z0-9-]{0,63}$"}
+    }
+  }
+}
+```
+
+### Validation rule types
+
+| Rule | Type | Description |
+|------|------|-------------|
+| `exact` | string | Header value must exactly equal this string (case-sensitive) |
+| `regex` | string | Header value must match this regular expression (full match) |
+| `oneof` | string[] | Header value must be one of the listed strings (case-sensitive) |
+
+Only one rule type may be specified per header. Specifying multiple types for the same header is invalid.
+
+**Response on validation failure:**
+
+```json
+{"status": 400, "message": "invalid header value: x-api-version", "data": null}
+```
+
+### Regex notes
+
+- Regexes are compiled once at policy load time and cached.
+- Anchored with `^` and `$` for full-string matching — partial matches are not accepted.
+- Use standard regex syntax (Rust `regex` crate dialect: POSIX-compatible with Unicode support).
+
+### Combined `required` + `validate`
+
+A header listed in `required` but not in `validate` is checked for presence only (any value is accepted). A header listed in `validate` but not in `required` is validated only if present (absent headers skip validation). To require a header and validate its value, list it in both:
+
+```json
+{
+  "headers": {
+    "required": ["x-api-version"],
+    "validate": {
+      "x-api-version": {"oneof": ["v1", "v2"]}
+    }
+  }
+}
+```
+
+---
+
+## `add` — Inject Static Request Headers
+
+A map of header name → static value to inject into every forwarded request. These are added (or overwritten if the client already sent the same header) before the request is forwarded to the backend.
+
+```json
+{
+  "headers": {
+    "add": {
+      "x-gateway-env": "production",
+      "x-gateway-version": "2.0",
+      "x-upstream-service": "orders-api"
+    }
+  }
+}
+```
+
+Use `add` for static routing hints, environment tags, or internal identification headers that backends rely on.
+
+---
+
+## `remove` — Strip Request Headers Before Forwarding
+
+An array of header names to remove from the request before forwarding to the backend. These headers may have been sent by the client but should not reach the backend.
+
+```json
+{
+  "headers": {
+    "remove": ["x-internal-debug", "x-admin-override", "x-bypass-cache"]
+  }
+}
+```
+
+Use `remove` to prevent clients from spoofing internal control headers that backends might trust.
+
+---
+
+## `response_add` — Inject Static Response Headers
+
+A map of header name → static value to inject into every response returned to the client. These are applied to the backend's response after it is received.
+
+```json
+{
+  "headers": {
+    "response_add": {
+      "strict-transport-security": "max-age=31536000; includeSubDomains; preload",
+      "x-frame-options": "DENY",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "strict-origin-when-cross-origin"
+    }
+  }
+}
+```
+
+Use `response_add` to enforce security headers uniformly without modifying backend code. If the backend already returns the same header, both values will appear (the backend's and the policy's). To override, add it to `response_remove` first.
+
+---
+
+## `response_remove` — Strip Backend Response Headers
+
+An array of header names to strip from the backend's response before returning it to the client.
+
+```json
+{
+  "headers": {
+    "response_remove": ["x-powered-by", "server", "x-aspnet-version", "x-aspnet-mvc-version"]
+  }
+}
+```
+
+Use `response_remove` to prevent technology fingerprinting by removing headers that reveal backend implementation details.
+
+---
+
+## `inject` — Dynamic Request Header Injection
+
+The `inject` array defines rules for deriving header values from runtime context. Unlike `add` (which uses static strings), inject rules evaluate a `source` expression at request time.
+
+```json
+{
+  "headers": {
+    "inject": [
+      {
+        "source": "metadata.tenant_id",
+        "target": "x-tenant-id",
+        "fallback": "default-tenant"
+      },
+      {
+        "source": "request.header.x-correlation-id",
+        "target": "x-internal-correlation-id"
+      },
+      {
+        "source": "request.query.version",
+        "target": "x-client-version",
+        "fallback": "unknown"
+      },
+      {
+        "source": "request.path",
+        "target": "x-original-path"
+      },
+      {
+        "source": "request.method",
+        "target": "x-original-method"
+      }
+    ]
+  }
+}
+```
+
+### Inject rule fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `source` | string | Yes | Source expression (see table below) |
+| `target` | string | Yes | Name of the header to inject into the forwarded request |
+| `fallback` | string | No | Static value to use if the source resolves to nothing. If absent and source is missing, the rule is skipped silently. |
+
+### Source expressions
+
+| Expression | Resolves to |
+|------------|-------------|
+| `metadata.<key>` | Value of `<key>` from the authenticated `ApiToken.metadata` map |
+| `request.header.<name>` | Value of the named inbound request header |
+| `request.path` | Full request path (after gateway routing, before prefix stripping) |
+| `request.method` | HTTP method of the request (e.g., `GET`, `POST`) |
+| `request.query.<param>` | Value of the named query parameter |
+
+### Fallback behaviour
+
+| Source resolves | Fallback configured | Result |
+|-----------------|---------------------|--------|
+| Value found | — | Inject source value |
+| Missing | Yes | Inject fallback value |
+| Missing | No | Rule silently skipped; no header injected |
+
+---
+
+## Metrics
+
+```
+gateway_policy_denials_total{reason="header_validation"}
+```
+
+This counter increments each time a request is rejected by header validation (either `required` or `validate` rules). Use it to detect misconfigured clients or integration issues.
+
+---
+
+## Complete Example
+
+A policy that enforces strict header requirements, validates content, strips internal client headers, injects backend routing headers, and adds security response headers:
+
+```json
+{
+  "headers": {
+    "required": ["x-api-version", "x-idempotency-key"],
+    "validate": {
+      "x-api-version": {"oneof": ["v1", "v2"]},
+      "content-type": {"regex": "^application/(json|x-www-form-urlencoded)(; .*)?$"}
+    },
+    "remove": ["x-internal-flag", "x-admin-key"],
+    "add": {
+      "x-routed-by": "drasken-gateway",
+      "x-env": "production"
+    },
+    "inject": [
+      {
+        "source": "metadata.tenant_id",
+        "target": "x-tenant-id"
+      },
+      {
+        "source": "metadata.plan",
+        "target": "x-plan",
+        "fallback": "free"
+      },
+      {
+        "source": "request.query.client_version",
+        "target": "x-client-version",
+        "fallback": "unknown"
+      }
+    ],
+    "response_add": {
+      "strict-transport-security": "max-age=31536000; includeSubDomains",
+      "x-frame-options": "DENY",
+      "x-content-type-options": "nosniff"
+    },
+    "response_remove": ["x-powered-by", "server"]
+  }
+}
+```
+
+### Apply this policy to a revision
+
+```bash
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "policy": {
+      "headers": {
+        "required": ["x-api-version"],
+        "validate": {
+          "x-api-version": {"oneof": ["v1", "v2"]}
+        },
+        "response_add": {
+          "x-frame-options": "DENY"
+        }
+      }
+    }
+  }' | jq
+```
+
+### Test
+
+```bash
+API_TOKEN=gw_...
+
+# Missing required header → 400
+curl -s http://localhost:8080/api/v1/resource \
+  -H "Authorization: Bearer $API_TOKEN" | jq
+
+# Invalid header value → 400
+curl -s http://localhost:8080/api/v1/resource \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "x-api-version: v99" | jq
+
+# Valid request → 200 (proxied)
+curl -s http://localhost:8080/api/v1/resource \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "x-api-version: v1" | jq
+```
+
+---
+
+## Related Topics
+
+- [Policy Overview](/nexus/policies/overview) — full policy field reference and inheritance
+- [Header Filtering](/nexus/routing/header-filtering) — complete list of injected and stripped headers with ordering
+- [IP Filtering](/nexus/policies/ip-filtering) — CIDR-based access control
+- [CORS](/nexus/policies/cors) — cross-origin response headers

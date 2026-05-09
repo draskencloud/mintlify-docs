@@ -1,0 +1,322 @@
+---
+title: "Token Lifecycle"
+description: "Issuing, using, expiring, updating, revoking, and rotating API tokens with operational security guidance."
+---
+
+This document covers the complete lifecycle of an API key token from issuance through expiry, update, revocation, rotation, and listing. It also covers operational security recommendations for managing tokens in production.
+
+---
+
+## Table of Contents
+
+- [Token Lifecycle Overview](#token-lifecycle-overview)
+- [Issuing a Token](#issuing-a-token)
+- [Token Fields Reference](#token-fields-reference)
+- [Using a Token](#using-a-token)
+- [Token Expiry](#token-expiry)
+- [Listing Tokens](#listing-tokens)
+- [Updating a Token](#updating-a-token)
+- [Revoking a Token](#revoking-a-token)
+- [Rotating a Token](#rotating-a-token)
+- [Cache Invalidation on Revocation](#cache-invalidation-on-revocation)
+- [Operational Security Recommendations](#operational-security-recommendations)
+
+---
+
+## Token Lifecycle Overview
+
+```
+Issue → [Use] → (Update name/expiry as needed)
+                    ↓
+              [Rotate periodically] → new token issued, old revoked atomically
+                    ↓
+              [Revoke] → immediate invalidation
+                    ↓
+              [Expired] → automatic rejection (no cleanup needed)
+```
+
+---
+
+## Issuing a Token
+
+Tokens are issued via the management API. Port `9090` must be accessible to the operator but not to the public internet.
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps/{app_id}/tokens \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "billing-service-prod",
+    "scopes": ["proxy:read", "proxy:write"],
+    "expires_at": "2027-01-01T00:00:00Z",
+    "metadata": {
+      "service": "billing",
+      "environment": "production",
+      "owner": "platform-team"
+    }
+  }'
+```
+
+**Response (201 Created):**
+
+```json
+{
+  "status": 201,
+  "message": "created",
+  "data": {
+    "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "app_id": "1e4d6f8a-9b2c-4e7f-a012-3456789abcde",
+    "name": "billing-service-prod",
+    "token": "pK3mXvQj8oLnR2sYwC5eFtBdNhA0uZGq7IyMxVD1JcP4kHWOlSbgE6TiUjFr",
+    "scopes": ["proxy:read", "proxy:write"],
+    "expires_at": "2027-01-01T00:00:00Z",
+    "metadata": {
+      "service": "billing",
+      "environment": "production",
+      "owner": "platform-team"
+    },
+    "revoked_at": null,
+    "created_at": "2026-05-09T12:00:00Z"
+  }
+}
+```
+
+> **Critical:** The `token` field in the issuance response is the **only time the raw token value appears**. The gateway stores a SHA-256 hash; the plaintext is gone the moment this response is sent. Copy the value to a secrets manager immediately.
+
+---
+
+## Token Fields Reference
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | UUID | Unique identifier for the token record. Use this in API calls to manage the token. |
+| `app_id` | UUID | The app this token is scoped to. A token can only authenticate requests to this app's policy. |
+| `name` | string | Human-readable label for the token. Not used in auth; used for display and audit logs. |
+| `token` | string | **Issuance only.** The raw 64-character base64url token value. Never returned again after issuance. |
+| `scopes` | string[] | The scopes granted. Valid values: `proxy:read`, `proxy:write`. |
+| `expires_at` | ISO 8601 datetime \| null | When the token expires. Null means the token does not expire (use with caution). |
+| `metadata` | map\<string, string\> | Arbitrary key-value pairs. Each entry is injected as a header to the backend on successful auth. |
+| `revoked_at` | ISO 8601 datetime \| null | Set when the token is revoked. Null means the token is active. |
+| `created_at` | ISO 8601 datetime | When the token was created. |
+
+---
+
+## Using a Token
+
+Include the raw token value in the `Authorization: Bearer` header on every request to the proxy port (`8080`):
+
+```bash
+curl http://localhost:8080/your/api/path \
+  -H "Authorization: Bearer pK3mXvQj8oLnR2sYwC5eFtBdNhA0uZGq7IyMxVD1JcP4kHWOlSbgE6TiUjFr"
+```
+
+The gateway validates the token and forwards the request to the configured backend if validation succeeds.
+
+---
+
+## Token Expiry
+
+When `expires_at` is set, the gateway checks it on every request — both on cache hit and on the database fallback path:
+
+- If `now() >= expires_at` → `401 Unauthorized` with body `{"status":401,"message":"token expired","data":null}`
+- If `now() < expires_at` → expiry check passes
+
+The Redis cache TTL is capped at `min(token_cache_ttl_secs, time_until_expiry_secs)`. An expired token will never produce a cache hit.
+
+**Tokens do not auto-delete when they expire.** The record stays in PostgreSQL with `revoked_at = null` but validation always rejects it. You can clean up expired tokens periodically or leave them for audit purposes.
+
+**Setting no expiry (`expires_at: null`):**
+
+```json
+{
+  "name": "long-lived-integration",
+  "scopes": ["proxy:read"],
+  "expires_at": null
+}
+```
+
+Non-expiring tokens are convenient but increase risk if a token is compromised. Compensate with regular rotation (see below).
+
+---
+
+## Listing Tokens
+
+```bash
+curl http://localhost:9090/api/v1/apps/{app_id}/tokens \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "status": 200,
+  "message": "ok",
+  "data": [
+    {
+      "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+      "app_id": "1e4d6f8a-9b2c-4e7f-a012-3456789abcde",
+      "name": "billing-service-prod",
+      "scopes": ["proxy:read", "proxy:write"],
+      "expires_at": "2027-01-01T00:00:00Z",
+      "metadata": {"service": "billing", "environment": "production"},
+      "revoked_at": null,
+      "created_at": "2026-05-09T12:00:00Z"
+    }
+  ]
+}
+```
+
+The `token` field (raw value) is **never included** in list or get responses. Only metadata is returned.
+
+---
+
+## Updating a Token
+
+You can update a token's `name` or `expires_at` without reissuing it:
+
+```bash
+curl -X PATCH http://localhost:9090/api/v1/apps/{app_id}/tokens/{token_id} \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "billing-service-prod-v2",
+    "expires_at": "2028-01-01T00:00:00Z"
+  }'
+```
+
+**What can be updated:**
+
+| Field | Updatable | Notes |
+|---|---|---|
+| `name` | Yes | Human label only; no auth effect |
+| `expires_at` | Yes | Can extend or shorten expiry |
+| `scopes` | No | Rotate the token to change scopes |
+| `metadata` | No | Rotate the token to change metadata |
+
+Updating `expires_at` does **not** invalidate the Redis cache. The updated expiry takes effect at the next cache miss (i.e., within `token_cache_ttl_secs` seconds). If immediate enforcement is needed — for example, shortening expiry to revoke in seconds — use the revocation endpoint instead.
+
+---
+
+## Revoking a Token
+
+Revocation permanently invalidates a token:
+
+```bash
+curl -X DELETE http://localhost:9090/api/v1/apps/{app_id}/tokens/{token_id} \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "status": 200,
+  "message": "revoked",
+  "data": null
+}
+```
+
+Revocation:
+
+1. Sets `revoked_at = now()` in PostgreSQL.
+2. Immediately deletes the Redis cache entry for that token's hash.
+3. Returns 200.
+
+After revocation, the next request using the old token:
+- Gets a cache miss (entry was deleted).
+- Hits PostgreSQL, which returns `revoked_at` set.
+- Receives `401 Unauthorized` with `{"status":401,"message":"token revoked","data":null}`.
+
+Revoked tokens cannot be un-revoked. Issue a new token if you need to restore access.
+
+---
+
+## Rotating a Token
+
+Rotation issues a new token and atomically invalidates the old one. This is the recommended approach for periodic credential rotation:
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps/{app_id}/tokens/{token_id}/rotate \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "status": 200,
+  "message": "rotated",
+  "data": {
+    "id": "9c1d4e7b-2f3a-4b5c-8d9e-0f1a2b3c4d5e",
+    "app_id": "1e4d6f8a-9b2c-4e7f-a012-3456789abcde",
+    "name": "billing-service-prod",
+    "token": "Rz9nWqXk4pMsT6vYbE1cFuLhN3jOaJH8IDyGC2eKsUiV0dtBXfwPgQmSlA7oZ",
+    "scopes": ["proxy:read", "proxy:write"],
+    "expires_at": "2027-01-01T00:00:00Z",
+    "metadata": {"service": "billing", "environment": "production"},
+    "rotated_from": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "created_at": "2026-05-09T13:00:00Z"
+  }
+}
+```
+
+**What rotation does, atomically:**
+
+1. Generates a new 48-byte random token value.
+2. Creates a new token record inheriting `name`, `scopes`, `expires_at`, and `metadata` from the old token.
+3. Sets `revoked_at = now()` on the old token.
+4. Deletes the old token's Redis cache entry.
+5. Returns the new raw token value (one-time only).
+
+**Zero-downtime rotation procedure:**
+
+```
+1. Call POST .../tokens/{old_id}/rotate → receive new_token_value
+2. Store new_token_value in secrets manager
+3. Update your service's environment / secret binding to use new_token_value
+4. Restart / reload the service
+5. Old token is already revoked; no further cleanup needed
+```
+
+The window between step 1 and step 4 where both tokens might be in use is brief. The old token is immediately revoked by the rotation call, so if you need a zero-downtime overlap window, issue a new token manually instead of rotating, then revoke the old token after your services have transitioned.
+
+---
+
+## Cache Invalidation on Revocation
+
+Revocation is effective **within milliseconds** of the API call, even though the cache TTL may be up to 300 seconds:
+
+| Event | PostgreSQL | Redis |
+|---|---|---|
+| Token revoked | `revoked_at` set immediately | Cache entry deleted immediately |
+| Next request with old token | N/A (cache miss first) | Cache miss → DB hit → `revoked_at` set → 401 |
+
+There is no polling delay. The cache entry is deleted synchronously as part of the revocation operation before the API call returns.
+
+---
+
+## Operational Security Recommendations
+
+**Store raw tokens immediately.** On issuance or rotation, the raw token is returned once. Copy it to a secrets manager (e.g., HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager, 1Password Secrets Automation) before closing the response. Do not log it, echo it in scripts, or store it in version control.
+
+**Set `expires_at` for all tokens.** Short-lived tokens limit the blast radius of a compromise. Even a 90-day expiry is significantly better than no expiry. Automate rotation before expiry to avoid service interruptions.
+
+```
+┌─────────────────────────────────────┐
+│ Recommended token lifetime by use case │
+├────────────────────────┬────────────┤
+│ CI/CD pipeline tokens  │ 24 hours   │
+│ Per-deployment tokens  │ 7 days     │
+│ Long-lived service acc │ 90 days    │
+│ Emergency break-glass  │ 1 hour     │
+└────────────────────────┴────────────┘
+```
+
+**Use token metadata to inject context.** Instead of hard-coding customer IDs or environment tags in backend code, embed them in the token's `metadata` map. The gateway injects them as headers, keeping this context out of the token value and easy to audit.
+
+**One token per service.** Do not share tokens between services. Per-service tokens ensure that compromising one service does not compromise others, and audit logs remain meaningful (each `token_id` maps to one service).
+
+**Rotate on suspicion immediately.** If a token may have been exposed (logged by mistake, seen in a URL, committed to Git), rotate it immediately. The old token is invalidated before the rotation call returns.
+
+**Audit regularly.** Use `GET /api/v1/apps/{app_id}/tokens` to review all active tokens. Revoke tokens for services that have been decommissioned. Revoke tokens whose `name` or `metadata` suggests unknown ownership.

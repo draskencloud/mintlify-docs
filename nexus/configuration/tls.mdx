@@ -1,0 +1,194 @@
+---
+title: "TLS Configuration Reference"
+description: "Server TLS on 8443, mTLS backend profiles, and JWKS fetch settings — full key reference."
+---
+
+This page is the configuration-reference companion to [TLS Termination](/nexus/deployment/tls-termination). It covers all TLS-related configuration keys including server TLS, JWKS fetch settings, and mTLS backend profiles.
+
+## Server TLS (Inbound)
+
+Server TLS terminates HTTPS connections from downstream clients on port **8443**. Configuration lives under `[server]`.
+
+### Reference Table
+
+| Key | Default | Env var | Description |
+|---|---|---|---|
+| `server.tls_enabled` | `false` | `GATEWAY_SERVER__TLS_ENABLED` | Enable TLS on port 8443 |
+| `server.tls_cert_path` | _(none)_ | `GATEWAY_SERVER__TLS_CERT_PATH` | Path to full-chain PEM certificate |
+| `server.tls_key_path` | _(none)_ | `GATEWAY_SERVER__TLS_KEY_PATH` | Path to PKCS8 or RSA PEM private key |
+
+### Implementation Details
+
+| Property | Value |
+|---|---|
+| TLS library | rustls 0.23 (pure Rust; no OpenSSL) |
+| Minimum TLS version | TLS 1.2 |
+| Preferred TLS version | TLS 1.3 |
+| Supported certificate formats | Full-chain PEM |
+| Supported key formats | PKCS8 PEM (`BEGIN PRIVATE KEY`), RSA PKCS1 PEM (`BEGIN RSA PRIVATE KEY`) |
+| TLS port | 8443 (fixed; not configurable in v1) |
+| Hot reload | Not supported in v1 — restart required |
+
+Both the HTTP port (8080) and the HTTPS port (8443) remain active when TLS is enabled. The management API (port 9090) does not support TLS in v1.
+
+### Minimal TLS Configuration
+
+```toml
+[server]
+tls_enabled   = true
+tls_cert_path = "/certs/fullchain.pem"
+tls_key_path  = "/certs/privkey.pem"
+```
+
+Via environment variables:
+
+```bash
+GATEWAY_SERVER__TLS_ENABLED=true
+GATEWAY_SERVER__TLS_CERT_PATH=/certs/fullchain.pem
+GATEWAY_SERVER__TLS_KEY_PATH=/certs/privkey.pem
+```
+
+---
+
+## mTLS Backend Profiles (Outbound)
+
+Backend mTLS enables the gateway to authenticate itself to upstream services using a client certificate. This is separate from server TLS.
+
+Each upstream service that requires mutual TLS is represented by a **named profile**. Profiles are configured exclusively via environment variables — there is no TOML section for them.
+
+### Environment Variable Pattern
+
+```
+GATEWAY_MTLS_PROFILE_<NAME>_CERT_PATH=<path>
+GATEWAY_MTLS_PROFILE_<NAME>_KEY_PATH=<path>
+GATEWAY_MTLS_PROFILE_<NAME>_CA_PATH=<path>
+```
+
+- `<NAME>` is the profile identifier in uppercase (e.g., `PAYMENTS`, `INVENTORY`).
+- `CERT_PATH`: path to the client certificate PEM file (presented to the upstream).
+- `KEY_PATH`: path to the client private key PEM file.
+- `CA_PATH`: path to the CA certificate PEM file used to verify the upstream's server certificate.
+
+### Example — Single Profile
+
+```bash
+export GATEWAY_MTLS_PROFILE_PAYMENTS_CERT_PATH=/certs/client.pem
+export GATEWAY_MTLS_PROFILE_PAYMENTS_KEY_PATH=/certs/client.key
+export GATEWAY_MTLS_PROFILE_PAYMENTS_CA_PATH=/certs/payments-ca.pem
+```
+
+### Example — Multiple Profiles
+
+```bash
+# Payments backend
+export GATEWAY_MTLS_PROFILE_PAYMENTS_CERT_PATH=/certs/payments/client.pem
+export GATEWAY_MTLS_PROFILE_PAYMENTS_KEY_PATH=/certs/payments/client.key
+export GATEWAY_MTLS_PROFILE_PAYMENTS_CA_PATH=/certs/payments/ca.pem
+
+# Inventory backend
+export GATEWAY_MTLS_PROFILE_INVENTORY_CERT_PATH=/certs/inventory/client.pem
+export GATEWAY_MTLS_PROFILE_INVENTORY_KEY_PATH=/certs/inventory/client.key
+export GATEWAY_MTLS_PROFILE_INVENTORY_CA_PATH=/certs/inventory/ca.pem
+```
+
+### Selecting a Profile Per Revision
+
+An app revision selects which mTLS profile to use via the `backend_mtls_profile` field in its `AuthPolicy`:
+
+```toml
+# config/apps/payments-api.toml
+[revisions.v1.auth_policy]
+backend_mtls_profile = "payments"   # references the PAYMENTS profile
+```
+
+The profile name is **case-insensitive** when matched against the environment variable name suffix.
+
+### Profile Storage in AppState
+
+Each configured mTLS profile produces a dedicated `reqwest::Client` instance pre-loaded with the client certificate and CA bundle. These client instances are stored in `AppState` and selected at request time based on the revision's `backend_mtls_profile` field. Profile clients are isolated from the shared HTTP client described in [http-client.md](/nexus/configuration/http-client).
+
+> **License requirement:** mTLS backend profiles require a **Pro** license or higher.
+
+---
+
+## JWKS Configuration
+
+JWKS settings control how the gateway fetches and caches JSON Web Key Sets from remote URLs used in JWT authentication policies. Configuration lives under `[jwks]`.
+
+```toml
+[jwks]
+cache_ttl_secs     = 300   # env: GATEWAY_JWKS__CACHE_TTL_SECS
+validate_on_reload = true   # env: GATEWAY_JWKS__VALIDATE_ON_RELOAD
+fetch_timeout_ms   = 5000   # env: GATEWAY_JWKS__FETCH_TIMEOUT_MS
+```
+
+### `jwks.cache_ttl_secs`
+
+| | |
+|---|---|
+| Type | Integer (seconds) |
+| Default | `300` (5 minutes) |
+| Env var | `GATEWAY_JWKS__CACHE_TTL_SECS` |
+| Legacy env var | `GATEWAY_JWKS_CACHE_TTL_SECS` |
+
+Duration to cache a JWKS response in memory. When expired the gateway fetches fresh keys. Lower values reduce the risk of using revoked keys; higher values reduce latency and external HTTP calls.
+
+### `jwks.validate_on_reload`
+
+| | |
+|---|---|
+| Type | Boolean |
+| Default | `true` |
+| Env var | `GATEWAY_JWKS__VALIDATE_ON_RELOAD` |
+| Legacy env var | `GATEWAY_JWKS_VALIDATE_ON_RELOAD` |
+
+When `true`, all JWKS URLs in active auth policies are validated (format check + reachability probe) at startup and on every config reload. An unreachable JWKS URL causes the reload to fail and the config reverts to the last known-good state.
+
+Set to `false` to allow startup in environments where JWKS endpoints may not be immediately reachable (e.g., during cold start when the identity provider comes up in parallel).
+
+### `jwks.fetch_timeout_ms`
+
+| | |
+|---|---|
+| Type | Integer (milliseconds) |
+| Default | `5000` (5 seconds) |
+| Env var | `GATEWAY_JWKS__FETCH_TIMEOUT_MS` |
+
+Timeout for HTTP requests to JWKS URLs. If the JWKS endpoint does not respond within this duration the fetch fails. The gateway then uses the cached JWKS if still valid, or returns an authentication error if the cache has expired.
+
+---
+
+## Docker Compose — TLS with mTLS Profiles
+
+```yaml
+services:
+  gateway:
+    image: draskencloud/gateway:latest
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+      - "9090:9090"
+    environment:
+      # Server TLS (inbound)
+      GATEWAY_SERVER__TLS_ENABLED: "true"
+      GATEWAY_SERVER__TLS_CERT_PATH: "/certs/server/fullchain.pem"
+      GATEWAY_SERVER__TLS_KEY_PATH: "/certs/server/privkey.pem"
+      # mTLS profiles (outbound)
+      GATEWAY_MTLS_PROFILE_PAYMENTS_CERT_PATH: "/certs/mtls/payments-client.pem"
+      GATEWAY_MTLS_PROFILE_PAYMENTS_KEY_PATH: "/certs/mtls/payments-client.key"
+      GATEWAY_MTLS_PROFILE_PAYMENTS_CA_PATH: "/certs/mtls/payments-ca.pem"
+    volumes:
+      - ./certs:/certs:ro
+```
+
+---
+
+## Certificate Rotation
+
+In v1, TLS certificates are loaded once at startup. Hot reload is not supported for TLS assets. To rotate certificates:
+
+1. Write new certificate and key files to the configured paths.
+2. Send `SIGTERM` to the gateway — it drains gracefully (see [Graceful Shutdown](/nexus/deployment/graceful-shutdown)).
+3. The process supervisor restarts the gateway with the new files.
+
+For zero-downtime rotation in multi-instance deployments, rotate one instance at a time while others serve traffic.

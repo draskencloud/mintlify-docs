@@ -1,0 +1,264 @@
+---
+title: "Backend Configuration"
+description: "All backend fields on a revision: scheme, host, port, base path, strip, health, weight, current."
+---
+
+Every revision in the Nexus API Gateway by Drasken Cloud has a backend configuration that defines where the gateway forwards matching requests. This document covers all backend fields, their defaults, and how to configure them correctly.
+
+---
+
+## Backend Fields
+
+Backend configuration is set on the revision object. The following fields control where and how the gateway forwards traffic:
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `backend_scheme` | string | `http` | No | Transport scheme: `http` or `https` |
+| `backend_host` | string | — | Yes | Hostname or IP address of the backend service |
+| `backend_port` | integer | — | Yes | TCP port of the backend service |
+| `backend_base_path` | string | `/` | No | Path prefix prepended to all forwarded request paths |
+| `strip_gateway_path` | boolean | `true` | No | Whether to strip the gateway path prefix before forwarding |
+| `health_check_path` | string | `null` | No | HTTP path for background health probes; absent = always healthy |
+| `traffic_weight` | integer | `100` | No | Relative traffic weight for canary routing |
+| `is_current` | boolean | `false` | No | Whether this revision is the active (current) revision |
+
+---
+
+## Field Details
+
+### `backend_scheme`
+
+Controls whether the gateway connects to the backend over plain HTTP or TLS-encrypted HTTPS:
+
+```json
+{"backend_scheme": "https"}
+```
+
+- `http` — plain TCP; no TLS. Use for backend services within the same private network.
+- `https` — TLS. Use for backends over public internet or when backend-to-gateway encryption is required.
+
+When using `https`, the gateway validates the backend's TLS certificate against the system's CA trust store. For backends with self-signed certificates, configure the `backend_mtls_profile` in the auth policy (or use a custom CA bundle; see the TLS configuration guide).
+
+---
+
+### `backend_host`
+
+The hostname or IP address of the backend service. The gateway resolves this value using standard DNS at request time.
+
+```json
+{"backend_host": "orders-svc.internal"}
+{"backend_host": "10.0.1.45"}
+{"backend_host": "api.partner.com"}
+```
+
+- DNS names are resolved per-request using the system resolver. For Kubernetes services, use the full service DNS name (e.g., `orders-svc.default.svc.cluster.local`) or short names if the gateway is in the same namespace.
+- IP addresses bypass DNS resolution.
+- **Immutable after revision creation**: to change the backend host, create a new revision.
+
+---
+
+### `backend_port`
+
+The TCP port number the backend listens on.
+
+```json
+{"backend_port": 8080}
+```
+
+Common values:
+- `80` — plain HTTP (default HTTP port)
+- `443` — HTTPS (default HTTPS port)
+- `8080`, `8000`, `3000` — common development ports
+
+---
+
+### `backend_base_path`
+
+A path prefix prepended to every forwarded request path (after gateway prefix stripping):
+
+```json
+{"backend_base_path": "/internal/api/v2"}
+```
+
+Default is `/`. See [Path Rewriting](/nexus/routing/path-rewriting) for detailed examples of how this interacts with `strip_gateway_path`.
+
+---
+
+### `strip_gateway_path`
+
+When `true` (the default), the gateway strips the app + version gateway path prefix from the request path before prepending `backend_base_path`:
+
+```json
+{"strip_gateway_path": true}
+```
+
+| Value | Effect |
+|-------|--------|
+| `true` | Gateway prefix stripped; backend sees only the path suffix |
+| `false` | Full request path forwarded; backend sees the complete path including gateway prefix |
+
+---
+
+### `health_check_path`
+
+An optional HTTP path the gateway probes to determine whether this backend is healthy:
+
+```json
+{"health_check_path": "/health"}
+{"health_check_path": "/api/v1/status"}
+```
+
+- When set, the gateway's background health probe task sends `GET <backend_scheme>://<backend_host>:<backend_port><health_check_path>` at regular intervals (`health_interval_secs` in server config, default 30s).
+- When absent or `null`, no probe is sent and the revision is treated as always healthy.
+- Unhealthy revisions are excluded from routing. See [Health Probing](/nexus/backends/health-probing).
+
+---
+
+### `traffic_weight`
+
+An integer representing the relative weight of this revision in traffic distribution:
+
+```json
+{"traffic_weight": 90}
+```
+
+- Used for canary deployments: when multiple revisions in the same version have non-null `traffic_weight` values, traffic is distributed proportionally.
+- Default is `100` (full weight).
+- Example: one revision with weight 90 and another with weight 10 → 90% / 10% split.
+- Weight values are relative, not percentages. Weights of 900 and 100 produce the same split as 90 and 10.
+
+---
+
+### `is_current`
+
+Marks this revision as the active (current) revision for normal traffic:
+
+```json
+{"is_current": true}
+```
+
+- Exactly one revision per version should have `is_current = true` for stable, non-canary traffic.
+- Set via the `POST /revisions/:id/activate` endpoint (which also clears `is_current` on the previously active revision atomically).
+- A revision with `is_current = false` and no `traffic_weight` set does not receive any traffic.
+
+---
+
+## Immutable Fields
+
+The following fields cannot be changed after a revision is created:
+
+| Field | Reason |
+|-------|--------|
+| `backend_scheme` | Changing the scheme changes the security posture of the connection |
+| `backend_host` | The revision represents a specific backend deployment; changing the host creates a different deployment |
+
+To change these fields, create a new revision with the desired backend configuration, register any endpoints if in `managed_endpoint` mode, then activate the new revision. The old revision can be deactivated but remains in the database for audit purposes.
+
+---
+
+## mTLS to Backends
+
+When `backend_scheme = "https"`, you can optionally configure mutual TLS (mTLS) client authentication for the gateway-to-backend connection using the `backend_mtls_profile` field in the auth policy:
+
+```json
+{
+  "auth": {
+    "backend_mtls_profile": "my-backend-cert"
+  }
+}
+```
+
+Named profiles are configured via environment variables. See the TLS configuration guide for details on certificate management.
+
+---
+
+## Complete Revision Object
+
+A fully populated revision object with all backend fields:
+
+```json
+{
+  "id": "b2c3d4e5-0000-0000-0000-000000000001",
+  "app_version_id": "a1b2c3d4-0000-0000-0000-000000000001",
+  "revision": "prod-3",
+  "backend_scheme": "https",
+  "backend_host": "orders-svc.internal",
+  "backend_port": 8443,
+  "backend_base_path": "/",
+  "strip_gateway_path": true,
+  "health_check_path": "/health",
+  "traffic_weight": 100,
+  "is_current": true,
+  "is_healthy": true,
+  "policy": {
+    "auth": {"auth_type": "api_key", "required": true},
+    "rate_limit": {"enabled": true, "requests": 1000, "window_seconds": 60},
+    "timeout_ms": 10000
+  },
+  "created_at": "2026-01-15T10:00:00Z",
+  "updated_at": "2026-01-15T10:05:00Z"
+}
+```
+
+---
+
+## Creating a Revision
+
+```bash
+APP_ID=<app-uuid>
+VERSION_ID=<version-uuid>
+
+curl -s -X POST \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "revision": "prod-3",
+    "backend_scheme": "https",
+    "backend_host": "orders-svc.internal",
+    "backend_port": 8443,
+    "backend_base_path": "/",
+    "strip_gateway_path": true,
+    "health_check_path": "/health",
+    "policy": {
+      "auth": {"auth_type": "api_key", "required": true},
+      "rate_limit": {"enabled": true, "requests": 1000, "window_seconds": 60},
+      "timeout_ms": 10000
+    }
+  }' | jq
+```
+
+### Activating a revision
+
+```bash
+REVISION_ID=<revision-uuid>
+
+curl -s -X POST \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID/activate" \
+  | jq
+```
+
+The `activate` endpoint atomically sets `is_current = true` on this revision and `is_current = false` on all other revisions in the same version.
+
+---
+
+## Deployment Workflow
+
+A typical backend deployment without downtime:
+
+```
+1. Create new revision (revision-4) with new backend version
+2. Register endpoints (managed_endpoint mode only)
+3. Set traffic_weight on revision-3 = 90, revision-4 = 10 (canary)
+4. Monitor metrics and error rates for revision-4
+5. If healthy: activate revision-4 (is_current = true, weight = 100)
+6. If unhealthy: leave revision-3 as is; fix revision-4 backend and retry
+```
+
+---
+
+## Related Topics
+
+- [Health Probing](/nexus/backends/health-probing) — background probe configuration and behaviour
+- [Circuit Breaker](/nexus/backends/circuit-breaker) — automatic failure isolation per revision
+- [Path Rewriting](/nexus/routing/path-rewriting) — how `backend_base_path` and `strip_gateway_path` combine
+- [Routing Overview](/nexus/routing/overview) — revision selection and weighted routing

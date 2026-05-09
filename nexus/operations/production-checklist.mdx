@@ -1,0 +1,108 @@
+---
+title: "Production Checklist"
+description: "Pre-launch checks before exposing Nexus to production traffic."
+---
+
+Use this checklist before pointing production traffic at a Nexus deployment. Items marked **Required** are non-negotiable for any exposed deployment; **Recommended** are best-practice but situational.
+
+---
+
+## Network and Exposure
+
+- [ ] **Required.** Port `9090` (management API) is firewalled from public internet. Reachable only from operator networks (VPN, jump host, internal LB).
+- [ ] **Required.** Port `8080` / `8443` (data plane) is the only externally reachable port.
+- [ ] **Required.** TLS terminates at the gateway or at an upstream load balancer. Plaintext `8080` is acceptable only if behind an LB doing TLS.
+- [ ] **Recommended.** Health endpoint `/api/v1/health` is wired to the load balancer / Kubernetes readiness probe.
+- [ ] **Recommended.** A separate `livenessProbe` checks that the process is responsive (a TCP probe on `9090` works).
+
+---
+
+## Authentication and Secrets
+
+- [ ] **Required.** `GATEWAY_SERVER__ADMIN_TOKEN` is set, rotated from any default, and stored in a secret manager (not in plaintext config).
+- [ ] **Required.** Production API tokens are issued with minimum required scopes — never `proxy:admin` for routine traffic.
+- [ ] **Required.** JWT signing secrets / private keys are loaded from environment variables backed by a secret manager.
+- [ ] **Recommended.** Tokens have `expires_at` set; long-lived tokens are an audit liability.
+- [ ] **Recommended.** `metadata` on tokens captures tenant identity for downstream multi-tenant routing.
+- [ ] **Recommended.** Token rotation playbook documented (see [Runbooks](/nexus/operations/runbooks)).
+
+---
+
+## Backend Security
+
+- [ ] **Recommended.** Backends are reachable only from the gateway's network — not from public internet. Defense-in-depth.
+- [ ] **Recommended.** mTLS is configured for backend connections in zero-trust environments. See [mTLS](/nexus/backends/mtls).
+- [ ] **Recommended.** Backends do not re-implement auth that Nexus already enforces — they trust forwarded identity headers.
+
+---
+
+## Policy
+
+- [ ] **Required.** Every App has an explicit `auth` policy. `auth_type: "none"` is intentional and reviewed.
+- [ ] **Required.** Every App has a per-IP rate limit defined to protect against unauthenticated floods.
+- [ ] **Required.** Every authenticated route has a per-token rate limit appropriate to its tier.
+- [ ] **Required.** `body_size_limit` is set; the default may be larger than any expected legitimate payload.
+- [ ] **Recommended.** `timeout` is set to a value below the load balancer / client read timeout.
+- [ ] **Recommended.** `cors` is configured with explicit origins (no `*` for credentialed requests).
+- [ ] **Recommended.** `ip_filter` allowlist for internal-only APIs.
+
+---
+
+## Resilience
+
+- [ ] **Required.** Each Revision has a `health_check_path`.
+- [ ] **Required.** Circuit breaker thresholds are tuned to your backend's error envelope.
+- [ ] **Recommended.** Multiple Revisions exist for canary capability (even at `traffic_weight: 0`).
+- [ ] **Recommended.** Retry policy is enabled for idempotent methods.
+- [ ] **Recommended.** Graceful shutdown grace period covers the longest legitimate request.
+
+---
+
+## Storage
+
+- [ ] **Required.** Database is backed up on a schedule appropriate to data volatility. SQLite: file copy + WAL checkpoint; Postgres: `pg_basebackup` or managed snapshots.
+- [ ] **Required.** Database connection pool sizes match your replica and load profile.
+- [ ] **Recommended.** Redis (when used) is run in HA mode; replica-of or sentinel.
+- [ ] **Recommended.** Database failover playbook documented.
+
+---
+
+## Observability
+
+- [ ] **Required.** Prometheus scrapes `:9090/metrics`. ServiceMonitor / scrape config in version control.
+- [ ] **Required.** Alert rules: 5xx rate, p99 latency, circuit-breaker open, audit pipeline backlog.
+- [ ] **Required.** Dashboards: traffic by App / Version / Revision; auth failures; rate-limit hits.
+- [ ] **Required.** Structured (JSON) logs ship to a central aggregator. Retention covers your incident review window.
+- [ ] **Required.** Audit log destination is reliable (durable filesystem, S3, or HTTP endpoint with retry).
+- [ ] **Recommended.** Distributed tracing exporter (OTLP) is configured if upstreams are traced.
+- [ ] **Recommended.** SLO dashboard with error budget burn alerts.
+
+---
+
+## Deployment Hygiene
+
+- [ ] **Required.** Deployments use specific image tags, not `:latest`.
+- [ ] **Required.** Resource requests and limits are set on the container.
+- [ ] **Required.** Multiple replicas behind a load balancer for zero-downtime rollouts.
+- [ ] **Required.** Secrets are mounted from a secret manager — never baked into images.
+- [ ] **Recommended.** Helm chart values are stored in version control.
+- [ ] **Recommended.** Config files (`config/default.toml`, `config/apps/*.toml`) are version controlled and reviewed.
+
+---
+
+## License & Tier
+
+- [ ] **Required.** Confirm license tier covers the features you depend on. `402 Payment Required` will surface unsupported features at runtime — catch this in staging.
+
+---
+
+## Day-2 Operations
+
+- [ ] **Required.** Documented runbook for incidents: bad revision, leaked token, DB outage, circuit stuck open.
+- [ ] **Required.** On-call rotation has access to the management API and logs.
+- [ ] **Recommended.** Quarterly chaos drill: kill a Revision's backend; verify circuit breaker, alerts, and rollback work.
+- [ ] **Recommended.** Quarterly review of issued tokens and their last-use timestamps.
+
+---
+
+If every required item is checked, you are ready to go live. Schedule the recommended items as ongoing improvements.

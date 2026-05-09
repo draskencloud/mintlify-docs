@@ -1,0 +1,265 @@
+---
+title: "Canary Deployments"
+description: "Shift a controlled fraction of production traffic to a new revision via traffic_weight before full rollout."
+---
+
+Canary deployments let you shift a controlled fraction of production traffic to a new backend revision before committing to a full rollout. The gateway implements canary routing via the `traffic_weight` field on each Revision.
+
+---
+
+## How Traffic Weighting Works
+
+Every Revision has a `traffic_weight` field (integer, default `100`). At request time, the gateway selects which Revision receives the request by:
+
+1. Collecting all Revisions for the Version that have `traffic_weight > 0`
+2. Distributing requests proportionally by weight
+3. Excluding Revisions that the health prober has marked unhealthy
+
+The `is_current` flag is the semantic marker for the "stable" revision (the one you would activate after completing a canary); however, **both `is_current = true` and `is_current = false` revisions can receive traffic simultaneously** when `traffic_weight` is set on multiple revisions.
+
+### Weight arithmetic
+
+```
+Rev A: traffic_weight = 90
+Rev B: traffic_weight = 10
+Total: 100
+
+Rev A receives ~90% of requests
+Rev B receives ~10% of requests
+```
+
+```
+Rev A: traffic_weight = 50
+Rev B: traffic_weight = 50
+Total: 100
+
+Rev A receives ~50% of requests
+Rev B receives ~50% of requests
+```
+
+The sum of weights does not need to equal 100. The gateway calculates each revision's share as `weight / total_weight`:
+
+```
+Rev A: traffic_weight = 3
+Rev B: traffic_weight = 1
+Total: 4
+
+Rev A receives 75% of requests
+Rev B receives 25% of requests
+```
+
+---
+
+## Zero-Weight Exclusion
+
+A Revision with `traffic_weight = 0` receives no traffic unless **all** candidate Revisions have `traffic_weight = 0`, in which case the gateway selects uniformly (rather than returning a 503).
+
+Use `traffic_weight = 0` to temporarily park a Revision without deleting it:
+
+- Park an old revision while keeping it available for immediate rollback by weight increase
+- Stage a new revision without exposing it to any traffic until you are ready
+
+---
+
+## Circuit Breaker Interaction
+
+The health prober (configured via `[health]`) continuously probes each Revision's `health_check_path`. If a Revision is marked unhealthy, the proxy engine excludes it from the weighted selection **regardless of its `traffic_weight` value**.
+
+This means:
+
+- A canary revision that starts returning errors will be removed from the selection pool automatically
+- Traffic shifts entirely to the remaining healthy revisions (reweighted proportionally)
+- When the unhealthy revision recovers, it is re-admitted to the pool at its configured weight
+
+The in-memory health map is checked on every request at zero I/O cost. No request is forwarded to an unhealthy backend.
+
+---
+
+## Step-by-Step: Canary Rollout
+
+The recommended pattern for a canary deployment is:
+
+```
+Stage 1: Deploy new revision at low weight   (e.g. 95/5)
+Stage 2: Monitor errors and latency
+Stage 3: Increase canary weight              (e.g. 50/50)
+Stage 4: Monitor again
+Stage 5: Increase canary weight              (e.g. 10/90)
+Stage 6: Activate new revision               (100% stable)
+Stage 7: Set old revision weight to 0        (park it as rollback target)
+```
+
+### Prerequisites
+
+Have an app, version, and an active revision (`rev-1`) already in place.
+
+```bash
+APP_ID=550e8400-e29b-41d4-a716-446655440000
+VERSION_ID=a1b2c3d4-0000-0000-0000-000000000001
+STABLE_REVISION_ID=b2c3d4e5-0000-0000-0000-000000000001  # rev-1, is_current=true
+```
+
+### Stage 1: Create the canary revision at 5% weight
+
+```bash
+curl -s -X POST \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "revision": "rev-2",
+    "backend_scheme": "https",
+    "backend_host": "orders-v2.internal.cluster.local",
+    "backend_port": 443,
+    "backend_base_path": "/",
+    "strip_gateway_path": true,
+    "traffic_weight": 5,
+    "health_check_path": "/health"
+  }' | jq .data.id
+# CANARY_REVISION_ID=c3d4e5f6-0000-0000-0000-000000000001
+```
+
+At this point:
+- `rev-1` (is_current=true): `traffic_weight = 100` — receives 100/(100+5) ≈ 95% of traffic
+- `rev-2` (is_current=false): `traffic_weight = 5` — receives 5/(100+5) ≈ 5% of traffic
+
+> **Note**: You do not need to modify `rev-1`'s weight manually. The total weight is computed dynamically. If you prefer explicit splits, update `rev-1`'s weight to `95` to make the arithmetic obvious.
+
+### Stage 2: Monitor
+
+Check error rates and latency on both revisions using Prometheus metrics or your observability stack. The `revision_id` label is included in gateway metrics.
+
+```bash
+# Prometheus query example: error rate per revision
+curl -s 'http://localhost:9090/metrics' | grep gateway_requests_total
+```
+
+### Stage 3: Increase canary weight to 50%
+
+```bash
+CANARY_REVISION_ID=c3d4e5f6-0000-0000-0000-000000000001
+
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$CANARY_REVISION_ID" \
+  -H "Content-Type: application/json" \
+  -d '{ "traffic_weight": 100 }' | jq
+
+# Update stable to match (explicit 50/50)
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$STABLE_REVISION_ID" \
+  -H "Content-Type: application/json" \
+  -d '{ "traffic_weight": 100 }' | jq
+```
+
+Both revisions now have `traffic_weight = 100`, so they receive equal traffic.
+
+### Stage 4: Shift to 90% canary
+
+```bash
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$CANARY_REVISION_ID" \
+  -H "Content-Type: application/json" \
+  -d '{ "traffic_weight": 90 }' | jq
+
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$STABLE_REVISION_ID" \
+  -H "Content-Type: application/json" \
+  -d '{ "traffic_weight": 10 }' | jq
+```
+
+### Stage 5: Activate the canary revision (100% stable)
+
+Activating the canary revision sets `is_current = true` on it and clears `is_current` from `rev-1`:
+
+```bash
+curl -s -X POST \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$CANARY_REVISION_ID/activate" \
+  | jq
+```
+
+### Stage 6: Park the old revision (keep for rollback)
+
+```bash
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$STABLE_REVISION_ID" \
+  -H "Content-Type: application/json" \
+  -d '{ "traffic_weight": 0 }' | jq
+```
+
+`rev-1` now has `traffic_weight = 0` and `is_current = false`. It receives no traffic but is available for immediate rollback.
+
+---
+
+## Rollback During a Canary
+
+If the canary revision shows problems, roll back immediately:
+
+```bash
+# Option A: Zero out the canary weight — all traffic returns to rev-1
+curl -s -X PATCH \
+  ".../$CANARY_REVISION_ID" \
+  -H "Content-Type: application/json" \
+  -d '{ "traffic_weight": 0 }' | jq
+
+# Option B: Reactivate rev-1 as is_current
+curl -s -X POST ".../$STABLE_REVISION_ID/activate" | jq
+```
+
+Option A is faster when you want to maintain the current `is_current` semantics but need to stop canary traffic immediately. Option B is the full promotion rollback.
+
+---
+
+## Health-Check-Based Automatic Exclusion
+
+Enable health probing on a revision by setting `health_check_path`:
+
+```json
+{
+  "health_check_path": "/health"
+}
+```
+
+The gateway's health prober task periodically sends `GET <backend_scheme>://<backend_host>:<backend_port><health_check_path>` and marks the revision unhealthy if:
+- The response status is not `2xx`
+- The request times out (configured via `health.timeout_ms`)
+- The revision fails `health.unhealthy_threshold` consecutive probes
+
+An unhealthy canary revision is excluded from weighted selection automatically. Traffic shifts to the remaining healthy revisions (re-weighted proportionally) without operator intervention.
+
+Configure probing in `config/default.toml`:
+
+```toml
+[health]
+interval_secs         = 30     # GATEWAY_HEALTH__INTERVAL_SECS
+# timeout_ms and threshold configured via legacy top-level keys for now
+```
+
+---
+
+## Inspecting Traffic Distribution
+
+```bash
+# List all revisions and their weights
+curl -s \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions" \
+  | jq '.data[] | {revision: .revision, is_current: .is_current, weight: .traffic_weight}'
+```
+
+Example output:
+
+```json
+{ "revision": "rev-1", "is_current": false, "weight": 10 }
+{ "revision": "rev-2", "is_current": true,  "weight": 90 }
+```
+
+---
+
+## Summary: Canary Lifecycle
+
+| Stage | `rev-1` weight | `rev-1` is_current | `rev-2` weight | `rev-2` is_current | Traffic split |
+|-------|---------------|-------------------|---------------|-------------------|--------------|
+| Before canary | 100 | true | — | — | 100% → rev-1 |
+| Canary at 5% | 100 | true | 5 | false | ≈95% → rev-1, ≈5% → rev-2 |
+| 50/50 split | 100 | true | 100 | false | 50% → rev-1, 50% → rev-2 |
+| 90/10 in favour of canary | 10 | true | 90 | false | 10% → rev-1, 90% → rev-2 |
+| Canary promoted | 0 | false | 100 | true | 100% → rev-2 |
+| Old revision parked | 0 | false | 100 | true | 100% → rev-2 (rev-1 is rollback target) |

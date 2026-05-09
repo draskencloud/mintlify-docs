@@ -1,0 +1,225 @@
+---
+title: "Dead-Letter Files"
+description: "Last-resort JSONL files capturing pipeline records that exhausted all retry attempts."
+---
+
+A dead-letter file captures pipeline records that could not be delivered to a forwarder after all retry attempts have been exhausted. Each observability pipeline maintains its own dead-letter file so that no records are silently discarded.
+
+---
+
+## Overview
+
+| Pipeline | Default dead-letter path | Overflow policy |
+|---|---|---|
+| Audit | `logs/audit_dead_letter.jsonl` | Block (back-pressure first, dead-letter last resort) |
+| Analytics | `logs/dead_letter.jsonl` | DropNewest (dead-letter is last resort after retries) |
+| Logging | `logs/log_dead_letter.jsonl` | DropNewest (dead-letter is last resort after retries) |
+
+Configure paths via environment variables or `config/default.toml`:
+
+```toml
+[audit]
+dead_letter_path = "logs/audit_dead_letter.jsonl"   # env: GATEWAY_AUDIT__DEAD_LETTER_PATH
+
+[analytics]
+dead_letter_path = "logs/dead_letter.jsonl"          # env: GATEWAY_ANALYTICS__DEAD_LETTER_PATH
+
+[logging]
+dead_letter_path = "logs/log_dead_letter.jsonl"      # env: GATEWAY_LOGGING__DEAD_LETTER_PATH
+```
+
+---
+
+## When Dead-Letter Is Written
+
+Dead-letter is the **last resort** in the delivery chain:
+
+```
+Event generated
+    → Placed in pipeline buffer
+        → Forwarder picks up batch
+            → Delivery attempt fails
+                → Retry (up to retry_max_attempts, with exponential backoff)
+                    → All retries exhausted
+                        → Write to dead_letter_path
+```
+
+Common triggers:
+
+| Trigger | Example |
+|---|---|
+| Database permanently unreachable | Postgres host down, credentials changed |
+| Network timeout to webhook | Webhook URL unreachable or returning 5xx |
+| Disk full on file forwarder | File forwarder cannot write the next batch |
+| Forwarder misconfigured | Wrong table name, wrong URL, wrong credentials |
+
+### Audit pipeline special behaviour
+
+The audit pipeline uses a **Block** overflow policy: when its buffer is full, inbound proxy requests slow down (back-pressure) rather than dropping events. Records only reach dead-letter when Postgres is genuinely unreachable for longer than `retry_max_attempts × retry_backoff_ms` milliseconds. Even then, the record is persisted to the dead-letter file rather than discarded.
+
+The analytics and logging pipelines use **DropNewest**: if the buffer is full, the _newest_ event is dropped immediately and counted in `gateway_analytics_dropped_total` or `gateway_log_dropped_total`. Only records that _make it into the buffer but fail delivery_ go to dead-letter.
+
+---
+
+## File Format
+
+Dead-letter files are **JSONL** (newline-delimited JSON). Each line is one record, with the same schema as the pipeline's normal forwarder output, plus a `_dead_letter_at` timestamp and a `_dead_letter_reason` field.
+
+### Audit dead-letter record
+
+```json
+{
+  "id": "01234567-89ab-cdef-0123-456789abcdef",
+  "app_id": "9f8e7d6c-5b4a-3210-fedc-ba9876543210",
+  "token_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "method": "POST",
+  "path": "/my-api/v1/orders",
+  "status_code": 201,
+  "latency_ms": 45,
+  "timestamp": "2026-01-15T12:34:56.789Z",
+  "client_ip": "203.0.113.42",
+  "user_agent": "curl/7.88.0",
+  "request_body_hash": null,
+  "response_body_hash": null,
+  "_dead_letter_at": "2026-01-15T12:35:01.234Z",
+  "_dead_letter_reason": "postgres connection refused"
+}
+```
+
+### Analytics dead-letter record
+
+```json
+{
+  "event_type": "access",
+  "timestamp": "2026-01-15T12:34:56.789Z",
+  "method": "GET",
+  "path": "/my-api/v1/items",
+  "status": 200,
+  "latency_ms": 12,
+  "app_id": "9f8e7d6c-5b4a-3210-fedc-ba9876543210",
+  "token_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "_dead_letter_at": "2026-01-15T12:35:01.500Z",
+  "_dead_letter_reason": "webhook timeout after 10s"
+}
+```
+
+---
+
+## Monitoring
+
+### File size
+
+```bash
+# Check dead-letter file sizes
+wc -l logs/audit_dead_letter.jsonl
+wc -l logs/dead_letter.jsonl
+wc -l logs/log_dead_letter.jsonl
+
+# Watch for growth
+watch -n 5 'wc -l logs/audit_dead_letter.jsonl'
+```
+
+### Prometheus metrics
+
+| Metric | Meaning |
+|---|---|
+| `gateway_analytics_dropped_total{reason="dead_letter"}` | Analytics records written to dead-letter |
+| `gateway_log_dropped_total{reason="dead_letter"}` | Log records written to dead-letter |
+| `gateway_audit_delivery_failures_total` | Audit delivery failures (may or may not reach dead-letter) |
+
+Alert if any dead-letter metric is non-zero:
+
+```yaml
+- alert: DeadLetterActivity
+  expr: |
+    rate(gateway_analytics_dropped_total{reason="dead_letter"}[5m]) > 0
+    or rate(gateway_log_dropped_total{reason="dead_letter"}[5m]) > 0
+  for: 1m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Pipeline records are being written to dead-letter files"
+```
+
+---
+
+## Recovery: Replaying Dead-Letter Records
+
+There is no built-in replay mechanism in v1. Dead-letter files must be replayed manually or by external tooling.
+
+### Manual replay to Postgres (audit records)
+
+```bash
+#!/usr/bin/env bash
+# replay_audit_dead_letter.sh
+# Replays audit dead-letter records into the audit_logs Postgres table.
+
+DL_FILE="logs/audit_dead_letter.jsonl"
+DB_URL="${DATABASE_URL:-postgresql://localhost/gateway}"
+
+if [ ! -f "$DL_FILE" ]; then
+  echo "No dead-letter file found at $DL_FILE"
+  exit 0
+fi
+
+while IFS= read -r line; do
+  # Strip dead-letter metadata fields before inserting
+  CLEAN=$(echo "$line" | jq 'del(._dead_letter_at, ._dead_letter_reason)')
+
+  psql "$DB_URL" -c "
+    INSERT INTO audit_logs (id, app_id, token_id, method, path, status_code,
+                             latency_ms, timestamp, client_ip, user_agent,
+                             request_body_hash, response_body_hash)
+    VALUES (
+      $(echo $CLEAN | jq -r '.id // "gen_random_uuid()"'),
+      $(echo $CLEAN | jq -r 'if .app_id then "'"'"'" + .app_id + "'"'"'" else "NULL" end'),
+      ...
+    )
+    ON CONFLICT (id) DO NOTHING;
+  " 2>/dev/null && echo "replayed: $(echo $CLEAN | jq -r '.id')"
+done < "$DL_FILE"
+
+echo "Replay complete. Review and archive $DL_FILE."
+```
+
+> For production use, implement replay using the `psql COPY` command or a dedicated script that reads the JSONL file and uses parameterised bulk inserts. The example above illustrates the concept.
+
+### Manual replay to webhook (analytics records)
+
+```bash
+#!/usr/bin/env bash
+# Replay analytics dead-letter records to the configured webhook
+WEBHOOK_URL="https://siem.example.com/ingest"
+
+while IFS= read -r line; do
+  CLEAN=$(echo "$line" | jq 'del(._dead_letter_at, ._dead_letter_reason)')
+  HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST "$WEBHOOK_URL" \
+    -H "Content-Type: application/json" \
+    -d "$CLEAN")
+  echo "status=$HTTP_STATUS record=$(echo $CLEAN | jq -r '.timestamp')"
+done < "logs/dead_letter.jsonl"
+```
+
+### After successful replay
+
+Archive or truncate the dead-letter file to avoid replaying records twice:
+
+```bash
+# Archive
+mv logs/audit_dead_letter.jsonl "logs/audit_dead_letter_$(date +%Y%m%d_%H%M%S).jsonl"
+touch logs/audit_dead_letter.jsonl
+
+# Or simply truncate if records were confirmed delivered
+> logs/audit_dead_letter.jsonl
+```
+
+---
+
+## Operational Checklist
+
+- [ ] Set `dead_letter_path` to a directory on a separate disk from the main database to avoid compounding a disk-full failure.
+- [ ] Ensure the gateway process has write permission to the dead-letter directory.
+- [ ] Add dead-letter file size checks to your infrastructure monitoring.
+- [ ] Document and test your replay procedure before you need it in an incident.
+- [ ] Rotate dead-letter files as part of your regular log rotation policy.

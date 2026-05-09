@@ -1,0 +1,190 @@
+---
+title: "Distributed Tracing"
+description: "x-request-id propagation always-on; optional OpenTelemetry OTLP span export when built with --features otlp."
+---
+
+Nexus API Gateway by Drasken Cloud provides two levels of distributed tracing support:
+
+1. **Request ID propagation** — always-on; zero dependencies; correlates gateway logs with backend logs and client-side traces.
+2. **OpenTelemetry OTLP export** — opt-in; requires a build flag and an environment variable; exports spans to any OTel-compatible collector (Jaeger, Tempo, Zipkin, Honeycomb, etc.).
+
+---
+
+## Request ID Propagation (Always-On)
+
+### How it works
+
+On every inbound request the gateway:
+
+1. Checks for an `x-request-id` header.
+2. If present and a valid UUID v4, adopts it as the trace ID.
+3. If absent or invalid, generates a new UUID v4.
+4. Stores the ID in the request context (tracing span).
+5. Forwards the header to the backend upstream.
+6. Echoes the header back in the response.
+
+The client, the gateway, and the backend all share the same `x-request-id` for a given request, enabling end-to-end correlation without any OpenTelemetry infrastructure.
+
+### Using `x-request-id`
+
+**Generate from the client:**
+
+```bash
+REQUEST_ID=$(uuidgen)
+curl -H "x-request-id: $REQUEST_ID" https://gateway:8080/my-api/v1/items
+# gateway uses $REQUEST_ID; backend receives it; response echoes it
+```
+
+**Find all gateway log lines for a request:**
+
+```bash
+# JSON format
+cat logs/gateway.jsonl | jq -r 'select(.fields["x-request-id"] == "a1b2c3d4-e5f6-7890-abcd-ef1234567890")'
+
+# Text format (grep)
+grep "a1b2c3d4-e5f6-7890-abcd-ef1234567890" /var/log/gateway.log
+```
+
+**Correlate with backend logs:**
+
+Your backend receives `x-request-id` in the forwarded request headers. Log it in your backend service alongside its own log lines, and you can join gateway logs and backend logs on a single ID with no OTel infrastructure.
+
+---
+
+## OpenTelemetry OTLP Export (Opt-In)
+
+### Requirements
+
+Two conditions must both be met to enable OTLP span export:
+
+| Requirement | How to satisfy |
+|---|---|
+| Build with the `otlp` feature | `cargo build --features otlp` or add `otlp` to your `Cargo.toml` features |
+| Set `GATEWAY_OTLP_ENDPOINT` | Export the env var pointing to your OTLP collector gRPC endpoint |
+
+```bash
+# Build
+cargo build --release --features otlp
+
+# Run
+GATEWAY_OTLP_ENDPOINT=http://otel-collector:4317 ./gateway
+```
+
+Without `GATEWAY_OTLP_ENDPOINT` set, the gateway starts normally with request-ID propagation only — no OTLP errors, no missing functionality.
+
+### Span structure
+
+The gateway emits one span per handled request through the proxy engine.
+
+| Span field | Value |
+|---|---|
+| **Span name** | `engine::handle` |
+| `revision_id` | UUID of the revision that handled the request |
+| `http.method` | HTTP method (e.g., `GET`) |
+| `http.url` | Full upstream URL |
+| `http.status_code` | Response status code |
+| `x-request-id` | The trace/request ID |
+
+The span covers the full `engine::handle()` call: from policy evaluation through upstream round-trip to response header transform.
+
+### Collector configuration
+
+The gateway exports spans over **gRPC** using the standard OTLP protocol. Set `GATEWAY_OTLP_ENDPOINT` to the gRPC endpoint of your collector (port 4317 by default for OTel Collector).
+
+**OpenTelemetry Collector example receiver config:**
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: "0.0.0.0:4317"
+
+exporters:
+  jaeger:
+    endpoint: "jaeger:14250"
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [jaeger]
+```
+
+**Jaeger (all-in-one, for development):**
+
+```bash
+docker run --rm -p 16686:16686 -p 4317:4317 jaegertracing/all-in-one:latest
+export GATEWAY_OTLP_ENDPOINT=http://localhost:4317
+cargo run --features otlp
+# Open http://localhost:16686 and search for service "draskencloud-gateway"
+```
+
+**Grafana Tempo:**
+
+```bash
+export GATEWAY_OTLP_ENDPOINT=http://tempo:4317
+```
+
+---
+
+## Subscriber Integration
+
+At startup, when `GATEWAY_OTLP_ENDPOINT` is set and the binary was compiled with `--features otlp`, the gateway:
+
+1. Initialises an OTLP trace exporter pointing to `GATEWAY_OTLP_ENDPOINT`.
+2. Registers the exporter with the `tracing` subscriber alongside the console formatter.
+3. All `tracing` spans (including those from Tower middleware layers) are sent to the collector.
+
+This means you get spans from Tower's `TraceLayer` (HTTP server spans), the proxy engine span, and any `tracing::info_span!` calls in middleware — all correlated.
+
+---
+
+## Correlation: Logs + Traces + Headers
+
+| Signal | Correlation field | How to use |
+|---|---|---|
+| Gateway logs (stdout/JSON) | `x-request-id` field | Filter log lines by request ID |
+| Backend service logs | `x-request-id` header (forwarded) | Backend logs the same ID; join across systems |
+| OTel spans (when enabled) | `x-request-id` span attribute | Use in Jaeger/Tempo trace search |
+| Audit logs (`audit_logs` table) | No direct column; use timestamp + path + token_id | Cross-reference by time window |
+| Prometheus metrics | Not correlated (aggregate only) | Use for alerting, not per-request debugging |
+
+### Full trace reconstruction (without OTel)
+
+Even without OTel infrastructure, you can reconstruct the full journey of a request:
+
+```bash
+ID="a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+# 1. Gateway log lines
+grep "$ID" /var/log/gateway.log
+
+# 2. Audit record
+psql $DATABASE_URL -c "SELECT * FROM audit_logs WHERE path LIKE '%' ORDER BY timestamp DESC LIMIT 10;"
+# (filter by time window + token_id if you know them)
+
+# 3. Backend service logs
+grep "$ID" /var/log/my-backend.log
+```
+
+---
+
+## Troubleshooting
+
+### No spans in collector
+
+1. Confirm the binary was built with `--features otlp`: `strings ./gateway | grep otlp`
+2. Confirm `GATEWAY_OTLP_ENDPOINT` is set in the process environment: `cat /proc/<pid>/environ | tr '\0' '\n' | grep OTLP`
+3. Check that the collector endpoint is reachable from the gateway: `grpc_health_probe -addr=<collector>:4317`
+4. Look for OTLP export errors in gateway logs (logged at `warn` level).
+
+### Spans missing `x-request-id`
+
+Ensure clients send `x-request-id` as a UUID v4. The gateway rejects non-UUID values and generates a new ID instead. Check logs for `"generated new request id"` events.
+
+### High cardinality in OTel
+
+`revision_id` and `app_id` are UUIDs and will create high-cardinality label sets in some backends. Configure your collector to aggregate or sample if needed.

@@ -1,0 +1,321 @@
+---
+title: "Quick Start"
+description: "Run Nexus API Gateway and route your first proxied request in under 5 minutes."
+---
+
+Get Nexus API Gateway by Drasken Cloud running and route your first proxied request in under 5 minutes.
+
+---
+
+## What You Will Have at the End
+
+- Gateway running on **port 8080** (proxy) and **port 9090** (management API)
+- One registered app (`hello-api`) pointing at `https://httpbin.org`
+- A working API key
+- A proxied request through the gateway to the backend
+
+---
+
+## Option A: Docker (recommended, no install required)
+
+```bash
+docker run -d \
+  --name gateway \
+  -p 8080:8080 \
+  -p 9090:9090 \
+  draskencloud/gateway
+```
+
+This uses SQLite (embedded, no external processes) and an in-memory cache. No additional services required.
+
+**Confirm it is up:**
+
+```bash
+curl -s http://localhost:9090/api/v1/health | jq
+# {"status":200,"message":"success","data":{"status":"ok"}}
+```
+
+---
+
+## Option B: Local Development (Rust toolchain)
+
+**Prerequisites**: Rust stable toolchain (`rustup install stable`).
+
+```bash
+git clone https://github.com/draskencloud/DraskenCloud.Gateway.Service.git
+cd DraskenCloud.Gateway.Service
+
+# Copy the example env file and set an admin token
+cp .env.example .env
+# Edit .env and set: GATEWAY_SERVER__ADMIN_TOKEN=dev-admin-token
+
+# Start the gateway (SQLite auto-created, migrations run automatically)
+SQLX_OFFLINE=true cargo run
+```
+
+The gateway reads `config/default.toml` for structural configuration and `.env` for secrets. SQLite file `gateway.db` is created in the working directory on first run.
+
+---
+
+## Port Reference
+
+| Port | Purpose | Who should reach it |
+|------|---------|-------------------|
+| `8080` | Proxy / data plane — client traffic | Your API consumers, load balancer, internet |
+| `9090` | Management API / control plane | Internal tooling, CI/CD, operators only |
+
+> **Important**: port `9090` must be firewalled from public internet access. It accepts configuration changes without request-level auth by default in development. Set `GATEWAY_SERVER__ADMIN_TOKEN` and restrict network access in production.
+
+---
+
+## Step 1: Create an App
+
+An **app** is the top-level object representing one API product. Choose `pass_through` routing mode: the gateway forwards all paths to the backend without requiring explicit endpoint registration.
+
+```bash
+curl -s -X POST http://localhost:9090/api/v1/apps \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Hello API",
+    "slug": "hello-api",
+    "gateway_path": "/hello",
+    "routing_mode": "pass_through"
+  }' | jq
+```
+
+**Response:**
+
+```json
+{
+  "status": 201,
+  "message": "created",
+  "data": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "name": "Hello API",
+    "slug": "hello-api",
+    "gateway_path": "/hello",
+    "routing_mode": "pass_through",
+    "is_active": true,
+    "created_at": "2026-01-15T10:00:00Z"
+  }
+}
+```
+
+Save the `id` — you will need it in the next steps. In this guide, `APP_ID=550e8400-e29b-41d4-a716-446655440000`.
+
+---
+
+## Step 2: Create a Version
+
+A **version** is the public API contract version your clients use (e.g. `v1`). The `gateway_path` here is the full path clients will call.
+
+```bash
+APP_ID=550e8400-e29b-41d4-a716-446655440000
+
+curl -s -X POST "http://localhost:9090/api/v1/apps/$APP_ID/versions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "version": "v1",
+    "gateway_path": "/hello/v1"
+  }' | jq
+```
+
+**Response:**
+
+```json
+{
+  "status": 201,
+  "message": "created",
+  "data": {
+    "id": "a1b2c3d4-0000-0000-0000-000000000001",
+    "app_id": "550e8400-e29b-41d4-a716-446655440000",
+    "version": "v1",
+    "gateway_path": "/hello/v1",
+    "status": "active",
+    "created_at": "2026-01-15T10:01:00Z"
+  }
+}
+```
+
+Save the version `id` as `VERSION_ID`.
+
+---
+
+## Step 3: Create a Revision with a Backend
+
+A **revision** holds the backend configuration. This is what the gateway actually proxies to. Point it at `httpbin.org` as a convenient public backend for testing.
+
+```bash
+APP_ID=550e8400-e29b-41d4-a716-446655440000
+VERSION_ID=a1b2c3d4-0000-0000-0000-000000000001
+
+curl -s -X POST \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "revision": "rev-1",
+    "backend_scheme": "https",
+    "backend_host": "httpbin.org",
+    "backend_port": 443,
+    "backend_base_path": "/",
+    "strip_gateway_path": true,
+    "default_policy": {
+      "auth": {
+        "auth_type": "api_key",
+        "required": true
+      },
+      "rate_limit": {
+        "enabled": true,
+        "requests": 100,
+        "window_seconds": 60
+      }
+    }
+  }' | jq
+```
+
+**Response:**
+
+```json
+{
+  "status": 201,
+  "message": "created",
+  "data": {
+    "id": "b2c3d4e5-0000-0000-0000-000000000001",
+    "app_version_id": "a1b2c3d4-0000-0000-0000-000000000001",
+    "revision": "rev-1",
+    "backend_scheme": "https",
+    "backend_host": "httpbin.org",
+    "backend_port": 443,
+    "backend_base_path": "/",
+    "strip_gateway_path": true,
+    "traffic_weight": 100,
+    "is_current": false,
+    "created_at": "2026-01-15T10:02:00Z"
+  }
+}
+```
+
+Save the revision `id` as `REVISION_ID`.
+
+---
+
+## Step 4: Activate the Revision
+
+A revision does not serve traffic until it is activated. Activation sets `is_current = true` on this revision (and clears it from any previously active revision in the same version).
+
+```bash
+APP_ID=550e8400-e29b-41d4-a716-446655440000
+VERSION_ID=a1b2c3d4-0000-0000-0000-000000000001
+REVISION_ID=b2c3d4e5-0000-0000-0000-000000000001
+
+curl -s -X POST \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID/activate" \
+  | jq
+```
+
+**Response:**
+
+```json
+{
+  "status": 200,
+  "message": "success",
+  "data": {
+    "id": "b2c3d4e5-0000-0000-0000-000000000001",
+    "is_current": true
+  }
+}
+```
+
+---
+
+## Step 5: Issue an API Token
+
+Tokens authenticate client requests on the proxy port (`:8080`). The raw token value is returned only once — store it securely.
+
+```bash
+APP_ID=550e8400-e29b-41d4-a716-446655440000
+
+curl -s -X POST "http://localhost:9090/api/v1/apps/$APP_ID/tokens" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "quickstart-token",
+    "scopes": ["proxy:read", "proxy:write"]
+  }' | jq
+```
+
+**Response:**
+
+```json
+{
+  "status": 201,
+  "message": "created",
+  "data": {
+    "id": "c3d4e5f6-0000-0000-0000-000000000001",
+    "name": "quickstart-token",
+    "token": "gw_a1b2c3d4e5f6...",
+    "scopes": ["proxy:read", "proxy:write"],
+    "expires_at": null,
+    "created_at": "2026-01-15T10:03:00Z"
+  }
+}
+```
+
+Save the `token` value as `API_TOKEN`. This is the only time it is returned.
+
+---
+
+## Step 6: Make Your First Proxied Request
+
+With the revision active and a token issued, you can now make requests through the gateway on port `8080`. The gateway strips `/hello/v1` from the path and forwards the remainder to `https://httpbin.org`.
+
+```bash
+API_TOKEN=gw_a1b2c3d4e5f6...
+
+# Proxy: GET /hello/v1/get → forwards to https://httpbin.org/get
+curl -s http://localhost:8080/hello/v1/get \
+  -H "Authorization: Bearer $API_TOKEN" | jq .origin
+```
+
+**Response** (your IP as seen by httpbin.org):
+
+```json
+"203.0.113.42"
+```
+
+Try a few more paths:
+
+```bash
+# POST request forwarded to httpbin.org/post
+curl -s -X POST http://localhost:8080/hello/v1/post \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"hello": "world"}' | jq .json
+
+# Request without token — expect 401
+curl -s http://localhost:8080/hello/v1/get | jq
+```
+
+---
+
+## What Happens When a Request Arrives
+
+```
+Client → :8080 → [IP Rate Limit] → [Trace] → [Auth] → [Rate Limit]
+       → [Header Validation] → [IP Filter] → [Body Limit] → [Timeout]
+       → [CORS] → [Logger] → [Cache] → [Proxy Engine] → httpbin.org
+```
+
+Auth failure at any middleware layer short-circuits the request and returns an error response without reaching the backend.
+
+---
+
+## Next Steps
+
+| Topic | Link |
+|-------|------|
+| How the gateway is architected | [Architecture Overview](/nexus/getting-started/architecture) |
+| App → Version → Revision → Endpoint model | [Core Concepts](/nexus/getting-started/core-concepts) |
+| Routing modes: pass_through vs managed_endpoint | [Routing Modes](/nexus/concepts/routing-modes) |
+| Policy inheritance | [Policy Inheritance](/nexus/concepts/policy-inheritance) |
+| Canary deployments | [Canary Deployments](/nexus/concepts/canary-deployments) |
+| File-based configuration | [File-Based Config](/nexus/concepts/file-based-config) |

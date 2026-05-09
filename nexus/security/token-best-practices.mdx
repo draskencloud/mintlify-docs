@@ -1,0 +1,315 @@
+---
+title: "Token Security Best Practices"
+description: "Operational guidance: store immediately, minimal scopes, expiry, rotation, isolation, revocation, and audit."
+---
+
+This document covers operational security practices for issuing, storing, using, and rotating API key tokens and JWT credentials in the Nexus API Gateway by Drasken Cloud.
+
+---
+
+## Table of Contents
+
+- [Store Raw Tokens Immediately](#store-raw-tokens-immediately)
+- [Minimal Scope Assignment](#minimal-scope-assignment)
+- [Set Token Expiry](#set-token-expiry)
+- [Use Token Metadata for Context Injection](#use-token-metadata-for-context-injection)
+- [Forward JWT Claims to Backends](#forward-jwt-claims-to-backends)
+- [Token Rotation Strategy](#token-rotation-strategy)
+- [Per-App, Per-Service Token Isolation](#per-app-per-service-token-isolation)
+- [Revocation Response Time](#revocation-response-time)
+- [Audit Trail](#audit-trail)
+- [Checklist](#checklist)
+
+---
+
+## Store Raw Tokens Immediately
+
+API key tokens are returned **exactly once** — in the JSON response body of the issuance or rotation call. The gateway stores only a SHA-256 hash; the raw value is discarded immediately after the response is sent.
+
+**Do this immediately after issuance:**
+
+```bash
+# Issue the token
+RESPONSE=$(curl -s -X POST http://localhost:9090/api/v1/apps/{app_id}/tokens \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"my-service","scopes":["proxy:read","proxy:write"]}')
+
+# Extract the raw token value
+TOKEN=$(echo "$RESPONSE" | jq -r '.data.token')
+
+# Immediately write to your secrets manager
+vault kv put secret/my-service/gateway-token value="$TOKEN"
+
+# Confirm storage, then discard the local variable
+unset TOKEN
+```
+
+**Never:**
+
+- Log the raw token value (it will appear in log aggregation systems).
+- Store it in a `.env` file committed to version control.
+- Send it over an unencrypted channel (Slack, email, ticket system).
+- Echo it in a CI/CD pipeline without masking.
+
+**Treat a gateway token identically to a database password.**
+
+---
+
+## Minimal Scope Assignment
+
+Issue tokens with only the scopes the consumer actually needs.
+
+| Consumer Type | Scopes to Issue |
+|---|---|
+| Read-only reporting service | `["proxy:read"]` |
+| Write-only webhook sender | `["proxy:write"]` |
+| Full CRUD microservice | `["proxy:read", "proxy:write"]` |
+| Health check / monitoring probe | `["proxy:read"]` |
+| CI/CD pipeline (read-only artifact fetch) | `["proxy:read"]` |
+| CI/CD pipeline (deploy + write) | `["proxy:read", "proxy:write"]` |
+
+**Why minimal scope matters:**
+
+A compromised `proxy:read` token cannot submit `POST`/`PUT`/`DELETE` requests. A read-only token leaking to a third party exposes data visibility but not data mutation. The 403 scope enforcement at the gateway is a hard stop — the backend never sees the out-of-scope request.
+
+```bash
+# Read-only token
+curl -X POST http://localhost:9090/api/v1/apps/{app_id}/tokens \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "analytics-service",
+    "scopes": ["proxy:read"],
+    "expires_at": "2027-01-01T00:00:00Z"
+  }'
+```
+
+---
+
+## Set Token Expiry
+
+Set `expires_at` on every token. Short-lived tokens dramatically reduce blast radius:
+
+| Scenario | Recommended Lifetime |
+|---|---|
+| CI/CD job token | 1–24 hours |
+| Per-deployment ephemeral token | 7 days |
+| Long-lived service account | 90 days (with automated rotation) |
+| Emergency break-glass token | 1 hour |
+| Permanent tokens | Avoid; use 1-year max with rotation |
+
+```bash
+# 90-day token with automated rotation reminder
+curl -X POST http://localhost:9090/api/v1/apps/{app_id}/tokens \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "billing-service-prod",
+    "scopes": ["proxy:read", "proxy:write"],
+    "expires_at": "2026-08-07T00:00:00Z"
+  }'
+```
+
+**Automate rotation before expiry.** Set up a scheduled job (cron, CI pipeline, secrets manager TTL policy) to rotate tokens 7–14 days before their `expires_at`. This provides a comfortable overlap window without requiring manual intervention.
+
+---
+
+## Use Token Metadata for Context Injection
+
+Token `metadata` is a key-value map that the gateway injects as HTTP headers into the backend request on every successful authentication. Use this to provide the backend with contextual information without requiring the backend to call back to the gateway or a database.
+
+**Example: per-customer token with context:**
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps/{app_id}/tokens \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "customer-acme-corp",
+    "scopes": ["proxy:read"],
+    "metadata": {
+      "customer_id": "cust_acme_001",
+      "plan": "enterprise",
+      "region": "us-east-1",
+      "contact": "ops@acmecorp.example"
+    }
+  }'
+```
+
+The backend receives:
+
+```http
+X-Token-Meta-Customer-Id: cust_acme_001
+X-Token-Meta-Plan: enterprise
+X-Token-Meta-Region: us-east-1
+X-Token-Meta-Contact: ops@acmecorp.example
+```
+
+**Benefits:**
+
+- The token value itself carries no readable information (it is random bytes).
+- The backend receives customer context without needing a gateway SDK or API call.
+- Rotating the token (new credential) preserves all metadata automatically.
+- Metadata is stored plaintext in PostgreSQL — avoid putting secrets in metadata values.
+
+**Security note:** Metadata headers are only added on the gateway-to-backend leg. They are stripped from any client response and are not accessible to the client that sent the token.
+
+---
+
+## Forward JWT Claims to Backends
+
+For JWT authentication, use `forward_claims_as_headers` to pass identity context from the JWT to the backend without exposing the full JWT:
+
+```json
+{
+  "auth_type": "jwt",
+  "forward_claims_as_headers": {
+    "sub": "X-User-Id",
+    "org_id": "X-Org-Id",
+    "email": "X-User-Email",
+    "roles": "X-User-Roles",
+    "plan": "X-User-Plan"
+  }
+}
+```
+
+**Why not forward the JWT itself?**
+
+- The raw JWT contains the full signature and all claims — exposing it to the backend gives the backend the ability to re-present it elsewhere.
+- Large JWTs (with many claims) add per-request header overhead.
+- Forwarding only the claims you need is the principle of minimal data exposure.
+- The backend should trust the gateway's authentication decision, not re-validate JWTs.
+
+**Backend security considerations:**
+
+The backend must trust that headers starting with `X-User-*`, `X-Org-*`, etc., were set by the gateway. This is valid only if:
+
+1. Clients cannot reach the backend directly (it is on a private network).
+2. The gateway strips client-supplied headers that match the forwarded claim header names before adding the gateway-sourced values.
+
+The gateway does strip client-supplied `X-Token-Meta-*` headers and claim-forwarded headers before adding its own values.
+
+---
+
+## Token Rotation Strategy
+
+**Rotate regularly, never manually in an emergency.** Regular rotation should be automatic:
+
+```
+Week 1-12: Token A is active
+Week 11:   Automated job calls POST .../tokens/{A}/rotate → Token B issued, Token A revoked
+Week 11-23: Token B is active
+Week 22:   Automated job calls POST .../tokens/{B}/rotate → Token C issued, Token B revoked
+...
+```
+
+**Emergency rotation (token suspected compromised):**
+
+```bash
+# Rotate immediately — new token issued, old token revoked atomically
+curl -X POST http://localhost:9090/api/v1/apps/{app_id}/tokens/{token_id}/rotate \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# The old token is invalid the moment this call returns
+# Update your secrets manager and redeploy immediately
+```
+
+**Zero-downtime rotation:**
+
+If your service cannot tolerate even a few seconds of failed authentication during a token swap, use the issue-then-revoke pattern instead of rotate:
+
+```
+1. Issue a new token (both old and new are valid)
+2. Update secrets manager with new token
+3. Gradually roll out new token to services
+4. Revoke old token once all services are using the new one
+```
+
+The rotate endpoint is atomic (old revoked immediately) and is suitable when your deployment pipeline can handle the update without downtime (e.g., Kubernetes secret rolling update).
+
+---
+
+## Per-App, Per-Service Token Isolation
+
+Issue a separate token for each distinct service or integration:
+
+```
+billing-service  → token "billing-service-prod"   (scopes: read+write)
+analytics-job    → token "analytics-nightly"       (scopes: read)
+external-partner → token "partner-acme-read"       (scopes: read, expires: 30 days)
+admin-cli        → token "admin-cli-personal"      (scopes: read+write)
+```
+
+**Benefits of isolation:**
+
+- Revoking the analytics token does not affect billing.
+- Audit logs show which token (and thus which service) made each request.
+- Per-service scope enforcement — a compromised partner token cannot write.
+- Token metadata can carry per-service context injected to backends.
+
+**Anti-pattern: shared tokens across services**
+
+```
+# BAD — all services share one token
+ALL_SERVICES_TOKEN = "pK3mXvQ..."
+```
+
+A single shared token means:
+- You cannot revoke access for one service without breaking all.
+- Audit logs show the token ID, not the service name.
+- You cannot have different scopes or metadata per service.
+
+---
+
+## Revocation Response Time
+
+Token revocation is effective **within milliseconds**, not at the next cache expiry:
+
+| Event | Latency |
+|---|---|
+| `DELETE /tokens/{id}` called | ~1 ms (DB write + cache delete) |
+| Next request with revoked token (warm cache) | Cache miss → DB hit → `revoked_at` set → `401` |
+| Next request with revoked token (cold) | DB hit → `revoked_at` set → `401` |
+
+The cache invalidation is synchronous — the Redis key is deleted before the revocation API call returns. This means:
+
+- You can call the revoke endpoint and immediately tell a compromised client "your token is invalid" — they will get `401` on their very next request.
+- There is no "wait up to 5 minutes for cache expiry" window.
+
+---
+
+## Audit Trail
+
+Every authenticated request is recorded in the `audit_logs` table in PostgreSQL:
+
+```
+token_id | app_id | method | path | status_code | duration_ms | created_at
+```
+
+This enables:
+
+- **Forensics:** Replay the sequence of requests a compromised token made.
+- **Billing:** Count requests per token/app over a time window.
+- **Anomaly detection:** Alert on unusual method patterns (e.g., a `proxy:read` token somehow making write attempts).
+- **Compliance:** Provide an audit record of who accessed what and when.
+
+The `token_id` in audit logs is the token's database UUID — not the raw token value. Audit logs are safe to query even if an attacker can read the database; they cannot reconstruct the raw token from the UUID.
+
+---
+
+## Checklist
+
+Use this checklist when issuing tokens for a new service:
+
+```
+[ ] Token issued with a descriptive name (service + environment)
+[ ] Scopes set to minimum required (proxy:read only if service is read-only)
+[ ] expires_at set to an appropriate horizon (≤ 90 days for long-lived)
+[ ] Raw token value stored in secrets manager immediately after issuance
+[ ] Raw token NOT logged, NOT committed, NOT sent over unencrypted channel
+[ ] Token metadata populated with service context (customer_id, environment, etc.)
+[ ] Automated rotation scheduled before expires_at
+[ ] Old tokens from previous deployments revoked
+[ ] Audit log baseline established (normal request volume and pattern noted)
+```

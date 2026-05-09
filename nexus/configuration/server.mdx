@@ -1,0 +1,337 @@
+---
+title: "Server Configuration Reference"
+description: "Ports, admin token, TLS, body size, proxy timeout, shutdown, log level/format, Swagger, circuit breaker, health, retry."
+---
+
+All keys in this section live under `[server]` in `config/default.toml`. Environment variable overrides use `GATEWAY_SERVER__<KEY>` (double underscore between section and key name).
+
+## Quick Reference
+
+```toml
+[server]
+proxy_port            = 8080
+mgmt_port             = 9090
+admin_token           = ""          # Set via env var; leave blank in TOML
+tls_enabled           = false
+# tls_cert_path       = "/certs/fullchain.pem"
+# tls_key_path        = "/certs/privkey.pem"
+max_body_bytes        = 10485760    # 10 MiB
+proxy_timeout_ms      = 30000       # 30 s
+shutdown_timeout_secs = 30
+log_level             = "info"
+log_format            = "text"
+crash_log_path        = "./crash.log"
+swagger_enabled       = true
+```
+
+## Key Reference
+
+### `proxy_port`
+
+| | |
+|---|---|
+| Type | Integer |
+| Default | `8080` |
+| Env var | `GATEWAY_SERVER__PROXY_PORT` |
+| Runtime reload | No — requires restart |
+
+The TCP port on which the reverse-proxy listener accepts incoming client requests. Change this when 8080 is already in use or when deploying behind a NAT that remaps ports.
+
+```toml
+[server]
+proxy_port = 8080
+```
+
+---
+
+### `mgmt_port`
+
+| | |
+|---|---|
+| Type | Integer |
+| Default | `9090` |
+| Env var | `GATEWAY_SERVER__MGMT_PORT` |
+| Runtime reload | No — requires restart |
+
+The TCP port for the management API. All administrative endpoints (`/api/v1/health`, `/api/v1/config`, `/api/v1/metrics`, `/api/v1/apps`, Swagger UI) are served on this port.
+
+**Do not expose this port to the public internet.** Restrict access via firewall rules or a network policy.
+
+---
+
+### `admin_token`
+
+| | |
+|---|---|
+| Type | String |
+| Default | _(none — management API is unauthenticated)_ |
+| Env var | `GATEWAY_SERVER__ADMIN_TOKEN` |
+| Runtime reload | Yes |
+
+Bearer token required on all management API requests. When set, every request to port 9090 must include `Authorization: Bearer <token>`. Comparison is constant-time (immune to timing attacks).
+
+**Always set this in production.** Without it, anyone with network access to port 9090 can read configuration, trigger reloads, and access all management endpoints.
+
+```bash
+# Recommended: set via environment variable, never hardcode in TOML
+export GATEWAY_SERVER__ADMIN_TOKEN="$(openssl rand -hex 32)"
+```
+
+Usage:
+
+```bash
+curl -H "Authorization: Bearer $GATEWAY_SERVER__ADMIN_TOKEN" \
+  http://localhost:9090/api/v1/health
+```
+
+---
+
+### `tls_enabled`
+
+| | |
+|---|---|
+| Type | Boolean |
+| Default | `false` |
+| Env var | `GATEWAY_SERVER__TLS_ENABLED` |
+| Runtime reload | No — requires restart |
+
+Enable TLS termination on port 8443. When enabled, both plain HTTP (8080) and HTTPS (8443) remain active. Requires `tls_cert_path` and `tls_key_path` to be set.
+
+---
+
+### `tls_cert_path`
+
+| | |
+|---|---|
+| Type | String (file path) |
+| Default | _(none)_ |
+| Env var | `GATEWAY_SERVER__TLS_CERT_PATH` |
+| Runtime reload | No — requires restart |
+
+Absolute path to the full-chain PEM certificate file. The file must contain the server leaf certificate followed by any intermediate CA certificates. See [TLS Termination](/nexus/deployment/tls-termination) for format requirements.
+
+---
+
+### `tls_key_path`
+
+| | |
+|---|---|
+| Type | String (file path) |
+| Default | _(none)_ |
+| Env var | `GATEWAY_SERVER__TLS_KEY_PATH` |
+| Runtime reload | No — requires restart |
+
+Absolute path to the private key PEM file. Supported formats: PKCS8 (`-----BEGIN PRIVATE KEY-----`) and RSA PKCS1 (`-----BEGIN RSA PRIVATE KEY-----`). Must correspond to the certificate at `tls_cert_path`.
+
+---
+
+### `max_body_bytes`
+
+| | |
+|---|---|
+| Type | Integer (bytes) |
+| Default | `10485760` (10 MiB) |
+| Env var | `GATEWAY_SERVER__MAX_BODY_BYTES` |
+| Runtime reload | Yes |
+
+Maximum allowed request body size in bytes. Requests that exceed this limit are rejected with HTTP **413 Content Too Large** before the body is read. Set to `0` to disable the limit (not recommended in production).
+
+```toml
+[server]
+max_body_bytes = 52428800  # 50 MiB
+```
+
+---
+
+### `proxy_timeout_ms`
+
+| | |
+|---|---|
+| Type | Integer (milliseconds) |
+| Default | `30000` (30 seconds) |
+| Env var | `GATEWAY_SERVER__PROXY_TIMEOUT_MS` |
+| Runtime reload | Yes |
+
+Per-request deadline enforced by the proxy timeout middleware. If the complete round-trip to the upstream backend (connection + send + receive) takes longer than this value, the gateway returns HTTP **504 Gateway Timeout** to the client and cancels the upstream request.
+
+This is separate from the HTTP client's `request_timeout_ms` setting — `proxy_timeout_ms` is enforced by middleware wrapping the entire handler, while `http.request_timeout_ms` is set on the reqwest client used for outbound connections.
+
+```toml
+[server]
+proxy_timeout_ms = 60000  # 60 seconds for slow backends
+```
+
+---
+
+### `shutdown_timeout_secs`
+
+| | |
+|---|---|
+| Type | Integer (seconds) |
+| Default | `30` |
+| Env var | `GATEWAY_SERVER__SHUTDOWN_TIMEOUT_SECS` |
+| Runtime reload | No — applies only at the next startup |
+
+Maximum time (in seconds) to wait for in-flight proxy requests to complete after receiving `SIGTERM`. If in-flight requests do not drain within this period, the gateway force-moves to the next shutdown phase. See [Graceful Shutdown](/nexus/deployment/graceful-shutdown).
+
+---
+
+### `log_level`
+
+| | |
+|---|---|
+| Type | String |
+| Default | `info` |
+| Env var | `GATEWAY_SERVER__LOG_LEVEL` |
+| Runtime reload | Yes |
+| Overridden by | `RUST_LOG` environment variable |
+
+Controls the minimum severity of log messages emitted to stdout. Accepted values:
+
+| Value | Description |
+|---|---|
+| `trace` | Extremely verbose; logs internal spans and polling loops |
+| `debug` | Detailed request/response data; useful during development |
+| `info` | Default; lifecycle events, config loads, health changes |
+| `warn` | Degraded conditions that don't stop the gateway |
+| `error` | Errors only; minimal output |
+
+`RUST_LOG` takes precedence when set. It accepts the full `tracing` filter syntax:
+
+```bash
+# Log gateway at debug, tower_http at warn
+RUST_LOG=nexus=debug,tower_http=warn
+```
+
+---
+
+### `log_format`
+
+| | |
+|---|---|
+| Type | String |
+| Default | `text` |
+| Env var | `GATEWAY_SERVER__LOG_FORMAT` |
+| Runtime reload | Yes |
+| Accepted values | `text`, `json` |
+
+Controls the log output format.
+
+- `text`: Human-readable, colourised when outputting to a TTY.
+- `json`: Structured JSON with fields `timestamp`, `level`, `target`, `message`, and any span fields. Use this format when piping logs to a log aggregator (Loki, Elasticsearch, Splunk, etc.).
+
+---
+
+### `crash_log_path`
+
+| | |
+|---|---|
+| Type | String (file path) |
+| Default | `./crash.log` |
+| Env var | `GATEWAY_SERVER__CRASH_LOG_PATH` |
+| Runtime reload | No |
+
+Path to the crash log file. The panic hook writes a structured JSON entry to this file when an unrecoverable panic occurs. The entry includes the panic message, thread name, timestamp, version, and build hash. This file is separate from the main log stream.
+
+---
+
+### `swagger_enabled`
+
+| | |
+|---|---|
+| Type | Boolean |
+| Default | `true` |
+| Env var | `GATEWAY_SERVER__SWAGGER_ENABLED` |
+| Runtime reload | Yes |
+
+When `true`, the Swagger UI is served at `http://localhost:9090/swagger-ui` and the OpenAPI 3.0 specification is available at `http://localhost:9090/api-docs/openapi.json`.
+
+Set to `false` in production environments where you do not want the API schema to be publicly discoverable.
+
+---
+
+## Update Check
+
+The update check is configured under `[update_check]` (not a sub-key of `[server]`).
+
+### `update_check.enabled`
+
+| | |
+|---|---|
+| Type | Boolean |
+| Default | `true` |
+| Env var | `GATEWAY_UPDATE_CHECK__ENABLED` |
+
+When `true`, an asynchronous background task runs at startup and checks for a newer release by querying `update_check.url`. The check is non-blocking — startup is not delayed. If a newer version is available a `WARN`-level log message is emitted. No automatic upgrade occurs.
+
+### `update_check.url`
+
+| | |
+|---|---|
+| Type | String (URL) |
+| Default | `https://api.github.com/repos/draskencloud/draskencloud.gateway.service/releases/latest` |
+| Env var | `GATEWAY_UPDATE_CHECK__URL` |
+
+The GitHub Releases API endpoint queried for the latest release version. Override this to point at an internal mirror or to disable specific endpoint access in air-gapped environments (or set `update_check.enabled = false`).
+
+---
+
+## Circuit Breaker
+
+Configured under `[circuit_breaker]`.
+
+### `circuit_breaker.threshold`
+
+| | |
+|---|---|
+| Type | Integer |
+| Default | `5` |
+| Env var | `GATEWAY_CIRCUIT_BREAKER__THRESHOLD` |
+| Legacy env var | `GATEWAY_CIRCUIT_BREAKER_THRESHOLD` |
+
+Number of consecutive failures before the circuit breaker trips to the open state, stopping traffic to the affected backend for `circuit_breaker.timeout_secs`.
+
+### `circuit_breaker.timeout_secs`
+
+| | |
+|---|---|
+| Type | Integer (seconds) |
+| Default | `30` |
+| Env var | `GATEWAY_CIRCUIT_BREAKER__TIMEOUT_SECS` |
+| Legacy env var | `GATEWAY_CIRCUIT_BREAKER_TIMEOUT_SECS` |
+
+How long (in seconds) the circuit breaker remains open before transitioning to the half-open state and allowing a probe request through.
+
+---
+
+## Backend Health Probe
+
+Configured under `[health]`.
+
+### `health.interval_secs`
+
+| | |
+|---|---|
+| Type | Integer (seconds) |
+| Default | `30` |
+| Env var | `GATEWAY_HEALTH__INTERVAL_SECS` |
+| Legacy env var | `GATEWAY_HEALTH_INTERVAL_SECS` |
+
+Interval between active health probes to registered backend services. The health probe results are reflected in the `/api/v1/health` management endpoint response and drive circuit breaker state transitions.
+
+---
+
+## Proxy Retry
+
+Configured under `[proxy]`.
+
+### `proxy.retry_attempts`
+
+| | |
+|---|---|
+| Type | Integer |
+| Default | `3` |
+| Env var | `GATEWAY_PROXY__RETRY_ATTEMPTS` |
+| Legacy env var | `GATEWAY_PROXY_RETRY_ATTEMPTS` |
+
+Maximum number of retry attempts for a failed upstream request before the gateway returns an error to the client. Retries use exponential backoff. Only idempotent methods (`GET`, `HEAD`, `OPTIONS`) are retried by default.

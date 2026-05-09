@@ -1,0 +1,386 @@
+---
+title: "Network Security"
+description: "Port reference, firewall configs, TLS/mTLS, X-Forwarded-For trust, and DDoS layering recommendations."
+---
+
+This document describes the network architecture of the Nexus API Gateway by Drasken Cloud, required firewall configurations, TLS setup, mTLS to backends, and how to correctly configure trusted proxy IP handling.
+
+---
+
+## Table of Contents
+
+- [Port Reference](#port-reference)
+- [Why Port 9090 Must Be Protected](#why-port-9090-must-be-protected)
+- [Firewall Configuration](#firewall-configuration)
+  - [iptables / nftables](#iptables--nftables)
+  - [Cloud Security Groups](#cloud-security-groups)
+  - [Kubernetes NetworkPolicy](#kubernetes-networkpolicy)
+- [TLS in Production](#tls-in-production)
+  - [Gateway-Native TLS (Port 8443)](#gateway-native-tls-port-8443)
+  - [TLS Termination at Load Balancer](#tls-termination-at-load-balancer)
+- [mTLS to Backends](#mtls-to-backends)
+- [X-Forwarded-For and Trusted Proxies](#x-forwarded-for-and-trusted-proxies)
+- [Network-Level Rate Limiting and DDoS Protection](#network-level-rate-limiting-and-ddos-protection)
+- [Reference Architecture Diagrams](#reference-architecture-diagrams)
+
+---
+
+## Port Reference
+
+| Port | Protocol | Purpose | Exposed To |
+|---|---|---|---|
+| `8080` | HTTP | Client-facing proxy (unencrypted) | Public internet or internal network |
+| `8443` | HTTPS | Client-facing proxy (TLS) | Public internet (preferred in production) |
+| `9090` | HTTP | Management API + `/metrics` | **Operators only — never the internet** |
+
+**There is no separate metrics port.** The Prometheus `/metrics` endpoint is served on port `9090` alongside the management API. Firewalling port `9090` also protects the metrics endpoint.
+
+---
+
+## Why Port 9090 Must Be Protected
+
+Port `9090` grants **full administrative control** over the gateway:
+
+| Capability | Endpoint |
+|---|---|
+| Create, update, delete apps | `POST/PATCH/DELETE /api/v1/apps` |
+| Issue and revoke tokens | `POST/DELETE /api/v1/apps/:id/tokens` |
+| Modify routing policy | `PATCH /api/v1/apps/:id/versions/:v/revisions/:r` |
+| Read full audit logs | `GET /api/v1/audit` |
+| View Prometheus metrics | `GET /metrics` |
+| Manage backend health | `POST /api/v1/apps/.../revisions/:r/activate` |
+
+An attacker with access to port `9090` can:
+
+- Revoke all existing tokens — instant denial of service for all authenticated clients.
+- Issue new tokens — forge access to any app.
+- Read the audit log — enumerate every path, method, and token ID in use.
+- Modify backend URLs — redirect traffic to attacker-controlled infrastructure.
+
+**This port must never be exposed to the public internet.** Protect it with a firewall allowing access only from operator/VPN networks, and always require the `GATEWAY_SERVER__ADMIN_TOKEN`.
+
+---
+
+## Firewall Configuration
+
+### iptables / nftables
+
+**iptables (IPv4):**
+
+```bash
+# Allow proxy traffic from anywhere
+iptables -A INPUT -p tcp --dport 8080 -j ACCEPT
+iptables -A INPUT -p tcp --dport 8443 -j ACCEPT
+
+# Allow management API only from operator network (e.g., VPN range 10.10.0.0/16)
+iptables -A INPUT -p tcp --dport 9090 -s 10.10.0.0/16 -j ACCEPT
+
+# Drop all other management API traffic
+iptables -A INPUT -p tcp --dport 9090 -j DROP
+```
+
+**nftables:**
+
+```nft
+table inet filter {
+  chain input {
+    type filter hook input priority 0; policy drop;
+
+    # Allow established connections
+    ct state established,related accept
+
+    # Allow proxy traffic
+    tcp dport { 8080, 8443 } accept
+
+    # Allow management API from operator VPN only
+    ip saddr 10.10.0.0/16 tcp dport 9090 accept
+
+    # Allow loopback
+    iif lo accept
+  }
+}
+```
+
+### Cloud Security Groups
+
+**AWS Security Group (Terraform):**
+
+```hcl
+resource "aws_security_group" "gateway" {
+  name   = "gateway"
+  vpc_id = var.vpc_id
+
+  # Proxy — public
+  ingress {
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 8443
+    to_port     = 8443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # Management API — VPN / operator network only
+  ingress {
+    from_port   = 9090
+    to_port     = 9090
+    protocol    = "tcp"
+    cidr_blocks = ["10.10.0.0/16"]  # VPN CIDR only
+  }
+
+  # Deny all other inbound implicitly (AWS SG default)
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+```
+
+**GCP Firewall Rules:**
+
+```bash
+# Allow proxy traffic from all sources
+gcloud compute firewall-rules create allow-gateway-proxy \
+  --network=default \
+  --allow=tcp:8080,tcp:8443 \
+  --source-ranges=0.0.0.0/0 \
+  --target-tags=gateway
+
+# Allow management API from VPN range only
+gcloud compute firewall-rules create allow-gateway-management \
+  --network=default \
+  --allow=tcp:9090 \
+  --source-ranges=10.10.0.0/16 \
+  --target-tags=gateway
+```
+
+### Kubernetes NetworkPolicy
+
+```yaml
+# Allow proxy traffic from any pod/namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-proxy-ingress
+  namespace: gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: draskencloud-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 8080
+        - port: 8443
+
+---
+# Allow management API only from ops namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-management-ingress
+  namespace: gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: draskencloud-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ops
+      ports:
+        - port: 9090
+```
+
+---
+
+## TLS in Production
+
+### Gateway-Native TLS (Port 8443)
+
+The gateway supports TLS termination natively using **rustls** — a pure-Rust TLS implementation with no dependency on OpenSSL. This eliminates an entire class of OpenSSL-related CVEs (Heartbleed, POODLE, etc.).
+
+**Enabling TLS:**
+
+```bash
+export GATEWAY_TLS_CERT_PATH="/run/secrets/gateway.crt"
+export GATEWAY_TLS_KEY_PATH="/run/secrets/gateway.key"
+```
+
+When both variables are set, the gateway starts port `8443` alongside port `8080`. Port `8080` remains active; you can disable it at the load balancer level or firewall it to force all traffic to `8443`.
+
+**Certificate format:** PEM-encoded X.509 certificate chain. If you have intermediate certificates, concatenate them in order (leaf → intermediate → root) in the cert file.
+
+**Key format:** PEM-encoded PKCS#8 private key (`-----BEGIN PRIVATE KEY-----`).
+
+**Obtaining a certificate:**
+
+```bash
+# Let's Encrypt via certbot (standalone mode)
+certbot certonly --standalone -d gateway.example.com
+
+# Files produced:
+# /etc/letsencrypt/live/gateway.example.com/fullchain.pem  ← GATEWAY_TLS_CERT_PATH
+# /etc/letsencrypt/live/gateway.example.com/privkey.pem   ← GATEWAY_TLS_KEY_PATH
+```
+
+**Supported TLS versions:** TLS 1.2 and TLS 1.3 (rustls defaults). TLS 1.0 and 1.1 are not supported.
+
+### TLS Termination at Load Balancer
+
+If you terminate TLS at an upstream load balancer (AWS ALB, GCP GLB, nginx, HAProxy), the gateway can run on plain HTTP internally:
+
+```
+Client → [LB: TLS termination on 443] → [Gateway: HTTP on 8080]
+```
+
+In this configuration:
+
+1. Set `trusted_proxy_ips` to the load balancer's IP(s) so the gateway trusts the `X-Forwarded-For` and `X-Forwarded-Proto` headers the LB adds.
+2. Keep port `8080` accessible only from the LB's IP range (not from the public internet).
+3. Ensure the LB does not bypass authentication — it should forward all headers unchanged, not strip `Authorization`.
+
+---
+
+## mTLS to Backends
+
+mTLS (mutual TLS) ensures backends only accept requests from a legitimate, authenticated gateway instance. The backend validates the gateway's client certificate, and the gateway validates the backend's server certificate.
+
+**Configure a named mTLS profile via environment variables:**
+
+```bash
+# Profile name: "internal" (matches backend_mtls_profile in policy)
+export GATEWAY_MTLS_PROFILE_INTERNAL_CERT_PATH="/run/secrets/gateway-client.crt"
+export GATEWAY_MTLS_PROFILE_INTERNAL_KEY_PATH="/run/secrets/gateway-client.key"
+export GATEWAY_MTLS_PROFILE_INTERNAL_CA_PATH="/run/secrets/backend-ca.crt"
+```
+
+**Reference the profile in a revision policy:**
+
+```json
+{
+  "backend_mtls_profile": "internal"
+}
+```
+
+**What happens when a profile is active:**
+
+1. The gateway opens a TLS connection to the backend.
+2. It presents the client certificate (`CERT_PATH`) signed by a CA the backend trusts.
+3. It verifies the backend's server certificate against the configured CA (`CA_PATH`).
+4. If either side fails to present a valid certificate, the connection is rejected before any HTTP data is sent.
+
+**Backend configuration (nginx example):**
+
+```nginx
+server {
+    listen 8443 ssl;
+    ssl_certificate     /etc/nginx/certs/backend.crt;
+    ssl_certificate_key /etc/nginx/certs/backend.key;
+
+    # Require client certificate signed by gateway's CA
+    ssl_client_certificate /etc/nginx/certs/gateway-ca.crt;
+    ssl_verify_client on;
+
+    location / {
+        proxy_pass http://app:3000;
+    }
+}
+```
+
+---
+
+## X-Forwarded-For and Trusted Proxies
+
+The gateway uses the `X-Forwarded-For` header for IP-based rate limiting and IP filter enforcement. If the gateway sits behind a load balancer or reverse proxy, the LB appends the real client IP to this header.
+
+**The risk:** Any client can forge `X-Forwarded-For`. If the gateway naively trusts it, an attacker can spoof their IP to bypass IP filter rules or avoid IP-based rate limits.
+
+**The solution: `trusted_proxy_ips`**
+
+Configure the IP addresses (or CIDR ranges) of your load balancers and trusted upstream proxies:
+
+```toml
+[server]
+# env: GATEWAY_SERVER__TRUSTED_PROXY_IPS
+trusted_proxy_ips = ["10.0.0.1/32", "10.0.0.2/32", "172.16.0.0/12"]
+```
+
+Or via environment variable:
+
+```bash
+export GATEWAY_SERVER__TRUSTED_PROXY_IPS="10.0.0.1/32,10.0.0.2/32"
+```
+
+**Behaviour:**
+
+| Request source IP | trusted_proxy_ips contains it? | IP used for rate limit / filter |
+|---|---|---|
+| Load balancer IP | Yes | Rightmost IP in `X-Forwarded-For` that is NOT a trusted proxy |
+| Unknown proxy | No | Request's direct TCP source IP |
+| Direct client | No | Request's direct TCP source IP |
+
+**If `trusted_proxy_ips` is empty (default):** The gateway uses the direct TCP source IP and ignores `X-Forwarded-For` entirely. This is correct when the gateway is directly internet-facing with no upstream proxy.
+
+**If `trusted_proxy_ips` is set:** The gateway peels back the `X-Forwarded-For` chain, skipping any IPs that belong to trusted proxies, and uses the leftmost non-trusted IP as the real client IP.
+
+---
+
+## Network-Level Rate Limiting and DDoS Protection
+
+The gateway provides application-layer rate limiting (`IpRateLimitLayer` and `RateLimitLayer`), but these operate after the TCP connection is established and the HTTP request is parsed. They cannot protect against volumetric Layer 3/4 attacks (SYN floods, UDP floods, etc.).
+
+**Recommended complementary protections:**
+
+| Layer | Tool | What it handles |
+|---|---|---|
+| L3/L4 | Upstream ISP / cloud DDoS scrubbing | Volumetric floods before they reach your network |
+| L4 | Cloud WAF or DDoS protection (AWS Shield, Cloudflare, GCP Armor) | SYN floods, reflection attacks |
+| L7 | CDN (Cloudflare, Fastly, CloudFront) | HTTP flood mitigation, caching to reduce origin load |
+| L7 | Gateway `IpRateLimitLayer` | Per-IP request rate limiting at the application level |
+| L7 | Gateway `RateLimitLayer` | Per-token/per-user rate limiting at the application level |
+
+**Recommended architecture for high-traffic deployments:**
+
+```
+Internet clients
+      │
+      ▼
+CDN / DDoS Scrubbing Layer   ← L3/L4 flood protection, L7 caching
+      │
+      ▼
+Load Balancer (TLS termination)
+      │ (internal network, TLS offloaded)
+      ▼
+Nexus API Gateway by Drasken Cloud (port 8080)   ← auth, rate limit, routing
+      │ (private LAN, optionally mTLS)
+      ▼
+Backend Services
+```
+
+**Rate limit configuration example:**
+
+```toml
+[rate_limit]
+# IP-level: max requests per window before 429
+ip_rps = 100                    # env: GATEWAY_RATE_LIMIT__IP_RPS
+ip_burst = 200                  # env: GATEWAY_RATE_LIMIT__IP_BURST
+
+# Token-level: per authenticated token
+token_rps = 50                  # env: GATEWAY_RATE_LIMIT__TOKEN_RPS
+token_burst = 100               # env: GATEWAY_RATE_LIMIT__TOKEN_BURST
+```
+
+The IP rate limit fires before authentication (`IpRateLimitLayer` is outermost), so volumetric unauthenticated attacks are dropped before consuming bcrypt or database resources.

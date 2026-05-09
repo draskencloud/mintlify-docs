@@ -1,0 +1,175 @@
+---
+title: "mTLS to Backends"
+description: "Authenticate the gateway to backends with named mTLS profiles configured via environment variables."
+---
+
+Mutual TLS (mTLS) allows the gateway to authenticate itself to backend services using a client certificate, and optionally verify the backend's certificate against a custom CA. This ensures that only the gateway can call your backends, even if the backend network is partially compromised.
+
+## How It Works
+
+The gateway maintains a pool of pre-configured `reqwest::Client` instances, one per mTLS profile. When a request is routed to a revision that has a profile assigned, the gateway selects the corresponding client and uses it for the upstream connection.
+
+## Configuring mTLS Profiles
+
+Profiles are configured entirely through environment variables — no TOML configuration is needed or supported, since these are secrets.
+
+### Environment Variable Pattern
+
+```
+GATEWAY_MTLS_PROFILE_<NAME>_CERT_PATH=<path-to-client-cert.pem>
+GATEWAY_MTLS_PROFILE_<NAME>_KEY_PATH=<path-to-client-key.pem>
+GATEWAY_MTLS_PROFILE_<NAME>_CA_PATH=<path-to-ca-cert.pem>
+```
+
+- `<NAME>` is an uppercase identifier you choose (e.g., `PAYMENTS`, `INTERNAL`, `PARTNER_A`)
+- `CERT_PATH` — PEM file containing the client certificate (and optionally the full chain)
+- `KEY_PATH` — PEM file containing the private key (PKCS8 or RSA PEM)
+- `CA_PATH` — PEM file containing the CA certificate used to verify the backend's server certificate; omit to use the system root CA store
+
+All three variables are required when defining a profile. The profile name is derived by lowercasing `<NAME>` (e.g., `PAYMENTS` → profile name `payments`).
+
+### Example: Single Profile
+
+```bash
+export GATEWAY_MTLS_PROFILE_PAYMENTS_CERT_PATH=/certs/gateway-client.pem
+export GATEWAY_MTLS_PROFILE_PAYMENTS_KEY_PATH=/certs/gateway-client.key
+export GATEWAY_MTLS_PROFILE_PAYMENTS_CA_PATH=/certs/payments-ca.pem
+```
+
+### Example: Multiple Profiles
+
+```bash
+# Profile "payments"
+export GATEWAY_MTLS_PROFILE_PAYMENTS_CERT_PATH=/certs/payments/client.pem
+export GATEWAY_MTLS_PROFILE_PAYMENTS_KEY_PATH=/certs/payments/client.key
+export GATEWAY_MTLS_PROFILE_PAYMENTS_CA_PATH=/certs/payments/ca.pem
+
+# Profile "internal"
+export GATEWAY_MTLS_PROFILE_INTERNAL_CERT_PATH=/certs/internal/client.pem
+export GATEWAY_MTLS_PROFILE_INTERNAL_KEY_PATH=/certs/internal/client.key
+export GATEWAY_MTLS_PROFILE_INTERNAL_CA_PATH=/certs/internal/ca.pem
+```
+
+## Assigning a Profile to a Revision
+
+Set `backend_mtls_profile` in the revision's `AuthPolicy`:
+
+```json
+{
+  "auth": {
+    "auth_type": "api_key",
+    "required": true,
+    "backend_mtls_profile": "payments"
+  }
+}
+```
+
+When this revision handles a request, the gateway uses the `payments` mTLS client for the upstream connection. All other revisions without a `backend_mtls_profile` use the shared default HTTP client.
+
+### Via the Management API
+
+```bash
+curl -s -X POST http://localhost:9090/api/v1/apps/<app_id>/versions/<ver_id>/revisions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "revision": "mtls-v1",
+    "backend_scheme": "https",
+    "backend_host": "payments-internal.example.com",
+    "backend_port": 8443,
+    "policy": {
+      "auth": {
+        "auth_type": "api_key",
+        "required": true,
+        "backend_mtls_profile": "payments"
+      }
+    }
+  }'
+```
+
+## Certificate Requirements
+
+| Field | Requirement |
+|-------|-------------|
+| Client certificate | PEM format; must be signed by a CA trusted by the backend |
+| Private key | PEM format; PKCS8 or RSA; must match the certificate |
+| CA certificate | PEM format; used to verify the backend's TLS certificate |
+| Key size | RSA 2048+ or ECDSA P-256+ recommended |
+
+## Kubernetes: Mounting Certificates as Secrets
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gateway-mtls-payments
+type: kubernetes.io/tls
+data:
+  tls.crt: <base64-encoded-cert>
+  tls.key: <base64-encoded-key>
+  ca.crt: <base64-encoded-ca>
+---
+# In the Deployment
+env:
+  - name: GATEWAY_MTLS_PROFILE_PAYMENTS_CERT_PATH
+    value: /certs/payments/tls.crt
+  - name: GATEWAY_MTLS_PROFILE_PAYMENTS_KEY_PATH
+    value: /certs/payments/tls.key
+  - name: GATEWAY_MTLS_PROFILE_PAYMENTS_CA_PATH
+    value: /certs/payments/ca.crt
+volumeMounts:
+  - name: mtls-payments
+    mountPath: /certs/payments
+    readOnly: true
+volumes:
+  - name: mtls-payments
+    secret:
+      secretName: gateway-mtls-payments
+```
+
+## Certificate Rotation
+
+Certificate rotation requires a gateway restart in v1 — mTLS clients are built at startup and not hot-reloaded.
+
+**Zero-downtime rotation procedure** (rolling restart behind a load balancer):
+
+1. Update the secret/file with the new certificate and key
+2. Perform a rolling restart of gateway instances
+3. Each new instance picks up the new certificate at startup
+4. Old instances continue serving traffic with the old certificate until they are replaced
+
+## Backend Configuration
+
+The backend must be configured to:
+
+1. Require client certificates (mTLS enforcement)
+2. Trust the CA that signed the gateway's client certificate
+3. Present a server certificate signed by the CA configured in `CA_PATH`
+
+### Example: nginx Backend mTLS Config
+
+```nginx
+server {
+    listen 8443 ssl;
+    ssl_certificate     /certs/server.pem;
+    ssl_certificate_key /certs/server.key;
+
+    # Require client certificate
+    ssl_client_certificate /certs/gateway-ca.pem;
+    ssl_verify_client on;
+
+    location / {
+        proxy_pass http://upstream;
+    }
+}
+```
+
+## Troubleshooting
+
+| Symptom | Likely Cause |
+|---------|-------------|
+| `502 Bad Gateway` on mTLS revision | Certificate path wrong or file not readable at startup |
+| Backend returns `SSL handshake failed` | CA mismatch — backend doesn't trust the gateway's client cert CA |
+| Gateway startup fails with TLS error | Key does not match the certificate |
+| `backend_mtls_profile` ignored | Profile name mismatch (case-sensitive lowercase comparison) |
+
+Check that the profile name in `backend_mtls_profile` exactly matches the lowercase version of the env var `<NAME>` component (e.g., `PAYMENTS` → `payments`).

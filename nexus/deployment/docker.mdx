@@ -1,63 +1,310 @@
 ---
-title: Docker
-description: Deploy Nexus using Docker or Docker Compose.
+title: "Docker Deployment"
+description: "Run the gateway in Docker — quick start, persistent SQLite volume, env-driven config, full Compose stack."
 ---
 
-## Docker Run
+This guide covers running the Nexus API Gateway by Drasken Cloud in Docker, from a single-container quick-start through a production-ready Docker Compose stack.
+
+## Quick Start
 
 ```bash
 docker run -d \
-  --name nexus \
+  --name gateway \
   -p 8080:8080 \
   -p 9090:9090 \
-  -e GATEWAY_AUTO_MIGRATE=true \
-  -e GATEWAY_DATABASE_URL="sqlite:///app/data/gateway.db?mode=rwc" \
-  -e GATEWAY_SERVER__ADMIN_TOKEN="your-secret-token" \
-  -e GATEWAY_SERVER__LOG_FORMAT=json \
-  -v nexus-data:/app/data \
-  ghcr.io/draskencloud/nexus:latest
+  draskencloud/gateway
 ```
 
-## Docker Compose
+The gateway is now reachable on:
+- **Port 8080** — reverse-proxy traffic
+- **Port 9090** — management API (health, config, metrics, Swagger UI)
+
+By default the container uses an in-process SQLite database at `/data/gateway.db`. No external services are required.
+
+## Persisting Data (SQLite Volume)
+
+SQLite writes to `/data/gateway.db` inside the container. Mount a host directory or named volume so the database survives container restarts:
+
+```bash
+# Host-directory mount
+docker run -d \
+  --name gateway \
+  -p 8080:8080 \
+  -p 9090:9090 \
+  -v ./data:/data \
+  draskencloud/gateway
+
+# Named volume
+docker volume create gateway-data
+docker run -d \
+  --name gateway \
+  -p 8080:8080 \
+  -p 9090:9090 \
+  -v gateway-data:/data \
+  draskencloud/gateway
+```
+
+## Volume Mounts Reference
+
+| Mount path | Purpose |
+|---|---|
+| `/data` | SQLite database (`gateway.db`). Mount for persistence. |
+| `/config` | TOML configuration files. Mount a directory containing `default.toml` and optionally an `apps/` sub-directory for app definitions. |
+| `/certs` | TLS certificate and key files when TLS termination is enabled. |
+| `/logs` | Log and analytics pipeline output files (`gateway.jsonl`, `analytics.jsonl`, `audit_dead_letter.jsonl`, etc.). |
+
+## Port Mapping Reference
+
+| Container port | Protocol | Purpose |
+|---|---|---|
+| `8080` | HTTP | Reverse-proxy ingress |
+| `9090` | HTTP | Management API (health, config, metrics) |
+| `8443` | HTTPS | TLS proxy port (only active when `tls_enabled=true`) |
+
+To change the ports the gateway listens on *inside* the container, use the environment variables `GATEWAY_SERVER__PROXY_PORT` and `GATEWAY_SERVER__MGMT_PORT`. To remap them on the host side use Docker's `-p host:container` syntax as normal.
+
+## Environment Variable Configuration
+
+All configuration keys can be set via environment variables using the `GATEWAY_` prefix with double-underscore (`__`) separators for nested sections:
+
+```bash
+docker run -d \
+  --name gateway \
+  -p 8080:8080 \
+  -p 9090:9090 \
+  -e GATEWAY_SERVER__ADMIN_TOKEN="change-me-in-production" \
+  -e GATEWAY_SERVER__LOG_FORMAT="json" \
+  -e GATEWAY_DATABASE_URL="sqlite:///data/gateway.db" \
+  -v gateway-data:/data \
+  draskencloud/gateway
+```
+
+### Common Docker Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `GATEWAY_SERVER__PROXY_PORT` | `8080` | Port the proxy listens on |
+| `GATEWAY_SERVER__MGMT_PORT` | `9090` | Port the management API listens on |
+| `GATEWAY_SERVER__ADMIN_TOKEN` | _(none)_ | Bearer token required for all management endpoints. **Set this in production.** |
+| `GATEWAY_SERVER__LOG_LEVEL` | `info` | Log verbosity: `trace`, `debug`, `info`, `warn`, `error`. `RUST_LOG` overrides this. |
+| `GATEWAY_SERVER__LOG_FORMAT` | `text` | `text` (human-readable) or `json` (structured, recommended for log aggregators) |
+| `GATEWAY_SERVER__MAX_BODY_BYTES` | `10485760` | Maximum request body size in bytes (10 MiB). Returns 413 when exceeded. |
+| `GATEWAY_SERVER__PROXY_TIMEOUT_MS` | `30000` | Per-request proxy timeout in milliseconds. Returns 504 when exceeded. |
+| `GATEWAY_SERVER__SHUTDOWN_TIMEOUT_SECS` | `30` | Drain timeout on SIGTERM before force-exit |
+| `GATEWAY_SERVER__TLS_ENABLED` | `false` | Enable TLS termination on port 8443 |
+| `GATEWAY_SERVER__TLS_CERT_PATH` | _(none)_ | Path to full-chain PEM certificate file |
+| `GATEWAY_SERVER__TLS_KEY_PATH` | _(none)_ | Path to PKCS8 or RSA PEM private key file |
+| `GATEWAY_DATABASE_URL` | `sqlite:///data/gateway.db` | Database connection string |
+| `GATEWAY_DB_DRIVER` | `sqlite` | `sqlite`, `postgres`, `mysql`, or `cockroach` |
+| `GATEWAY_AUTO_MIGRATE` | `true` | Run embedded migrations at startup |
+| `GATEWAY_CACHE__ENABLED` | `false` | Enable response caching |
+| `GATEWAY_CACHE__BACKEND` | `memory` | `memory`, `redis`, or `memcached` |
+| `GATEWAY_CACHE__REDIS__URL` | `redis://localhost:6379` | Redis connection URL (when `backend=redis`) |
+| `GATEWAY_LICENSE_KEY` | _(none)_ | Inline license key (alternative to a license file) |
+| `GATEWAY_LICENSE_FILE` | _(none)_ | Path to license file on disk |
+| `RUST_LOG` | _(none)_ | Overrides `log_level`; standard `tracing` filter directives accepted |
+
+## Health Check
+
+The Dockerfile ships with a built-in health check:
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:9090/api/v1/health || exit 1
+```
+
+To override it at run time:
+
+```bash
+docker run -d \
+  --name gateway \
+  -p 8080:8080 \
+  -p 9090:9090 \
+  --health-cmd="curl -f http://localhost:9090/api/v1/health" \
+  --health-interval=30s \
+  --health-timeout=5s \
+  --health-start-period=10s \
+  --health-retries=3 \
+  draskencloud/gateway
+```
+
+A healthy instance returns HTTP 200 from `GET /api/v1/health`. The response body includes status of the database pool, cache, and circuit breakers.
+
+## Docker Compose — Minimal (SQLite, No Redis)
 
 ```yaml
+# docker-compose.yml
+version: "3.8"
+
 services:
-  nexus:
-    image: ghcr.io/draskencloud/nexus:latest
+  gateway:
+    image: draskencloud/gateway:latest
     ports:
       - "8080:8080"
       - "9090:9090"
     environment:
-      GATEWAY_AUTO_MIGRATE: "true"
-      GATEWAY_DATABASE_URL: "sqlite:///app/data/gateway.db?mode=rwc"
-      GATEWAY_SERVER__ADMIN_TOKEN: "your-secret-token"
+      GATEWAY_SERVER__ADMIN_TOKEN: "${GATEWAY_ADMIN_TOKEN}"
       GATEWAY_SERVER__LOG_FORMAT: "json"
     volumes:
-      - nexus-data:/app/data
-    restart: unless-stopped
+      - gateway-data:/data
+      - ./config:/config:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9090/api/v1/health"]
       interval: 30s
       timeout: 5s
+      start_period: 10s
       retries: 3
+    restart: unless-stopped
 
 volumes:
-  nexus-data:
+  gateway-data:
 ```
 
-## Private Registry Login
+## Docker Compose — Production Stack (Postgres + Redis)
 
-The image is hosted on GitHub Container Registry. If the repo is private:
+The following compose file wires the gateway to a PostgreSQL database and a Redis instance for shared rate-limit counters and the response cache. This configuration is required for [horizontal scaling](/nexus/deployment/horizontal-scaling).
+
+```yaml
+# docker-compose.prod.yml
+version: "3.8"
+
+services:
+  gateway:
+    image: draskencloud/gateway:latest
+    # Use the postgres+redis-enabled build or build locally:
+    # build:
+    #   context: .
+    #   args:
+    #     FEATURES: "store-postgres"
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment:
+      # Database
+      GATEWAY_DB_DRIVER: "postgres"
+      GATEWAY_DATABASE_URL: "postgres://gateway:${POSTGRES_PASSWORD}@postgres:5432/gateway"
+      GATEWAY_AUTO_MIGRATE: "true"
+      # Cache / Rate limiting
+      GATEWAY_CACHE__ENABLED: "true"
+      GATEWAY_CACHE__BACKEND: "redis"
+      GATEWAY_CACHE__REDIS__URL: "redis://redis:6379"
+      GATEWAY_CACHE__REDIS__POOL_MAX_SIZE: "20"
+      # Server
+      GATEWAY_SERVER__ADMIN_TOKEN: "${GATEWAY_ADMIN_TOKEN}"
+      GATEWAY_SERVER__LOG_FORMAT: "json"
+      GATEWAY_SERVER__PROXY_TIMEOUT_MS: "30000"
+      # License
+      GATEWAY_LICENSE_KEY: "${GATEWAY_LICENSE_KEY}"
+    volumes:
+      - ./config:/config:ro
+      - ./certs:/certs:ro
+      - gateway-logs:/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: gateway
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  gateway-logs:
+```
+
+Create a `.env` file alongside the compose file for secrets:
 
 ```bash
-echo "YOUR_PAT" | docker login ghcr.io --username YOUR_GITHUB_USERNAME --password-stdin
+# .env
+POSTGRES_PASSWORD=supersecret
+GATEWAY_ADMIN_TOKEN=change-me-in-production
+GATEWAY_LICENSE_KEY=your-license-key-here
 ```
 
-## Using PostgreSQL
-
-For multi-instance or production deployments, replace SQLite with PostgreSQL:
+Then start the stack:
 
 ```bash
--e GATEWAY_DB_DRIVER=postgres \
--e GATEWAY_DATABASE_URL="postgresql://user:pass@host:5432/nexus"
+docker compose -f docker-compose.prod.yml up -d
 ```
+
+## TLS with Docker
+
+Mount your certificate and key into `/certs` and enable TLS:
+
+```bash
+docker run -d \
+  --name gateway \
+  -p 8080:8080 \
+  -p 8443:8443 \
+  -p 9090:9090 \
+  -e GATEWAY_SERVER__TLS_ENABLED="true" \
+  -e GATEWAY_SERVER__TLS_CERT_PATH="/certs/fullchain.pem" \
+  -e GATEWAY_SERVER__TLS_KEY_PATH="/certs/privkey.pem" \
+  -v /etc/letsencrypt/live/example.com:/certs:ro \
+  draskencloud/gateway
+```
+
+Both HTTP (8080) and HTTPS (8443) remain active when TLS is enabled. See [TLS Termination](/nexus/deployment/tls-termination) for key format requirements and rotation guidance.
+
+## Supplying a Config File
+
+To use a full TOML configuration instead of environment variables, mount the file into `/config`:
+
+```bash
+docker run -d \
+  --name gateway \
+  -p 8080:8080 \
+  -p 9090:9090 \
+  -v ./config:/config:ro \
+  draskencloud/gateway
+```
+
+The gateway loads `/config/default.toml` on startup. App-level TOML files can be placed in `/config/apps/`. Environment variables still override any value from the file.
+
+## Building a Custom Image
+
+```bash
+# Default: SQLite only
+docker build -t my-gateway .
+
+# With Postgres support
+docker build --build-arg FEATURES="store-postgres" -t my-gateway-pg .
+
+# All storage backends + OTLP
+docker build --build-arg FEATURES="store-postgres,store-mysql,otlp,memcached" -t my-gateway-full .
+```
+
+If you pass `FEATURES` you will need a matching multi-stage Dockerfile that forwards the argument to `cargo build --features $FEATURES`. The official image includes `store-postgres` support by default.

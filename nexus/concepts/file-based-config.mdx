@@ -1,0 +1,391 @@
+---
+title: "File-Based Configuration"
+description: "Load App, Version, Revision, and Endpoint definitions from TOML files for GitOps and IaC workflows."
+---
+
+The gateway can load App, Version, Revision, and Endpoint definitions from TOML files in addition to — or instead of — creating them through the management API. This is the recommended approach for GitOps workflows, infrastructure-as-code, and seeding test environments.
+
+---
+
+## Overview
+
+At startup, the gateway reads all `*.toml` files from the directory specified by `apps_dir` (default: `config/apps`). Each file can define one or more Apps with their full hierarchy. The gateway upserts the definitions into its in-memory `RuntimeStore` and optionally syncs them to the database.
+
+When `file_watch_enabled = true`, the gateway monitors the directory for changes and reloads modified files automatically without restarting.
+
+---
+
+## Configuration Settings
+
+All settings live in `config/default.toml` (or are overridden via environment variables):
+
+| Setting | Default | Env var | Description |
+|---------|---------|---------|-------------|
+| `apps_dir` | `config/apps` | `GATEWAY_APPS_DIR` | Directory scanned for `*.toml` app definition files |
+| `file_watch_enabled` | `false` | `GATEWAY_FILE_WATCH_ENABLED` | Enable automatic reload on file changes |
+| `file_watch_debounce_ms` | `500` | `GATEWAY_FILE_WATCH_DEBOUNCE_MS` | Wait this many ms after a change before reloading (avoids reloads mid-save) |
+
+```toml
+# config/default.toml
+apps_dir             = "config/apps"
+file_watch_enabled   = false
+file_watch_debounce_ms = 500
+```
+
+The app config source can also be controlled via the `[app_config]` section:
+
+```toml
+[app_config]
+source            = "both"        # "file" | "db" | "both"
+conflict          = "file_wins"   # "file_wins" | "db_wins" | "error"
+watch             = true
+watch_debounce_ms = 500
+apps_dir          = "config/apps"
+```
+
+| Option | Values | Description |
+|--------|--------|-------------|
+| `source` | `file`, `db`, `both` | Load app definitions from file only, database only, or merge both |
+| `conflict` | `file_wins`, `db_wins`, `error` | What to do when a file-defined app and a DB-defined app share the same `slug` |
+| `watch` | `true` / `false` | Enable filesystem watcher |
+
+---
+
+## Directory Layout
+
+Organise files however suits your team. One file per app is the recommended convention:
+
+```
+config/
+  default.toml               ← gateway settings
+  local.toml                 ← gitignored personal dev overrides
+  apps/
+    payments.toml            ← Payments Service (all versions and revisions)
+    orders.toml              ← Orders Service
+    auth.toml                ← Auth Service
+    _all.toml                ← (optional) all apps in a single file
+```
+
+---
+
+## Full TOML File Format
+
+Below is a complete, annotated example covering every supported field.
+
+```toml
+# config/apps/payments.toml
+# Payments Service — all versions and revisions
+
+# ── App ───────────────────────────────────────────────────────────────────────
+
+[app]
+name         = "Payments Service"
+slug         = "payments"            # Unique identifier; used as conflict key.
+                                     # Immutable after first load.
+gateway_path = "/payments"           # Base path prefix on the proxy.
+                                     # Immutable after first load.
+routing_mode = "managed_endpoint"    # "pass_through" | "managed_endpoint"
+                                     # Immutable after first load.
+is_active    = true
+
+# App-level default policy — inherited by all versions/revisions/endpoints
+# unless they define their own values for a given field.
+[app.default_policy]
+allowed_methods = ["GET", "POST", "PUT", "DELETE", "PATCH"]
+
+  [app.default_policy.auth]
+  auth_type = "api_key"
+  required  = true
+
+  [app.default_policy.rate_limit]
+  enabled        = true
+  requests       = 1000
+  window_seconds = 60
+
+  [app.default_policy.cors]
+  allowed_origins  = ["https://dashboard.example.com", "https://app.example.com"]
+  allowed_methods  = ["GET", "POST", "PUT", "DELETE"]
+  allowed_headers  = ["Authorization", "Content-Type", "X-Request-Id"]
+  allow_credentials = true
+  max_age          = 3600
+
+  [app.default_policy.ip_filter]
+  mode  = "allow"
+  cidrs = ["10.0.0.0/8", "172.16.0.0/12"]
+
+  [app.default_policy.cache]
+  enabled = false
+
+# ── Version v1 ────────────────────────────────────────────────────────────────
+
+[[app.versions]]
+version      = "v1"
+gateway_path = "/payments/v1"
+status       = "active"             # "active" | "deprecated" | "retired"
+
+  # Version-level policy override. Only fields specified here are merged;
+  # all other fields are inherited from the App policy.
+  # Omit entirely to inherit App policy unchanged.
+  [app.versions.default_policy]
+  # (empty — inherits App policy)
+
+  # ── Revision r1 ─────────────────────────────────────────────────────────────
+
+  [[app.versions.revisions]]
+  revision           = "r1"
+  backend_scheme     = "https"
+  backend_host       = "payments.internal.cluster.local"
+                       # Stable address: k8s Service DNS, Consul VIP, or LB hostname.
+                       # Instance-level load balancing is handled by the infrastructure.
+  backend_port       = 443
+  backend_base_path  = "/"
+  strip_gateway_path = true          # Strip /payments/v1 before forwarding
+  is_current         = true          # This revision receives all stable traffic
+  traffic_weight     = 100           # 0–100; used for weighted canary routing
+  health_check_path  = "/health"     # Optional; health prober sends GET here
+
+    # Revision-level policy override.
+    [app.versions.revisions.default_policy]
+    # Override rate_limit for this specific revision
+    [app.versions.revisions.default_policy.rate_limit]
+    enabled        = true
+    requests       = 500             # Tighter limit for this backend cluster
+    window_seconds = 60
+
+    # ── Endpoints (managed_endpoint mode only) ────────────────────────────────
+    # Each [[app.versions.revisions.endpoints]] entry registers one
+    # method + path combination. Requests to unregistered combinations
+    # return 404 (unknown path) or 405 (known path, wrong method).
+
+    [[app.versions.revisions.endpoints]]
+    method       = "GET"
+    path         = "/orders"         # Relative to the version gateway_path
+    backend_path = "/v1/orders"      # Path sent to the backend (optional; defaults to path)
+    is_active    = true
+
+      # Endpoint-level policy override — merged with revision policy.
+      # Use for per-endpoint caching, rate limits, or auth overrides.
+      [app.versions.revisions.endpoints.policy_override]
+      [app.versions.revisions.endpoints.policy_override.cache]
+      enabled     = true
+      ttl_seconds = 60
+
+    [[app.versions.revisions.endpoints]]
+    method       = "POST"
+    path         = "/orders"
+    backend_path = "/v1/orders"
+    is_active    = true
+    # No policy_override — inherits revision policy
+
+    [[app.versions.revisions.endpoints]]
+    method       = "GET"
+    path         = "/orders/{id}"
+    backend_path = "/v1/orders/{id}"
+    is_active    = true
+
+      [app.versions.revisions.endpoints.policy_override]
+      [app.versions.revisions.endpoints.policy_override.cache]
+      enabled     = true
+      ttl_seconds = 300              # Longer cache for individual order lookups
+
+    [[app.versions.revisions.endpoints]]
+    method       = "PUT"
+    path         = "/orders/{id}"
+    backend_path = "/v1/orders/{id}"
+    is_active    = true
+
+    [[app.versions.revisions.endpoints]]
+    method       = "DELETE"
+    path         = "/orders/{id}"
+    backend_path = "/v1/orders/{id}"
+    is_active    = true
+
+  # ── Revision r2 (canary) ──────────────────────────────────────────────────
+
+  [[app.versions.revisions]]
+  revision           = "r2"
+  backend_scheme     = "https"
+  backend_host       = "payments-v2.internal.cluster.local"
+  backend_port       = 443
+  backend_base_path  = "/"
+  strip_gateway_path = true
+  is_current         = false         # Not the stable revision yet
+  traffic_weight     = 10            # Receives ~9% of traffic (10 / (100+10))
+  health_check_path  = "/health"
+
+    # r2 inherits r1's policy — no overrides needed
+
+    [[app.versions.revisions.endpoints]]
+    method       = "GET"
+    path         = "/orders"
+    backend_path = "/v1/orders"
+    is_active    = true
+
+    [[app.versions.revisions.endpoints]]
+    method       = "POST"
+    path         = "/orders"
+    backend_path = "/v1/orders"
+    is_active    = true
+
+    [[app.versions.revisions.endpoints]]
+    method       = "GET"
+    path         = "/orders/{id}"
+    backend_path = "/v1/orders/{id}"
+    is_active    = true
+
+    [[app.versions.revisions.endpoints]]
+    method       = "PUT"
+    path         = "/orders/{id}"
+    backend_path = "/v1/orders/{id}"
+    is_active    = true
+
+    [[app.versions.revisions.endpoints]]
+    method       = "DELETE"
+    path         = "/orders/{id}"
+    backend_path = "/v1/orders/{id}"
+    is_active    = true
+
+# ── Version v2 ────────────────────────────────────────────────────────────────
+
+[[app.versions]]
+version      = "v2"
+gateway_path = "/payments/v2"
+status       = "active"
+
+  [[app.versions.revisions]]
+  revision           = "r1"
+  backend_scheme     = "https"
+  backend_host       = "payments-v3.internal.cluster.local"  # New backend for v2
+  backend_port       = 443
+  backend_base_path  = "/v2"
+  strip_gateway_path = true
+  is_current         = true
+  traffic_weight     = 100
+  health_check_path  = "/health"
+
+    [[app.versions.revisions.endpoints]]
+    method       = "GET"
+    path         = "/orders"
+    backend_path = "/orders"
+    is_active    = true
+
+# ── Deprecated version v0 ─────────────────────────────────────────────────────
+
+[[app.versions]]
+version      = "v0"
+gateway_path = "/payments/v0"
+status       = "deprecated"          # Traffic continues; Deprecation header added
+
+  [[app.versions.revisions]]
+  revision           = "r1"
+  backend_scheme     = "https"
+  backend_host       = "payments-legacy.internal.cluster.local"
+  backend_port       = 443
+  backend_base_path  = "/"
+  strip_gateway_path = true
+  is_current         = true
+  traffic_weight     = 100
+```
+
+---
+
+## Upsert Behaviour
+
+File loading is **idempotent**. Re-running the same file does not create duplicate records. The gateway identifies existing objects by their unique natural key:
+
+| Object | Conflict key |
+|--------|-------------|
+| App | `slug` |
+| Version | `(app_slug, version)` |
+| Revision | `(version_id, revision)` |
+| Endpoint | `(revision_id, method, path)` |
+
+When a file-defined object already exists (same slug / version / revision / endpoint), the gateway updates the mutable fields (backend config, policy, `is_active`) and leaves immutable fields (`gateway_path`, `routing_mode`) unchanged.
+
+When `app_config.conflict = "file_wins"` (default), file-defined objects take precedence over objects created via the management API when they share the same slug.
+
+---
+
+## Error Handling
+
+File errors are **non-fatal**. If a `*.toml` file fails to parse, the gateway logs an error and skips that file. All other valid files are still loaded.
+
+This means a single broken file will not prevent the gateway from starting or prevent other apps from loading.
+
+```
+ERROR file_config: parse error in config/apps/broken.toml at line 12: expected string for backend_host
+INFO  file_config: loaded config/apps/payments.toml (2 apps, 4 versions, 6 revisions, 18 endpoints)
+INFO  file_config: loaded config/apps/orders.toml (1 app, 2 versions, 3 revisions, 10 endpoints)
+```
+
+---
+
+## Hot Reload
+
+### Automatic (filesystem watcher)
+
+When `file_watch_enabled = true`, the gateway watches `apps_dir` using OS filesystem events (inotify on Linux, FSEvents on macOS). After detecting a change, it waits `file_watch_debounce_ms` milliseconds (default 500ms) before reloading — this avoids partial reloads when an editor writes the file in multiple steps.
+
+```toml
+file_watch_enabled     = true
+file_watch_debounce_ms = 500
+```
+
+### Manual (management API)
+
+Trigger a reload at any time:
+
+```bash
+curl -s -X POST http://localhost:9090/api/v1/config/reload | jq
+```
+
+This re-reads `config/default.toml`, `config/local.toml`, re-applies environment variable overrides, and reloads all app definition files from `apps_dir`.
+
+---
+
+## When to Use File-Based Config
+
+| Use case | Recommendation |
+|----------|---------------|
+| **GitOps / infrastructure-as-code** | Define all apps in `config/apps/*.toml`; commit to version control; deploy via CI/CD pipeline |
+| **Seeding test environments** | Include `config/apps/test-fixtures.toml` in the test setup; it loads automatically on startup |
+| **Multi-environment config** | Use environment variable overrides (`GATEWAY_APPS_DIR=/env/prod/apps`) to point to environment-specific files |
+| **Dynamic API management** | Use the management API (`POST /api/v1/apps`) when apps are created at runtime (e.g. tenant onboarding) |
+| **Mixed approach** | Set `source = "both"` and `conflict = "file_wins"` — use files for long-lived apps and the API for ephemeral or tenant-specific apps |
+
+---
+
+## Minimal Working Example
+
+A minimal `pass_through` app to get started quickly:
+
+```toml
+# config/apps/hello.toml
+
+[app]
+name         = "Hello Service"
+slug         = "hello"
+gateway_path = "/hello"
+routing_mode = "pass_through"
+is_active    = true
+
+  [app.default_policy.auth]
+  auth_type = "none"               # Public — no auth required
+
+[[app.versions]]
+version      = "v1"
+gateway_path = "/hello/v1"
+status       = "active"
+
+  [[app.versions.revisions]]
+  revision           = "r1"
+  backend_scheme     = "https"
+  backend_host       = "httpbin.org"
+  backend_port       = 443
+  backend_base_path  = "/"
+  strip_gateway_path = true
+  is_current         = true
+  traffic_weight     = 100
+```
+
+Drop this file in `config/apps/` and restart the gateway (or trigger a reload if the file watcher is enabled). Requests to `http://localhost:8080/hello/v1/*` are immediately forwarded to `https://httpbin.org/*`.

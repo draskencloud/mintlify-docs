@@ -1,0 +1,197 @@
+---
+title: "TLS Termination"
+description: "Pure-Rust rustls TLS on port 8443 with PEM cert/key; HTTP and HTTPS both remain active."
+---
+
+The Nexus API Gateway by Drasken Cloud can terminate TLS directly using **rustls** — a pure-Rust TLS implementation with no OpenSSL dependency.
+
+## Overview
+
+| Setting | Value |
+|---|---|
+| TLS library | rustls 0.23 (pure Rust, no OpenSSL) |
+| TLS port | 8443 (alongside HTTP on 8080; both remain active) |
+| Supported key formats | PKCS8 PEM, RSA PEM |
+| Certificate format | Full-chain PEM |
+| Minimum TLS version | TLS 1.2 (rustls default; TLS 1.3 preferred) |
+| Hot reload | Not supported in v1 — restart required |
+
+## Enabling TLS
+
+Set the three required configuration keys. The HTTP port (8080) remains active alongside HTTPS (8443); disable it at the load balancer if you want HTTPS-only access.
+
+### Via Environment Variables (Recommended)
+
+```bash
+GATEWAY_SERVER__TLS_ENABLED=true
+GATEWAY_SERVER__TLS_CERT_PATH=/certs/fullchain.pem
+GATEWAY_SERVER__TLS_KEY_PATH=/certs/privkey.pem
+```
+
+### Via TOML
+
+```toml
+[server]
+tls_enabled   = true
+tls_cert_path = "/certs/fullchain.pem"
+tls_key_path  = "/certs/privkey.pem"
+```
+
+## Key and Certificate Format Requirements
+
+### Private Key
+
+rustls accepts two PEM formats:
+
+| Format | PEM header | Notes |
+|---|---|---|
+| PKCS8 | `-----BEGIN PRIVATE KEY-----` | Preferred; works with RSA, ECDSA, Ed25519 |
+| RSA (PKCS1) | `-----BEGIN RSA PRIVATE KEY-----` | Legacy; RSA only |
+
+If your key file contains `-----BEGIN EC PRIVATE KEY-----` (SEC1 / PKCS1 EC format) you must convert it to PKCS8 first:
+
+```bash
+openssl pkcs8 -topk8 -nocrypt -in ec-key.pem -out ec-pkcs8.pem
+```
+
+### Certificate
+
+The certificate file must be a **full-chain PEM** — the server certificate followed by any intermediate CA certificates, in order. Leaf certificate first:
+
+```
+-----BEGIN CERTIFICATE-----
+<leaf cert>
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+<intermediate CA>
+-----END CERTIFICATE-----
+```
+
+## Environment Variables Reference
+
+| Variable | Default | Description |
+|---|---|---|
+| `GATEWAY_SERVER__TLS_ENABLED` | `false` | Enable TLS termination on port 8443 |
+| `GATEWAY_SERVER__TLS_CERT_PATH` | _(none)_ | Absolute path to full-chain PEM certificate |
+| `GATEWAY_SERVER__TLS_KEY_PATH` | _(none)_ | Absolute path to PKCS8 or RSA PEM private key |
+
+## Port Behaviour When TLS Is Enabled
+
+| Port | Protocol | Active |
+|---|---|---|
+| 8080 | HTTP | Yes (always) |
+| 8443 | HTTPS | Yes (when `tls_enabled=true`) |
+| 9090 | HTTP | Yes (management API — no TLS on management port in v1) |
+
+Both 8080 and 8443 proxy traffic. To force HTTPS-only, block port 8080 at the load balancer or firewall level, not by disabling it in the gateway (the management API health check still expects HTTP on 9090).
+
+## Creating a Self-Signed Certificate (Development)
+
+```bash
+# Generate a 2048-bit RSA key in PKCS8 format and a self-signed certificate
+openssl req -x509 \
+  -newkey rsa:2048 \
+  -keyout privkey.pem \
+  -out fullchain.pem \
+  -days 365 \
+  -nodes \
+  -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+# Verify the files
+openssl x509 -in fullchain.pem -noout -text | grep -E "Issuer|Subject|Not"
+openssl pkey -in privkey.pem -noout -text | head -5
+```
+
+> Note: `openssl req -newkey rsa:2048 -nodes` generates a PKCS1 RSA key by default on some versions of OpenSSL. To explicitly generate PKCS8:
+>
+> ```bash
+> openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out privkey.pem
+> openssl req -new -x509 -key privkey.pem -out fullchain.pem -days 365 \
+>   -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+> ```
+
+Start the gateway with TLS:
+
+```bash
+GATEWAY_SERVER__TLS_ENABLED=true \
+GATEWAY_SERVER__TLS_CERT_PATH=./fullchain.pem \
+GATEWAY_SERVER__TLS_KEY_PATH=./privkey.pem \
+./target/release/nexus
+```
+
+Test:
+
+```bash
+# -k / --insecure skips certificate validation for self-signed certs
+curl -k https://localhost:8443/
+```
+
+## Let's Encrypt / Certbot
+
+For production, use a certificate from a public CA. With Certbot:
+
+```bash
+# Obtain certificate (standalone mode — requires port 80 available)
+certbot certonly --standalone -d gateway.example.com
+
+# Certificates are written to:
+# /etc/letsencrypt/live/gateway.example.com/fullchain.pem
+# /etc/letsencrypt/live/gateway.example.com/privkey.pem
+```
+
+```bash
+GATEWAY_SERVER__TLS_ENABLED=true \
+GATEWAY_SERVER__TLS_CERT_PATH=/etc/letsencrypt/live/gateway.example.com/fullchain.pem \
+GATEWAY_SERVER__TLS_KEY_PATH=/etc/letsencrypt/live/gateway.example.com/privkey.pem \
+./target/release/nexus
+```
+
+### Certificate Rotation
+
+TLS certificates are loaded once at startup. Hot reload of TLS certificates is **not supported in v1**. To rotate a certificate:
+
+1. Place the new certificate and key files in the configured paths.
+2. Send `SIGTERM` to the gateway — it will drain gracefully (see [Graceful Shutdown](/nexus/deployment/graceful-shutdown)).
+3. The process supervisor (systemd, Docker, Kubernetes) restarts the gateway and it loads the new files.
+
+For zero-downtime rotation in a multi-instance deployment, rotate one instance at a time while others continue serving traffic.
+
+## mTLS to Backend Services
+
+Gateway-to-backend mutual TLS (client certificate authentication) is configured separately using per-revision mTLS profiles. This is distinct from terminating TLS from downstream clients.
+
+See the [mTLS Backends](/nexus/backends/mtls) documentation and the [TLS Configuration Reference](/nexus/configuration/tls) for details.
+
+## Production Recommendations
+
+**Prefer terminating TLS at a dedicated load balancer or reverse proxy** (AWS ALB, nginx, Cloudflare, etc.) when operating in a cloud or containerised environment. This approach:
+
+- Simplifies certificate management (centralized rotation)
+- Offloads TLS handshake CPU from the gateway
+- Allows the internal network between the load balancer and gateway instances to use plain HTTP
+
+Reserve gateway-level TLS termination for:
+
+- Direct-to-gateway deployments without a front-end proxy
+- On-premises environments where the gateway is the TLS boundary
+- mTLS between untrusted peers that must present client certificates to the gateway (not yet supported in v1 — only backend mTLS is available)
+
+## Docker with TLS
+
+```yaml
+# docker-compose.yml
+services:
+  gateway:
+    image: draskencloud/gateway:latest
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+      - "9090:9090"
+    environment:
+      GATEWAY_SERVER__TLS_ENABLED: "true"
+      GATEWAY_SERVER__TLS_CERT_PATH: "/certs/fullchain.pem"
+      GATEWAY_SERVER__TLS_KEY_PATH: "/certs/privkey.pem"
+    volumes:
+      - /etc/letsencrypt/live/gateway.example.com:/certs:ro
+```

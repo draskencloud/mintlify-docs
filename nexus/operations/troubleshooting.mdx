@@ -1,0 +1,161 @@
+---
+title: "Troubleshooting"
+description: "Diagnose and fix common issues with the Nexus gateway in production."
+---
+
+This page is organized by symptom. For each symptom, you get a short diagnostic flow and pointers to the deeper docs. For exhaustive status code references, see the [Error Catalog](/nexus/operations/error-catalog).
+
+---
+
+## Requests return 401 Unauthorized
+
+**Diagnostic flow:**
+
+1. Confirm the `Authorization: Bearer <token>` header is present and the token is the raw value (not the SHA-256 hash).
+2. Verify the token has not been revoked: `GET /api/v1/apps/:app_id/tokens` on the management API.
+3. Check `expires_at` on the token. Expired tokens cannot be used; rotate them.
+4. For JWT auth: confirm `iss`, `aud`, and `required_claims` in the policy match what your IdP issues. Decode the token at [jwt.io](https://jwt.io) to inspect claims.
+5. For JWKS-based JWT: verify the gateway can reach `jwks_url` from inside its network (egress firewall, DNS).
+
+**See also:** [Authentication Overview](/nexus/auth/overview), [Token Lifecycle](/nexus/auth/token-lifecycle).
+
+---
+
+## Requests return 403 Forbidden
+
+Most common causes, in order:
+
+1. **Scope missing.** The token's `scopes` do not include all entries in `policy.required_scopes`. Reissue with the required scopes.
+2. **IP filter mismatch.** The source IP is not in `policy.ip_filter.cidrs` (allow mode) or is in it (deny mode). Inspect via the management API and add/remove CIDRs.
+3. **Path denylist hit (pass-through mode).** A `path_denylist` prefix matched the request path. Adjust the policy.
+
+The gateway log line will identify which check failed (`auth.scope`, `ip_filter`, `path_denylist`).
+
+---
+
+## Requests return 404 Not Found
+
+**Diagnostic checklist:**
+
+- Run `GET /api/v1/apps` and confirm an App matches the path prefix.
+- Confirm `is_active = true` on the App.
+- Run `GET /api/v1/apps/:app_id/versions` — the Version must not be `retired`.
+- For `managed_endpoint` mode: confirm the exact `(method, path)` is registered. List endpoints under the active Revision.
+- Check the Revision has `is_current = true`. A Revision with `traffic_weight: 0` and no current flag will not receive traffic.
+
+---
+
+## Backends return 502 / 503 / 504 intermittently
+
+Likely the **circuit breaker has opened** for one or more Revisions.
+
+1. Run the health endpoint on the management API: `GET /api/v1/health` shows DB and dependency state.
+2. Inspect the Revision: the `circuit_state` field on `GET .../revisions/:id` reports `closed`, `open`, or `half_open`.
+3. Check backend health probes: `health_check_path` should return 2xx. A wrong path is a frequent cause of false-open breakers.
+4. Recovery: the breaker auto-transitions `open → half_open` after the recovery timeout, then `half_open → closed` on a successful probe. To force-clear, deactivate and reactivate the Revision.
+
+**See also:** [Circuit Breaker](/nexus/backends/circuit-breaker), [Health Probing](/nexus/backends/health-probing), [Retry Logic](/nexus/backends/retry-logic).
+
+---
+
+## Rate limit returns 429 unexpectedly
+
+1. Verify which limiter triggered: response header `X-RateLimit-Source` is `ip` or `token`.
+2. Check effective `rate_limit` policy after inheritance — it may be tighter at the Revision or Endpoint level than at the App level. Run `GET /api/v1/apps/:app_id/versions/:vid/revisions/:rid` and inspect `default_policy.rate_limit`.
+3. For multi-replica deployments without shared Redis: each replica enforces its own counter. Configure Redis as the shared cache backend.
+
+**See also:** [IP Rate Limiting](/nexus/policies/ip-rate-limiting), [Per-Token Rate Limiting](/nexus/policies/per-token-rate-limiting).
+
+---
+
+## CORS preflight failing in browser
+
+1. Confirm the request's `Origin` matches one of `policy.cors.allowed_origins` exactly (scheme + host + port). Wildcards are not allowed when credentials are enabled.
+2. Confirm the requested method is in `policy.cors.allowed_methods`.
+3. Confirm requested headers are in `policy.cors.allowed_headers`.
+4. The browser's `OPTIONS` request must reach the gateway — it must not be blocked by an upstream firewall.
+
+**See also:** [CORS](/nexus/policies/cors).
+
+---
+
+## Config changes do not take effect
+
+| Change type | How to apply |
+|-------------|-------------|
+| Policy / app / version / revision via management API | Immediate. RuntimeStore updates in-process. |
+| `config/default.toml` static settings (port, DB, TLS) | Restart required. |
+| `config/default.toml` runtime tunables (rate limits, timeouts) | `POST /api/v1/config/reload` or `PATCH /api/v1/config`. |
+| `config/apps/*.toml` file-based app definitions | Hot-reloaded via filesystem watcher (when enabled), or `POST /api/v1/config/apps/reload`. |
+
+If a `PATCH /config` request returns `422`, the new value failed validation; the previous value remains active. Inspect the error message.
+
+---
+
+## JWT signature validation failing
+
+1. Decode the JWT at jwt.io or via `cargo run --bin jwt-decode`. Confirm:
+   - `alg` matches what the policy expects (HS256 vs RS256, etc.).
+   - `iss` and `aud` match policy fields.
+   - `exp` is in the future.
+2. For HS256: the configured secret env var (`policy.auth.jwt_secret_env`) must hold the exact secret used to sign.
+3. For RS256 with JWKS: clear the JWKS cache by `POST /api/v1/cache/purge` and confirm the IdP's `kid` matches a key in the JWKS response.
+
+---
+
+## mTLS handshake failing to backend
+
+1. Verify the mTLS profile env vars are set: `GATEWAY_MTLS_PROFILE_<NAME>_CERT_PATH`, `_KEY_PATH`, `_CA_PATH`.
+2. Confirm the certificate chain is valid: `openssl x509 -in cert.pem -noout -dates -subject`.
+3. The backend must trust the gateway's client cert CA. Confirm with the backend operator.
+4. Hostname verification: the backend's server certificate `CN`/`SAN` must match `backend_host`.
+
+**See also:** [mTLS](/nexus/backends/mtls).
+
+---
+
+## Multi-replica deployment shows inconsistent state
+
+In a multi-replica setup, each replica maintains its own RuntimeStore. State changes propagate via:
+
+- **Database polling** (default): each replica refreshes from the database every `poll_interval_secs`.
+- **Redis pub/sub** (when configured): immediate invalidation broadcasts.
+
+If you see drift, confirm:
+
+1. All replicas share the same database.
+2. Redis is configured for pub/sub if you require sub-second propagation.
+3. Token revocations may take up to one polling interval to propagate without Redis.
+
+**See also:** [Horizontal Scaling](/nexus/deployment/horizontal-scaling).
+
+---
+
+## Slow first request after a deploy
+
+The proxy populates RuntimeStore from the database on startup. On Kubernetes, set `readinessProbe` on `/api/v1/health` so the pod does not receive traffic until warm-up completes (sub-second for typical workloads, but visible under heavy app counts).
+
+---
+
+## High memory use
+
+| Likely cause | Mitigation |
+|--------------|-----------|
+| Large in-process response cache | Switch cache backend to Redis or lower TTLs |
+| Many simultaneous large request bodies | Lower `body_size_limit` policy or shed load |
+| Audit pipeline backlog (slow log destination) | Provision faster log sink or shorten retention |
+
+Inspect `process_resident_memory_bytes` on `/metrics`.
+
+---
+
+## When to file a bug
+
+If after exhausting the steps above you still see unexpected behaviour, capture:
+
+- Gateway version and build hash (`GET /api/v1/version`)
+- The full request and response (headers + body) reproducing the issue
+- A snippet of structured logs around the request
+- The relevant policy as returned by the management API
+
+Open an issue at [github.com/draskencloud/nexus/issues](https://github.com/draskencloud/nexus/issues).

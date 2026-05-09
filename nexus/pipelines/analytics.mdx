@@ -1,0 +1,246 @@
+---
+title: "Analytics Pipeline"
+description: "Optional best-effort event forwarding to file/stdout/postgres/webhook with DropNewest overflow."
+---
+
+The analytics pipeline is an **optional**, best-effort event forwarding system that emits structured per-request access events to external systems. It is designed to be the primary integration point for data warehouses, SIEMs, and analytics platforms.
+
+For contrast with the audit and logging pipelines, see [audit](/nexus/pipelines/audit) and [logging](/nexus/pipelines/logging).
+
+---
+
+## Overview
+
+| Property | Value |
+|---|---|
+| **Enabled by default** | No (`analytics.enabled = false`) |
+| **Overflow policy** | DropNewest — if the buffer is full, the newest event is silently dropped and counted in `gateway_analytics_dropped_total{reason="channel"}` |
+| **Request path impact** | None — the analytics pipeline runs in a background task; a full buffer drops events rather than slowing requests |
+| **Auto-activation** | When `enabled = true` with no `[[analytics.forwarders]]` configured, a file forwarder is created automatically at `logs/analytics.jsonl` |
+
+---
+
+## Configuration
+
+```toml
+[analytics]
+enabled            = false                      # env: GATEWAY_ANALYTICS__ENABLED
+buffer_size        = 10000                      # env: GATEWAY_ANALYTICS__BUFFER_SIZE
+batch_size         = 500                        # env: GATEWAY_ANALYTICS__BATCH_SIZE
+flush_interval_ms  = 5000                       # env: GATEWAY_ANALYTICS__FLUSH_INTERVAL_MS
+retry_max_attempts = 3                          # env: GATEWAY_ANALYTICS__RETRY_MAX_ATTEMPTS
+retry_backoff_ms   = 200                        # env: GATEWAY_ANALYTICS__RETRY_BACKOFF_MS
+dead_letter_path   = "logs/dead_letter.jsonl"   # env: GATEWAY_ANALYTICS__DEAD_LETTER_PATH
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Master switch; set to `true` to activate the pipeline |
+| `buffer_size` | `10000` | In-memory ring buffer capacity in events. When full, new events are dropped. |
+| `batch_size` | `500` | Events per forwarder flush. Flush occurs when either `batch_size` is reached or `flush_interval_ms` elapses. |
+| `flush_interval_ms` | `5000` | Maximum time between flushes (milliseconds). |
+| `retry_max_attempts` | `3` | Delivery retries on forwarder error before writing to dead-letter. |
+| `retry_backoff_ms` | `200` | Initial retry backoff (milliseconds); doubles on each attempt. |
+| `dead_letter_path` | `logs/dead_letter.jsonl` | Path for records that exhausted all retries. See [dead-letter](/nexus/observability/dead-letter). |
+
+---
+
+## Forwarder Types
+
+Each forwarder is an independent delivery target. Multiple forwarders can be configured simultaneously; every event is delivered to every enabled forwarder.
+
+### `file` — Write to disk (JSONL)
+
+```toml
+[[analytics.forwarders]]
+name             = "file"
+type             = "file"
+enabled          = true
+path             = "logs/analytics.jsonl"
+max_mb           = 200      # rotate when file reaches 200 MB
+max_days         = 30       # rotate files older than 30 days
+compress         = false    # gzip rotated files when true
+event_types      = []       # empty = all event types
+batch_size       = 500
+flush_interval_ms = 5000
+```
+
+### `stdout` — Write to stdout (JSONL)
+
+```toml
+[[analytics.forwarders]]
+name        = "stdout"
+type        = "stdout"
+enabled     = true
+event_types = ["access"]
+```
+
+Useful for piping to a log collector that reads from stdout (e.g., Fluent Bit, Vector).
+
+### `postgres` — Write to a dedicated analytics table
+
+```toml
+[[analytics.forwarders]]
+name        = "postgres"
+type        = "postgres"
+enabled     = true
+event_types = []
+batch_size  = 500
+flush_interval_ms = 5000
+```
+
+Uses the same database connection as the rest of the gateway. Writes to the `analytics_events` table created by migrations.
+
+### `webhook` — HTTP POST to an external endpoint
+
+```toml
+[[analytics.forwarders]]
+name        = "siem"
+type        = "webhook"
+enabled     = true
+url         = "https://siem.example.com/ingest"
+timeout_secs = 10
+event_types = ["security", "audit"]
+
+[analytics.forwarders.headers]
+"Authorization" = "Bearer your-ingest-token"
+"X-Source"      = "draskencloud-gateway"
+```
+
+The gateway POSTs a JSON array of events per batch. The webhook endpoint must return HTTP 2xx. On 4xx the batch is written to dead-letter. On 5xx the batch is retried.
+
+---
+
+## Event Types
+
+Events can be filtered per forwarder using the `event_types` array. An empty array means all event types are forwarded.
+
+| Event type | Description |
+|---|---|
+| `access` | One event per proxied request: method, path, status, latency, token_id, app_id, client_ip |
+| `security` | Authentication failures, IP blocks, rate limit blocks |
+| `audit` | Configuration changes made via the management API |
+
+---
+
+## Field Transforms
+
+Each forwarder can apply a transform to events before delivery. Transforms are applied in order: rename → drop → add.
+
+```toml
+[[analytics.forwarders]]
+name        = "warehouse"
+type        = "webhook"
+enabled     = true
+url         = "https://warehouse.example.com/ingest"
+event_types = []
+
+[analytics.forwarders.transform]
+# Rename fields to match the warehouse schema
+rename = { "app_id" = "application_id", "token_id" = "api_key_id" }
+
+# Drop fields not needed in the warehouse
+drop = ["request_body_hash", "response_body_hash", "user_agent"]
+
+# Inject static fields (useful for multi-region deployments)
+add = { "source" = "gateway", "region" = "us-east-1", "env" = "production" }
+```
+
+| Transform key | Type | Description |
+|---|---|---|
+| `rename` | `{old_name: new_name}` | Rename event fields |
+| `drop` | `[field_name, ...]` | Remove fields from the event |
+| `add` | `{key: value}` | Inject static string fields |
+
+---
+
+## Complete Configuration Example
+
+```toml
+[analytics]
+enabled           = true
+buffer_size       = 50000
+batch_size        = 1000
+flush_interval_ms = 2000
+retry_max_attempts = 5
+retry_backoff_ms  = 500
+dead_letter_path  = "/var/log/gateway/analytics_dead_letter.jsonl"
+
+# File forwarder: keep a local copy for replay
+[[analytics.forwarders]]
+name             = "local-file"
+type             = "file"
+enabled          = true
+path             = "/var/log/gateway/analytics.jsonl"
+max_mb           = 500
+max_days         = 7
+compress         = true
+event_types      = []
+
+# SIEM webhook: security events only
+[[analytics.forwarders]]
+name         = "siem"
+type         = "webhook"
+enabled      = true
+url          = "https://siem.example.com/ingest"
+timeout_secs = 15
+event_types  = ["security", "audit"]
+
+[analytics.forwarders.headers]
+"Authorization" = "Bearer prod-siem-token"
+
+[analytics.forwarders.transform]
+add = { "gateway_env" = "production" }
+
+# Data warehouse: access events with renamed fields
+[[analytics.forwarders]]
+name         = "warehouse"
+type         = "webhook"
+enabled      = true
+url          = "https://ingest.warehouse.example.com/events"
+timeout_secs = 30
+event_types  = ["access"]
+batch_size   = 2000
+
+[analytics.forwarders.transform]
+rename = { "app_id" = "application_id", "token_id" = "credential_id" }
+drop   = ["user_agent", "request_body_hash", "response_body_hash"]
+add    = { "source" = "apigw", "dc" = "us-east-1" }
+```
+
+---
+
+## Metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `gateway_analytics_events_total` | Counter | `event_type`, `forwarder` | Events successfully sent to a forwarder |
+| `gateway_analytics_dropped_total` | Counter | `reason` | Events dropped (`reason`: `channel` = buffer full; `dead_letter` = retry exhaustion) |
+| `gateway_analytics_buffer_size` | Gauge | `forwarder` | Current buffer depth |
+| `gateway_analytics_flush_duration_seconds` | Histogram | `forwarder` | Time to flush one batch |
+| `gateway_analytics_delivery_failures_total` | Counter | `forwarder`, `reason` | Delivery failures per forwarder |
+
+### Recommended alerts
+
+```yaml
+- alert: AnalyticsHighDropRate
+  expr: rate(gateway_analytics_dropped_total{reason="channel"}[5m]) > 100
+  for: 2m
+  annotations:
+    summary: "Analytics buffer full; events are being dropped"
+
+- alert: AnalyticsDeadLetter
+  expr: rate(gateway_analytics_dropped_total{reason="dead_letter"}[5m]) > 0
+  for: 1m
+  annotations:
+    summary: "Analytics events being written to dead-letter"
+```
+
+---
+
+## Operational Notes
+
+- **Buffer sizing:** each event is approximately 500–2000 bytes in memory. A `buffer_size` of 10,000 uses roughly 5–20 MB. Increase `buffer_size` if you see high `gateway_analytics_dropped_total{reason="channel"}` rates.
+- **Forwarder ordering:** forwarders receive events independently. A slow webhook does not affect a fast file forwarder.
+- **Auto-activation:** if you set `enabled = true` but forget to add a `[[analytics.forwarders]]` block, the gateway creates a file forwarder at `logs/analytics.jsonl`. This is intentional to avoid silently discarding events.
+- **Dead-letter replay:** see [dead-letter](/nexus/observability/dead-letter) for replay procedures.

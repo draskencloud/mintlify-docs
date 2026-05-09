@@ -1,0 +1,182 @@
+---
+title: "Glossary"
+description: "Definitions of every domain term used across the Nexus documentation."
+---
+
+This glossary is the single source of truth for terminology. When in doubt about what a word means in Nexus, look here first.
+
+---
+
+## A
+
+**Admin token** — A bootstrap bearer token configured via `GATEWAY_SERVER__ADMIN_TOKEN`. Required on every request to the management API (port `9090`) when set. Distinct from API tokens issued to apps.
+
+**App** — The top-level API product. Defines a base gateway path and a routing mode. Owns Versions, Revisions, Endpoints, and Tokens. See [App / Version / Revision](/nexus/concepts/app-version-revision).
+
+**API token** — A bearer credential scoped to an App. The raw value is shown once at issuance; the gateway stores only a SHA-256 hash. Used by clients in `Authorization: Bearer <token>` headers.
+
+**Audit log** — An immutable record of every management API mutation (who changed what, when). Written asynchronously through the audit pipeline. See [Audit Logs](/nexus/observability/audit-logs).
+
+**Auth identity** — The internal struct produced by the authentication middleware after a successful credential validation. Carries token ID, scopes, and any forwarded JWT claims.
+
+---
+
+## B
+
+**Backend** — The upstream service Nexus proxies to. Configured per Revision via `backend_scheme`, `backend_host`, `backend_port`, and `backend_base_path`.
+
+**Backend base path** — Path prefix prepended to forwarded requests. Combined with `strip_gateway_path` to construct the upstream URL.
+
+**Basic auth** — HTTP Basic authentication using bcrypt-hashed credentials. Supported alongside API key and JWT auth. See [HTTP Basic Auth](/nexus/auth/basic-auth).
+
+---
+
+## C
+
+**Cache** — Two distinct caches in Nexus: (1) the response cache configured per policy (caches upstream responses), and (2) the runtime cache (in-memory or Redis) used for token validation and rate limit counters.
+
+**Canary deployment** — Routing a percentage of traffic to a new Revision to validate it before promoting. Controlled by `traffic_weight` on Revisions. See [Canary Deployments](/nexus/concepts/canary-deployments).
+
+**Circuit breaker** — Per-Revision fail-fast logic. After a configurable number of consecutive backend failures, the breaker opens and short-circuits requests with `503` until the recovery timeout elapses. See [Circuit Breaker](/nexus/backends/circuit-breaker).
+
+**Control plane** — Port `9090` (the management API). Used by operators to create apps, issue tokens, modify policies. Must be firewalled from external traffic.
+
+**CORS policy** — Cross-Origin Resource Sharing rules. Configured per policy with `allowed_origins`, `allowed_methods`, `allowed_headers`, `max_age`. See [CORS](/nexus/policies/cors).
+
+---
+
+## D
+
+**Data plane** — Port `8080` (and `8443` for TLS). Carries client traffic to backends. Public-facing.
+
+**Dead letter queue** — Stores audit log records that failed to flush after their retry budget is exhausted. See [Dead Letter](/nexus/observability/dead-letter).
+
+**Default policy** — Policy attached to an App, Version, or Revision. Inherited by all children unless overridden.
+
+**Deprecated** — A Version status. Traffic is still served, but a `Deprecation: true` response header is added. Signal to clients to migrate.
+
+---
+
+## E
+
+**Endpoint** — A `(method, path)` pair registered under a Revision. Only used in `managed_endpoint` routing mode. Can carry a `policy_override`.
+
+**Effective policy** — The merged result of an App's, Version's, Revision's, and Endpoint's policy fields after inheritance. Computed once per Revision and cached.
+
+---
+
+## F
+
+**File-based config** — TOML files at `config/apps/*.toml` that define Apps, Versions, Revisions, and Endpoints declaratively. Hot-reloadable via filesystem watcher. See [File-Based Configuration](/nexus/concepts/file-based-config).
+
+**Forward claims as headers** — JWT-only feature. Map of claim name → request header name. Matching claims are added as headers on the proxied request, letting backends consume identity without re-validating the JWT.
+
+---
+
+## G
+
+**Gateway path** — The public path prefix on which an App or Version is mounted. Examples: `/payments` (App), `/payments/v1` (Version). Immutable after creation.
+
+**Graceful shutdown** — On `SIGTERM`, the gateway stops accepting new connections and waits for in-flight requests to drain before exiting. Configurable timeout. See [Graceful Shutdown](/nexus/deployment/graceful-shutdown).
+
+---
+
+## H
+
+**Health probe** — Background HTTP request the gateway makes to `health_check_path` on each Revision's backend. Failing probes mark the Revision unhealthy and exclude it from traffic. See [Health Probing](/nexus/backends/health-probing).
+
+**Header injection** — Adding static or dynamic headers to forwarded requests via the `headers` policy. Sources include token metadata, JWT claims, and literal values.
+
+---
+
+## I
+
+**IP filter** — Allowlist or denylist of CIDR ranges per policy. Requests from disallowed IPs receive `403`. See [IP Filtering](/nexus/policies/ip-filtering).
+
+**IP rate limit** — Pre-auth per-IP rate limit. Enforced before authentication so unauthenticated floods cannot exhaust auth resources. See [IP Rate Limiting](/nexus/policies/ip-rate-limiting).
+
+**`is_current`** — Boolean flag on a Revision. Exactly one Revision per Version can be current at a time. The current Revision is the stable traffic target unless `traffic_weight` shifts traffic to others.
+
+---
+
+## J
+
+**JWKS** — JSON Web Key Set. A discovery endpoint exposing public keys used to verify JWT signatures. Nexus fetches and caches keys, refreshing them in the background.
+
+**JWT** — JSON Web Token. Supported algorithms: HS256, RS256, RS384, RS512, ES256, ES384.
+
+---
+
+## L
+
+**License tier** — `community`, `pro`, or `enterprise`. Controls feature availability. Locked features return `402 Payment Required`. See [License Tiers](/nexus/deployment/license-tiers).
+
+---
+
+## M
+
+**Managed endpoint mode** — Routing mode where only registered `(method, path)` pairs are accepted. Unknown paths → `404`, unknown methods → `405`. See [Managed Endpoint Mode](/nexus/routing/managed-endpoint-mode).
+
+**Metadata (token)** — Arbitrary key-value pairs attached to an API token. Each pair is forwarded as a request header on successful auth. Useful for multi-tenant routing and tenant context.
+
+**mTLS** — Mutual TLS authentication for backend connections. Configured via mTLS profiles tied to a Revision. See [mTLS](/nexus/backends/mtls).
+
+---
+
+## P
+
+**Pass-through mode** — Routing mode where every path under the App's `gateway_path` is forwarded to the backend without endpoint registration. See [Pass-Through Mode](/nexus/routing/pass-through-mode).
+
+**Policy** — JSONB document configuring middleware behaviour: auth, rate limits, CORS, IP filter, headers, cache, allowed methods. See [Policy Schema](/nexus/reference/policy-schema).
+
+**Policy inheritance** — The four-level merge chain: App → Version → Revision → Endpoint. See [Policy Inheritance](/nexus/concepts/policy-inheritance).
+
+**Policy override** — Endpoint-level field that merges on top of the effective Revision policy.
+
+---
+
+## R
+
+**Rate limit (per-token)** — Post-auth rate limit applied per validated token. Configured via the `rate_limit` policy field. See [Per-Token Rate Limiting](/nexus/policies/per-token-rate-limiting).
+
+**Required scopes** — Array of token scope strings that must all be present for access. Missing scopes return `403`. Configured per policy.
+
+**Retired** — A Version status. Traffic is rejected with `404`. Terminal state — no transition back to active.
+
+**Retry logic** — Automatic retry on idempotent methods (`GET`, `HEAD`, `OPTIONS`) for `502`, `503`, `504` responses. Configurable max attempts. See [Retry Logic](/nexus/backends/retry-logic).
+
+**Revision** — An internal deployment iteration of a Version. Owns the backend configuration. Multiple Revisions can coexist for canary or blue-green strategies.
+
+**Routing mode** — `pass_through` or `managed_endpoint`. Set on App creation, immutable thereafter.
+
+**RuntimeStore** — In-process cache of all routing data. The proxy hot path reads from RuntimeStore exclusively — zero database I/O per request.
+
+---
+
+## S
+
+**Scope** — A capability string attached to an API token (e.g. `proxy:read`, `proxy:write`). Compared against `required_scopes` in policies for authorization.
+
+**Slug** — URL-safe unique identifier for an App. Used in metric labels and audit logs.
+
+**Strip gateway path** — Boolean on a Revision. When `true`, the matched gateway path prefix is stripped before forwarding. Default: `true`.
+
+---
+
+## T
+
+**Traffic weight** — Integer on a Revision controlling its share of traffic among current Revisions for canary routing. Default: `100`.
+
+**Trust boundary** — The conceptual line between untrusted clients and trusted backends. Nexus is the boundary enforcer.
+
+---
+
+## V
+
+**Version** — The public API contract version. Owns the public path segment clients use (e.g. `/v1`). Status: `active`, `deprecated`, or `retired`.
+
+---
+
+## W
+
+**Weighted routing** — Selecting a Revision based on `traffic_weight` proportions. Implemented as weighted random selection per request.

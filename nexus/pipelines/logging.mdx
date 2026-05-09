@@ -1,0 +1,256 @@
+---
+title: "Logging Pipeline"
+description: "Optional structured log forwarder with categorised log types and slow-request tracking."
+---
+
+The logging pipeline is an **optional** structured log forwarding system that ships categorised log records to external destinations. It is separate from the console logger (stdout) — enabling this pipeline does not change what appears on the terminal.
+
+For console log configuration (format, level), see [observability/logging](/nexus/observability/logging). For the always-on audit trail, see [audit](/nexus/pipelines/audit).
+
+---
+
+## Overview
+
+| Property | Value |
+|---|---|
+| **Enabled by default** | No (`logging.enabled = false`) |
+| **Overflow policy** | DropNewest — a full buffer drops the newest record; never slows the request path |
+| **Request path impact** | None — forwarding runs in a background task |
+| **Auto-activation** | When `enabled = true` with no `[[logging.forwarders]]` configured, creates a file forwarder at `logs/gateway.jsonl` |
+
+---
+
+## Configuration
+
+```toml
+[logging]
+enabled                  = false                        # env: GATEWAY_LOGGING__ENABLED
+buffer_size              = 10000                        # env: GATEWAY_LOGGING__BUFFER_SIZE
+batch_size               = 500                          # env: GATEWAY_LOGGING__BATCH_SIZE
+flush_interval_ms        = 5000                         # env: GATEWAY_LOGGING__FLUSH_INTERVAL_MS
+retry_max_attempts       = 3                            # env: GATEWAY_LOGGING__RETRY_MAX_ATTEMPTS
+retry_backoff_ms         = 200                          # env: GATEWAY_LOGGING__RETRY_BACKOFF_MS
+dead_letter_path         = "logs/log_dead_letter.jsonl" # env: GATEWAY_LOGGING__DEAD_LETTER_PATH
+slow_request_threshold_ms = 1000                        # env: GATEWAY_LOGGING__SLOW_REQUEST_THRESHOLD_MS
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Master switch |
+| `buffer_size` | `10000` | In-memory ring buffer capacity in records |
+| `batch_size` | `500` | Records per forwarder flush |
+| `flush_interval_ms` | `5000` | Maximum time between flushes (milliseconds) |
+| `retry_max_attempts` | `3` | Retries before writing to dead-letter |
+| `retry_backoff_ms` | `200` | Initial retry backoff (ms); doubles per attempt |
+| `dead_letter_path` | `logs/log_dead_letter.jsonl` | Dead-letter file path |
+| `slow_request_threshold_ms` | `1000` | Requests exceeding this threshold are tagged as `slow_request` log type. Set to `0` to disable. |
+
+---
+
+## Log Types
+
+Each log type can be enabled or disabled independently. Per-forwarder `event_types` filtering further restricts which types reach each destination.
+
+```toml
+[logging.types]
+access       = true   # env: GATEWAY_LOGGING__TYPES__ACCESS
+audit        = true   # env: GATEWAY_LOGGING__TYPES__AUDIT
+error        = true   # env: GATEWAY_LOGGING__TYPES__ERROR
+security     = true   # env: GATEWAY_LOGGING__TYPES__SECURITY
+policy       = true   # env: GATEWAY_LOGGING__TYPES__POLICY
+health       = true   # env: GATEWAY_LOGGING__TYPES__HEALTH
+cache        = false  # env: GATEWAY_LOGGING__TYPES__CACHE  (high volume — off by default)
+slow_request = true   # env: GATEWAY_LOGGING__TYPES__SLOW_REQUEST
+```
+
+### Log type reference
+
+| Type | Default | Description |
+|---|---|---|
+| `access` | true | One record per proxied request: method, path, status, latency_ms, token_id, app_id, revision_id, client_ip |
+| `audit` | true | Configuration mutations via the management API (duplicate of audit pipeline but useful for aggregation) |
+| `error` | true | Internal errors, panics caught at boundaries, failed middleware operations |
+| `security` | true | Authentication failures, token revocations, IP blocks, rate limit blocks |
+| `policy` | true | Policy denials: method mismatch, scope failure, path filter, IP filter, header validation |
+| `health` | true | Backend health state transitions: up → down, down → up, circuit breaker open/close |
+| `cache` | false | Cache hit/miss events. **High volume** — enable only when debugging cache behaviour |
+| `slow_request` | true | Requests exceeding `slow_request_threshold_ms`; includes the full request context |
+
+---
+
+## Slow Request Tracking
+
+When `slow_request_threshold_ms > 0` and `logging.types.slow_request = true`, every request that exceeds the threshold generates a `slow_request` log record and increments `gateway_slow_requests_total{app_slug}`.
+
+```toml
+# Track any request taking more than 500 ms
+[logging]
+enabled                   = true
+slow_request_threshold_ms = 500
+```
+
+A `slow_request` record contains:
+
+```json
+{
+  "log_type": "slow_request",
+  "timestamp": "2026-01-15T12:34:56.789Z",
+  "app_slug": "my-api",
+  "app_id": "9f8e7d6c-5b4a-3210-fedc-ba9876543210",
+  "revision_id": "01234567-89ab-cdef-0123-456789abcdef",
+  "method": "POST",
+  "path": "/my-api/v1/reports/generate",
+  "status": 200,
+  "latency_ms": 3412,
+  "token_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "client_ip": "203.0.113.42",
+  "x-request-id": "req-uuid-here"
+}
+```
+
+---
+
+## Forwarder Types
+
+### `file` — Write to disk (JSONL)
+
+```toml
+[[logging.forwarders]]
+name              = "file"
+type              = "file"
+enabled           = true
+path              = "logs/gateway.jsonl"
+max_mb            = 500
+max_days          = 90
+compress          = false
+event_types       = []     # empty = all log types
+batch_size        = 500
+flush_interval_ms = 5000
+```
+
+### `stdout` — Write to stdout (JSONL)
+
+```toml
+[[logging.forwarders]]
+name        = "stdout"
+type        = "stdout"
+enabled     = true
+event_types = ["error", "security"]
+```
+
+### `webhook` — HTTP POST to an external endpoint
+
+```toml
+[[logging.forwarders]]
+name         = "log-aggregator"
+type         = "webhook"
+enabled      = true
+url          = "https://logs.example.com/ingest"
+timeout_secs = 10
+event_types  = ["error", "security", "policy"]
+
+[logging.forwarders.headers]
+"Authorization" = "Bearer aggregator-token"
+```
+
+---
+
+## Complete Configuration Examples
+
+### Forward slow requests only (file forwarder)
+
+```toml
+[logging]
+enabled                   = true
+slow_request_threshold_ms = 500
+
+[logging.types]
+access       = false
+audit        = false
+error        = false
+security     = false
+policy       = false
+health       = false
+cache        = false
+slow_request = true
+
+[[logging.forwarders]]
+name    = "slow"
+type    = "file"
+enabled = true
+path    = "logs/slow_requests.jsonl"
+max_mb  = 100
+max_days = 30
+```
+
+### Security events to SIEM, all logs to file
+
+```toml
+[logging]
+enabled           = true
+buffer_size       = 20000
+batch_size        = 200
+flush_interval_ms = 1000
+
+# All log types enabled (defaults)
+
+[[logging.forwarders]]
+name             = "archive"
+type             = "file"
+enabled          = true
+path             = "/var/log/gateway/gateway.jsonl"
+max_mb           = 1000
+max_days         = 90
+compress         = true
+event_types      = []
+
+[[logging.forwarders]]
+name         = "siem"
+type         = "webhook"
+enabled      = true
+url          = "https://siem.example.com/logs"
+timeout_secs = 5
+event_types  = ["security", "policy", "error"]
+
+[logging.forwarders.headers]
+"Authorization" = "Bearer siem-api-key"
+"X-Log-Source"  = "gateway"
+```
+
+---
+
+## Metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `gateway_log_records_total` | Counter | `log_type`, `forwarder` | Records successfully delivered to a forwarder |
+| `gateway_log_dropped_total` | Counter | `reason` | Records dropped (`channel` = buffer full; `dead_letter` = retry exhaustion) |
+| `gateway_log_buffer_size` | Gauge | `forwarder` | Current buffer depth |
+| `gateway_log_flush_duration_seconds` | Histogram | `forwarder` | Time to flush one batch |
+| `gateway_log_delivery_failures_total` | Counter | `forwarder`, `reason` | Delivery failures per forwarder |
+| `gateway_slow_requests_total` | Counter | `app_slug` | Requests exceeding `slow_request_threshold_ms` |
+
+### Recommended alerts
+
+```yaml
+- alert: LoggingDropRate
+  expr: rate(gateway_log_dropped_total{reason="channel"}[5m]) > 50
+  for: 2m
+  annotations:
+    summary: "Log pipeline buffer full; records are being dropped"
+
+- alert: SlowRequestSpike
+  expr: rate(gateway_slow_requests_total[5m]) > 10
+  for: 2m
+  annotations:
+    summary: "High slow-request rate on {{ $labels.app_slug }}"
+```
+
+---
+
+## Operational Notes
+
+- **Cache log type:** enabling `cache = true` can generate tens of thousands of records per second under load. Only enable for short debugging sessions.
+- **Forwarder independence:** each forwarder has its own buffer and retry state. A failing webhook does not affect a file forwarder.
+- **Log type vs. log level:** log types (`access`, `security`, etc.) are categories of structured log records in the forwarding pipeline. They are independent of the console log level (`info`, `debug`, etc.) set in `[server]`.
+- **Dead-letter recovery:** see [dead-letter](/nexus/observability/dead-letter) for procedures.

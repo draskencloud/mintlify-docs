@@ -1,0 +1,196 @@
+---
+title: "Routing Modes"
+description: "pass_through forwards every request; managed_endpoint requires explicit method+path registration."
+---
+
+Every App has a `routing_mode` that is set at creation time and **cannot be changed**. It governs how the proxy engine matches incoming requests to backend targets.
+
+There are two modes:
+
+| Mode | Matching | Unregistered paths | Best for |
+|------|---------|-------------------|---------|
+| `pass_through` | All paths forwarded | Forwarded as-is | Backends with their own routing; migration; flexibility |
+| `managed_endpoint` | Explicit method + path required | `404` / `405` | Strict API contracts; per-endpoint policies |
+
+---
+
+## `pass_through` Mode
+
+In `pass_through` mode the gateway forwards **every request** that arrives under the Version's gateway path to the backend. The proxy does not inspect or validate the path beyond optional denylist enforcement.
+
+### How it works
+
+1. A request arrives: `GET /payments/v1/foo/bar/baz`
+2. The gateway matches the longest gateway path prefix: `/payments/v1`
+3. The gateway resolves the active Revision for that Version
+4. If `strip_gateway_path = true`: strip `/payments/v1` → remaining path is `/foo/bar/baz`
+5. Forward to backend: `https://payments.internal:443/foo/bar/baz`
+6. Stream the response back to the client
+
+No endpoint registration is required. The backend handles its own routing.
+
+### Path denylist
+
+The only path-level enforcement in `pass_through` mode is the `path_denylist` policy field. It is a list of path prefixes; requests whose remaining path starts with any denylist entry receive `403 Forbidden`.
+
+```json
+{
+  "path_denylist": [
+    "/internal",
+    "/admin",
+    "/_debug"
+  ]
+}
+```
+
+With this policy:
+- `GET /payments/v1/orders` → forwarded normally
+- `GET /payments/v1/internal/metrics` → `403 Forbidden` (matches `/internal` prefix)
+- `GET /payments/v1/admin/users` → `403 Forbidden` (matches `/admin` prefix)
+
+The denylist is a **prefix match**, not an exact match and not a regex. `/internal` denies `/internal`, `/internal/foo`, `/internal/foo/bar`, and so on.
+
+### Example: pass_through app
+
+```bash
+# Create a pass_through app — good for a legacy backend
+curl -s -X POST http://localhost:9090/api/v1/apps \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Legacy Orders",
+    "slug": "legacy-orders",
+    "gateway_path": "/legacy/orders",
+    "routing_mode": "pass_through",
+    "default_policy": {
+      "auth": { "auth_type": "api_key", "required": true },
+      "path_denylist": ["/admin", "/internal"]
+    }
+  }'
+```
+
+All requests to `/legacy/orders/*` (except `/legacy/orders/admin/*` and `/legacy/orders/internal/*`) are forwarded transparently.
+
+---
+
+## `managed_endpoint` Mode
+
+In `managed_endpoint` mode the gateway maintains an **explicit registry** of method + path combinations. Requests that do not match a registered endpoint are rejected before reaching the backend.
+
+### How it works
+
+1. A request arrives: `GET /payments/v1/orders/123`
+2. The gateway matches the Version: `/payments/v1`
+3. The gateway resolves the active Revision
+4. The gateway looks up registered Endpoints for that Revision
+5. It matches by method (`GET`) and path (`/orders/123` → matches `/orders/{id}`)
+6. If matched: forward to backend (using `backend_path` if set)
+7. If path not found: return `404 Not Found`
+8. If path found but method not registered: return `405 Method Not Allowed` with `Allow` header listing valid methods
+
+### Endpoint matching
+
+Path matching in `managed_endpoint` mode is **exact string match** (after the version gateway path is stripped). There is no wildcard or regex matching in the matching engine itself — use `pass_through` mode if your backend needs flexible path matching.
+
+```
+Registered:  /orders
+Registered:  /orders/{id}
+
+Request path (after stripping /payments/v1): /orders       → matches /orders
+Request path:                                /orders/123    → matches /orders/{id}
+Request path:                                /orders/123/items  → 404 (no match)
+```
+
+> **Note on path parameters:** `{id}` in the path is a label for documentation and `backend_path` substitution; the matching engine uses it as a position marker. The exact matching semantics are enforced in the Endpoint table with `(revision_id, method, path)` uniqueness.
+
+### `backend_path` override
+
+When a `backend_path` is set on an Endpoint, the gateway uses that path when forwarding to the backend instead of the matched path:
+
+```
+Registered endpoint:
+  method: GET
+  path: /orders/{id}
+  backend_path: /v2/orders/{id}
+
+Request: GET /payments/v1/orders/456
+
+Forwarded to backend: GET /v2/orders/456
+```
+
+This enables path translation: the public API path can differ from the backend path. Use it when migrating internal APIs without changing the public contract.
+
+### Per-endpoint policies
+
+Each Endpoint has a `policy_override` field. This is the primary advantage of `managed_endpoint` mode — you can apply different auth, rate limits, or cache settings to individual endpoints:
+
+```bash
+# High-frequency read endpoint: aggressive caching, loose rate limit
+curl -s -X POST ".../$REVISION_ID/endpoints" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "method": "GET",
+    "path": "/orders/{id}",
+    "policy_override": {
+      "cache": { "enabled": true, "ttl_seconds": 300 },
+      "rate_limit": { "enabled": true, "requests": 10000, "window_seconds": 60 }
+    }
+  }'
+
+# State-changing endpoint: no cache, tighter rate limit
+curl -s -X POST ".../$REVISION_ID/endpoints" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "method": "POST",
+    "path": "/orders",
+    "policy_override": {
+      "cache": { "enabled": false },
+      "rate_limit": { "enabled": true, "requests": 100, "window_seconds": 60 }
+    }
+  }'
+```
+
+---
+
+## Immutability of `routing_mode`
+
+`routing_mode` is set on the App at creation time and cannot be changed afterward. This is intentional:
+
+- The proxy router's matching logic differs fundamentally between the two modes
+- Changing the mode would break or change the behaviour of all existing Revisions and Endpoints under the App
+- If you switched from `managed_endpoint` to `pass_through`, all registered Endpoints would become irrelevant but remain in the database — confusing
+
+**If you need a different routing mode**, create a new App with the desired mode and migrate traffic to it by updating your load balancer or DNS.
+
+---
+
+## Choosing a Mode
+
+### Use `pass_through` when:
+
+- Your backend already has its own routing and you want to add auth, rate limiting, or policy enforcement without modifying it
+- You are migrating an existing API behind the gateway incrementally
+- The set of valid paths changes frequently and you do not want to keep the endpoint registry in sync
+- You need wildcard path forwarding (e.g. all paths under `/api/*` go to one backend)
+
+### Use `managed_endpoint` when:
+
+- You want strict control over which method + path combinations are exposed
+- You need different auth, rate limits, or cache settings on individual endpoints
+- You are designing a new API and want the gateway to enforce the contract
+- You want `405 Method Not Allowed` instead of allowing the backend to handle invalid methods
+- You need path translation (`backend_path` override per endpoint)
+
+---
+
+## Comparison Table
+
+| Behaviour | `pass_through` | `managed_endpoint` |
+|----------|--------------|------------------|
+| Path registration required | No | Yes |
+| Unknown path | Forwarded to backend | `404 Not Found` |
+| Wrong method on known path | Forwarded to backend | `405 Method Not Allowed` with `Allow` header |
+| Per-endpoint policy | No | Yes (`policy_override`) |
+| Backend path translation | No | Yes (`backend_path` on endpoint) |
+| Path denylist enforcement | Yes (`path_denylist` in policy) | N/A (only registered paths are accepted) |
+| Endpoint registry maintenance | Not required | Required; endpoints must be registered per revision |
+| `is_active` per endpoint | N/A | Yes; inactive endpoints excluded from matching |

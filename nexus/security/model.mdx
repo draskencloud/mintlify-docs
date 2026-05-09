@@ -1,0 +1,214 @@
+---
+title: "Security Model"
+description: "Threat model, trust boundaries, control plane isolation, and what the gateway does and does not protect against."
+---
+
+This document describes the threat model for the Nexus API Gateway by Drasken Cloud, the trust boundaries it enforces, what it protects against, and what falls outside its scope.
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Trust Boundaries](#trust-boundaries)
+- [Threat Model](#threat-model)
+  - [What the Gateway Protects Against](#what-the-gateway-protects-against)
+  - [What the Gateway Does Not Protect Against](#what-the-gateway-does-not-protect-against)
+- [Control Plane Isolation (Port 9090)](#control-plane-isolation-port-9090)
+- [Admin Token](#admin-token)
+- [Data in Transit](#data-in-transit)
+- [Data at Rest](#data-at-rest)
+- [Attack Surface by Component](#attack-surface-by-component)
+
+---
+
+## Overview
+
+The Nexus API Gateway by Drasken Cloud is a **security boundary** between untrusted external clients and trusted backend services. It validates every inbound request before forwarding it, enforcing authentication, scope, rate limits, IP rules, and body size constraints. It does not inspect application-layer payload semantics — those remain the backend's responsibility.
+
+The gateway operates on two distinct control planes:
+
+| Port | Plane | Trust Level |
+|---|---|---|
+| `:8080` | Data plane (proxy) | Untrusted clients |
+| `:8443` | Data plane (TLS proxy) | Untrusted clients |
+| `:9090` | Control plane (management API) | Operators only — must be firewalled |
+
+---
+
+## Trust Boundaries
+
+```
+                    ┌──────────────────────────────────────┐
+                    │           UNTRUSTED ZONE             │
+                    │  External clients, public internet   │
+                    └───────────────┬──────────────────────┘
+                                    │ HTTP/HTTPS requests
+                                    ▼
+                    ┌──────────────────────────────────────┐
+                    │       Nexus API Gateway by Drasken Cloud           │
+                    │                                      │
+                    │  Port 8080 / 8443  ← data plane      │
+                    │  Port 9090         ← control plane   │
+                    │         (firewall this port!)        │
+                    └───────────────┬──────────────────────┘
+                                    │ Authenticated, validated requests
+                                    ▼
+                    ┌──────────────────────────────────────┐
+                    │           TRUSTED ZONE               │
+                    │   Backend services (private LAN)     │
+                    └──────────────────────────────────────┘
+```
+
+**External clients (untrusted):** Any caller reaching port `8080` or `8443` is untrusted until their credential is validated. This includes third-party integrations, user-facing applications, CI/CD pipelines, and partner services.
+
+**Gateway:** The gateway is the trust boundary enforcer. After validating credentials and enforcing policy, it elevates the request to the trusted zone by forwarding it to the appropriate backend.
+
+**Backend services (trusted):** Services on the backend LAN are treated as trusted. The gateway does not re-authenticate requests from backends and does not inspect backend response bodies for security content.
+
+**Control plane (port 9090):** The management API grants full administrative access — create/delete apps, issue/revoke tokens, modify policies. It must only be reachable from operator networks. See [Control Plane Isolation](#control-plane-isolation-port-9090).
+
+---
+
+## Threat Model
+
+### What the Gateway Protects Against
+
+| Threat | Mitigation |
+|---|---|
+| **Unauthenticated requests** | `AuthLayer` validates credentials before forwarding. `required = true` (default) blocks unauthenticated traffic with `401`. |
+| **Credential replay / token theft** | Tokens stored as SHA-256 hashes. Revocation takes effect within milliseconds via cache invalidation. Short-lived tokens (configurable `expires_at`) limit replay window. |
+| **Scope escalation** | Scope enforcement blocks callers with insufficient scope from using unauthorized HTTP methods. `proxy:read` tokens cannot invoke write endpoints. |
+| **Rate abuse / DoS** | `IpRateLimitLayer` (per-IP) and `RateLimitLayer` (per-token) enforce configurable request rate limits. Requests over the limit receive `429`. |
+| **IP-based attacks** | `IpFilterLayer` enforces allow/deny lists of IP ranges per policy. |
+| **Oversized request bodies** | `BodyLimitLayer` enforces a configurable maximum body size, rejecting oversized requests with `413` before they reach the backend. |
+| **Timing attacks on secrets** | All credential comparisons use constant-time operations (`subtle::ConstantTimeEq`). bcrypt for basic auth is inherently constant-time. |
+| **Header injection from clients** | Gateway strips and rewrites specific headers (e.g., `X-Token-Meta-*`, `X-Forwarded-For`) before forwarding, preventing clients from spoofing injected context headers. |
+| **Malformed requests** | The Axum HTTP parser rejects structurally invalid HTTP before any middleware runs. |
+| **Expired credentials** | Expiry checked on every request (both cache hit and DB path). Expired tokens always receive `401`. |
+| **Password brute-force** | bcrypt with cost factor 12 makes each basic-auth verification take ~200–400 ms. Combined with rate limiting, brute-force attacks are computationally infeasible. |
+
+### What the Gateway Does Not Protect Against
+
+| Threat | Why It Is Out of Scope |
+|---|---|
+| **Compromised backend services** | The gateway trusts its backends. A backdoored or exploited backend is a backend security problem. |
+| **SSRF from backends** | The gateway does not inspect backend responses. Backends can make arbitrary outbound requests — this is governed by backend network policy. |
+| **Application-layer injection (SQLi, XSS, command injection)** | The gateway does not parse or sanitise request bodies. Body validation is the backend's responsibility. Use a WAF upstream of the gateway for application-layer filtering. |
+| **Malicious authenticated users with valid credentials** | The gateway validates credentials, not user intent. Authorisation at the resource level (e.g., "can this user see this record?") is the backend's concern. |
+| **Side-channel attacks on the host OS** | Hardware-level side channels (Spectre, Meltdown) and OS-level isolation are infrastructure concerns, not gateway concerns. |
+| **Management API abuse by authorised operators** | The gateway assumes operators with access to port 9090 are trusted. Operator access control is enforced by network policy and the admin token. |
+
+---
+
+## Control Plane Isolation (Port 9090)
+
+**Port 9090 is the most sensitive surface in the deployment.** It provides:
+
+- Full CRUD for apps, versions, revisions, and endpoints.
+- Token issuance and revocation.
+- Audit log access.
+- Runtime configuration reads.
+- Metrics endpoint (`/metrics`).
+
+**An attacker with access to port 9090 can:**
+
+- Create new apps and revoke all existing tokens.
+- Issue tokens for any app.
+- Read all audit logs.
+- Modify backend configurations.
+
+**Firewall requirements:**
+
+```
+# Allow proxy traffic from anywhere
+iptables -A INPUT -p tcp --dport 8080 -j ACCEPT
+iptables -A INPUT -p tcp --dport 8443 -j ACCEPT
+
+# Allow management API ONLY from operator networks
+iptables -A INPUT -p tcp --dport 9090 -s 10.0.0.0/8 -j ACCEPT
+iptables -A INPUT -p tcp --dport 9090 -j DROP
+```
+
+See the [Network Security](/nexus/security/network-security) document for a full firewall configuration guide.
+
+---
+
+## Admin Token
+
+The admin token protects the management API with a Bearer token requirement:
+
+```bash
+# Set via environment variable — never in config file
+export GATEWAY_SERVER__ADMIN_TOKEN="your-admin-token-value"
+```
+
+When `GATEWAY_SERVER__ADMIN_TOKEN` is set, **every request to port 9090 must include:**
+
+```http
+Authorization: Bearer your-admin-token-value
+```
+
+Requests without a valid admin token receive `401 Unauthorized`.
+
+**Implementation details:**
+
+- Comparison uses `subtle::ConstantTimeEq` to prevent timing-based token extraction.
+- The admin token is not stored in the database. It is compared directly against the environment variable value in memory.
+- If `GATEWAY_SERVER__ADMIN_TOKEN` is not set, the management API is **unauthenticated** — all requests are accepted. This is suitable only for development. In production, always set this variable.
+
+**Admin token best practices:**
+
+- Generate with a CSPRNG: `openssl rand -base64 48`
+- Store in your secrets manager, not in `.env` files or scripts.
+- Rotate periodically.
+- Use a separate admin token per environment (dev, staging, production).
+
+---
+
+## Data in Transit
+
+| Connection | Recommendation |
+|---|---|
+| Client → Gateway (`:8080`) | Use port `8443` with TLS in production (rustls, no OpenSSL dependency) |
+| Client → Gateway (`:8443`) | TLS provided natively by the gateway; certificate via `GATEWAY_TLS_CERT_PATH` / `GATEWAY_TLS_KEY_PATH` |
+| Gateway → Backend | Configure mTLS per revision for mutual authentication; see `backend_mtls_profile` in policy |
+| Gateway → PostgreSQL | Use `sslmode=require` in `DATABASE_URL` |
+| Gateway → Redis | Use a TLS-wrapped Redis URL (`rediss://`) |
+
+TLS termination at the gateway (`:8443`) uses **rustls** — a memory-safe TLS implementation in Rust with no dependency on OpenSSL, avoiding a large class of OpenSSL CVEs.
+
+mTLS to backends ensures backends only accept requests that originated from a legitimate gateway instance. See the [Network Security](/nexus/security/network-security) document for mTLS configuration.
+
+---
+
+## Data at Rest
+
+| Data | Storage Format |
+|---|---|
+| API key tokens | SHA-256 hash of the raw token value (hex-encoded) |
+| Basic auth passwords | bcrypt hash (cost factor configurable; default: 12) |
+| JWT secrets | Not stored — loaded from environment variable at runtime |
+| JWT public keys | Not stored — loaded from environment variable or fetched from JWKS URL at runtime |
+| Token metadata | Plaintext key-value pairs in PostgreSQL JSONB column |
+| Audit log entries | Plaintext in PostgreSQL; includes `token_id` (not raw token), request path, response code, timestamp |
+| Admin token | Not stored — compared directly against environment variable |
+
+**No plaintext secrets are stored in the database.** The database compromise does not expose raw tokens, passwords, or JWT secrets:
+
+- To forge API key tokens, an attacker would need to invert SHA-256 (computationally infeasible).
+- To break basic auth passwords, an attacker would need to brute-force bcrypt (computationally expensive by design).
+- JWT secrets live only in environment variables, not in the database.
+
+---
+
+## Attack Surface by Component
+
+| Component | Port / Interface | Accessible From | Notes |
+|---|---|---|---|
+| Proxy (HTTP) | `:8080` | Public internet | Data plane; all requests auth-validated |
+| Proxy (TLS) | `:8443` | Public internet | Preferred over `:8080` in production |
+| Management API | `:9090` | Operators only | Must be firewalled; admin token required |
+| PostgreSQL | DB port (e.g., `5432`) | Gateway only | Firewall from all non-gateway hosts |
+| Redis | Cache port (e.g., `6379`) | Gateway only | Firewall from all non-gateway hosts; use AUTH |
+| JWKS endpoints | External HTTPS | Gateway outbound | Fetched by gateway; validate TLS cert |

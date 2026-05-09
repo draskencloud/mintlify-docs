@@ -1,0 +1,265 @@
+---
+title: "Header Filtering"
+description: "How the gateway strips hop-by-hop headers, injects gateway/policy headers, and processes response headers."
+---
+
+The gateway both strips and injects headers at multiple points in the request/response lifecycle. Understanding which headers are removed and which are added — and in what order — is essential for debugging proxied requests and designing policies that depend on header values.
+
+---
+
+## Overview
+
+Headers are processed in two directions:
+
+| Direction | When | What happens |
+|-----------|------|-------------|
+| **Request** (gateway → backend) | Before forwarding | Hop-by-hop stripped; policy headers added; token metadata injected; JWT claims injected |
+| **Response** (backend → client) | Before returning | `response_remove` headers stripped; `response_add` headers injected; gateway metadata headers added |
+
+---
+
+## Request Headers: Hop-by-Hop Stripping
+
+Per [RFC 7230 §6.1](https://datatracker.ietf.org/doc/html/rfc7230#section-6.1), the following headers are removed from every forwarded request before it reaches the backend. These headers are specific to a single transport-level connection and must not be forwarded to the next hop:
+
+| Header | Reason for removal |
+|--------|--------------------|
+| `connection` | Describes connection-level options; not applicable to backend connection |
+| `keep-alive` | Connection persistence; managed independently per hop |
+| `proxy-authenticate` | Proxy authentication challenge; backend should never see it |
+| `proxy-authorization` | Proxy credentials; backend should never see it |
+| `te` | Transfer encoding negotiation between client and gateway only |
+| `trailers` | Chunked trailer negotiation; hop-specific |
+| `transfer-encoding` | Determined fresh for each hop |
+| `upgrade` | Protocol upgrade is negotiated per connection |
+
+These are silently removed. No error is raised.
+
+---
+
+## Request Headers: Gateway-Injected Headers
+
+After hop-by-hop stripping, the gateway injects several headers before forwarding. These are added (or overwritten) regardless of what the client sent.
+
+### `x-request-id`
+
+A UUID v4 trace identifier. If the inbound client request already contains `x-request-id`, the existing value is forwarded unchanged. If absent, a new UUID is generated and added.
+
+```
+x-request-id: 7f3a2b1c-4d5e-6f7a-8b9c-0d1e2f3a4b5c
+```
+
+This header is also echoed back in the gateway's response to the client, enabling correlation across client, gateway, and backend logs.
+
+### Token Metadata Headers
+
+When a request is authenticated using an API token (`api_key` auth type), the gateway reads the `metadata` field of the `ApiToken` record and injects each key-value pair as a request header before forwarding.
+
+Example: if a token has `metadata = {"x-tenant-id": "acme", "x-plan": "enterprise"}`, the gateway adds:
+
+```
+x-tenant-id: acme
+x-plan: enterprise
+```
+
+This allows backends to make access control or routing decisions based on the authenticated token's metadata without re-parsing the token themselves.
+
+### JWT Claim Headers
+
+When JWT authentication is used and the policy has `forward_claims_as_headers` configured, the gateway extracts the specified claims from the validated JWT and injects them as request headers.
+
+**Policy configuration:**
+
+```json
+{
+  "auth": {
+    "auth_type": "jwt",
+    "forward_claims_as_headers": {
+      "sub": "x-user-id",
+      "email": "x-user-email",
+      "org_id": "x-org-id"
+    }
+  }
+}
+```
+
+For a JWT with `{"sub": "user-123", "email": "alice@example.com", "org_id": "org-456"}`, the gateway injects:
+
+```
+x-user-id: user-123
+x-user-email: alice@example.com
+x-org-id: org-456
+```
+
+If a claim listed in `forward_claims_as_headers` is absent from the token, that header is simply not injected (no error).
+
+### Policy Static Add Headers (`headers.add`)
+
+Static headers defined in `Policy.headers.add` are injected into every forwarded request. These are key-value pairs specified in the policy document:
+
+```json
+{
+  "headers": {
+    "add": {
+      "x-gateway-version": "2.0",
+      "x-environment": "production"
+    }
+  }
+}
+```
+
+These are always injected, regardless of what the client sent. If the client sent the same header, the policy value overwrites it.
+
+### Dynamic Inject Headers (`headers.inject`)
+
+Inject rules derive header values from runtime context rather than static strings. See [Header Validation](/nexus/policies/header-validation) for the full rule reference.
+
+Sources include:
+- `metadata.<key>` — from the authenticated token's metadata
+- `request.header.<name>` — from an existing inbound request header
+- `request.path` — the full request path
+- `request.method` — the HTTP method
+- `request.query.<param>` — a specific query parameter value
+
+---
+
+## Request Headers: Client Headers That Pass Through
+
+All request headers not in the hop-by-hop list and not overwritten by gateway rules are forwarded verbatim to the backend. This includes:
+
+- `Authorization` — unless the policy strips it (see `headers.remove`)
+- `Content-Type`, `Content-Length`, `Accept`, `Accept-Encoding`
+- `User-Agent`
+- Any custom application headers (`x-correlation-id`, `x-api-version`, etc.)
+
+To strip a specific header before forwarding (e.g., to prevent clients from spoofing internal headers), use `headers.remove` in the policy:
+
+```json
+{
+  "headers": {
+    "remove": ["x-internal-token", "x-admin-flag"]
+  }
+}
+```
+
+---
+
+## Response Headers: Backend Response Processing
+
+The gateway also processes response headers from the backend before returning them to the client.
+
+### `response_remove`
+
+Headers listed in `Policy.headers.response_remove` are stripped from the backend's response:
+
+```json
+{
+  "headers": {
+    "response_remove": ["x-powered-by", "server", "x-aspnet-version"]
+  }
+}
+```
+
+Use this to prevent backends from leaking internal technology details or sensitive server information.
+
+### `response_add`
+
+Static headers in `Policy.headers.response_add` are injected into every response returned to the client:
+
+```json
+{
+  "headers": {
+    "response_add": {
+      "strict-transport-security": "max-age=31536000; includeSubDomains",
+      "x-frame-options": "DENY"
+    }
+  }
+}
+```
+
+If the backend already sent the same header, the policy value is added in addition (not replaced). To replace, first remove it with `response_remove` then add it with `response_add`.
+
+### Gateway-Added Response Headers
+
+These headers are always added by the gateway to every response, regardless of policy:
+
+| Header | Value | When present |
+|--------|-------|-------------|
+| `x-request-id` | Echo of the request's `x-request-id` | Always |
+| `X-Cache` | `HIT` or `MISS` | When cache middleware is active |
+| `Age` | Cache entry age in seconds | On cache `HIT` |
+| `X-Circuit-Open` | `true` | When circuit breaker is Open and request was short-circuited |
+| `Access-Control-Allow-Origin` | Matching origin | When CORS policy is active and origin matches |
+| `Access-Control-Allow-Methods` | Configured methods | CORS preflight responses |
+| `Access-Control-Allow-Headers` | Configured headers | CORS preflight responses |
+| `Access-Control-Max-Age` | Configured value | CORS preflight responses |
+| `Vary: Origin` | Added alongside CORS headers | When CORS policy is active |
+| `Allow` | Configured methods | On `405 Method Not Allowed` |
+| `Retry-After` | Seconds until limit resets | On `429 Too Many Requests` |
+
+---
+
+## Header Processing Order
+
+The complete order in which headers are processed on an inbound request:
+
+```
+1. Client sends request headers
+       │
+2. Hop-by-hop headers stripped (connection, keep-alive, te, etc.)
+       │
+3. headers.remove entries stripped (policy-configured)
+       │
+4. Auth validated; token metadata headers injected
+       │
+5. JWT claim headers injected (forward_claims_as_headers)
+       │
+6. headers.add static headers injected (policy-configured)
+       │
+7. headers.inject dynamic headers evaluated and injected
+       │
+8. x-request-id set or forwarded
+       │
+9. Request forwarded to backend
+```
+
+And for the response:
+
+```
+1. Backend sends response headers
+       │
+2. headers.response_remove entries stripped (policy-configured)
+       │
+3. headers.response_add entries injected (policy-configured)
+       │
+4. Gateway metadata headers added (x-request-id, X-Cache, CORS, etc.)
+       │
+5. Response returned to client
+```
+
+---
+
+## Debugging Header Issues
+
+If a header is not arriving at your backend, work through this checklist:
+
+1. **Is it a hop-by-hop header?** — Check the stripping list above; these are always removed.
+2. **Is it in `headers.remove`?** — Check the policy on the app/version/revision/endpoint.
+3. **Is the client actually sending it?** — Use the gateway's access log or `x-request-id` to correlate and check with `curl -v`.
+4. **Is a policy `headers.add` or `inject` rule overwriting it?** — Check all policy levels; the most specific level wins.
+
+If a header is appearing in responses that you did not expect:
+
+1. **Is it from `headers.response_add`?** — Check the policy at all levels.
+2. **Is it a gateway metadata header?** (`x-request-id`, `X-Cache`, etc.) — These are always added and cannot be suppressed via policy.
+3. **Did the backend send it?** — Use `response_remove` to strip unwanted backend response headers.
+
+---
+
+## Related Topics
+
+- [Path Rewriting](/nexus/routing/path-rewriting) — `x-request-id` generation and forwarding
+- [Header Validation](/nexus/policies/header-validation) — `required`, `validate`, `add`, `remove`, `inject` full reference
+- [CORS](/nexus/policies/cors) — CORS response headers
+- [Per-Token Rate Limiting](/nexus/policies/per-token-rate-limiting) — `Retry-After` header
+- [Circuit Breaker](/nexus/backends/circuit-breaker) — `X-Circuit-Open` header

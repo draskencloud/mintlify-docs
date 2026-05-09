@@ -1,0 +1,315 @@
+---
+title: "Policy Inheritance"
+description: "Policies defined at four hierarchy levels merge top-down so children override only the fields they specify."
+---
+
+Policies control how the gateway's middleware stack behaves for a given request: which auth method to use, what rate limits to apply, which CORS origins to allow, and so on.
+
+Policies are defined at four levels in the hierarchy and **inherited downward**, with each level able to override individual fields from its parent.
+
+---
+
+## The Four Policy Levels
+
+```
+App.default_policy
+  │
+  └── Version.default_policy   (merges with App policy)
+        │
+        └── Revision.default_policy   (merges with Version policy)
+              │
+              └── Endpoint.policy_override   (merges with Revision policy)
+```
+
+The effective policy for any request is the result of merging from top to bottom. The gateway performs this merge once per Revision at cache-warm time and stores the merged result in the `CachedRevision`. Endpoint `policy_override` is applied at request time when an Endpoint is matched.
+
+---
+
+## Merge Strategy
+
+The merge is **shallow per top-level field**. Each top-level field in the policy object (e.g. `auth`, `rate_limit`, `cors`) is treated as a single unit. If a child level defines that field, the child's entire definition of that field replaces the parent's. Fields absent from the child are inherited unchanged from the parent.
+
+**This is not a deep recursive merge.** If the parent sets `auth.required = true` and the child sets only `auth.auth_type = "jwt"`, the child's `auth` block replaces the parent's entire `auth` block (so `auth.required` would revert to its type default unless the child explicitly sets it).
+
+### Example
+
+```json
+// App default_policy
+{
+  "auth":       { "auth_type": "api_key", "required": true },
+  "rate_limit": { "enabled": true, "requests": 1000, "window_seconds": 60 },
+  "cors":       { "allowed_origins": ["https://app.example.com"] }
+}
+
+// Version default_policy (no fields set — fully inherits App policy)
+{}
+
+// Revision default_policy (overrides rate_limit only)
+{
+  "rate_limit": { "enabled": true, "requests": 500, "window_seconds": 60 }
+}
+
+// Endpoint policy_override (overrides cache only)
+{
+  "cache": { "enabled": true, "ttl_seconds": 120 }
+}
+
+// ── Effective policy for a request to this Endpoint ──────────────────────────
+{
+  "auth":       { "auth_type": "api_key", "required": true },  // from App
+  "rate_limit": { "enabled": true, "requests": 500, "window_seconds": 60 }, // from Revision
+  "cors":       { "allowed_origins": ["https://app.example.com"] }, // from App
+  "cache":      { "enabled": true, "ttl_seconds": 120 }  // from Endpoint
+}
+```
+
+---
+
+## Policy Fields Reference
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `auth` | object | Authentication requirements for this level |
+| `rate_limit` | object | Per-token rate limiting window and limit |
+| `allowed_methods` | array of strings | HTTP methods permitted; others → `405` |
+| `required_scopes` | array of strings | Token scopes that must all be present; missing → `403` |
+| `headers` | object | Required request header names (and optional value patterns) |
+| `cors` | object | CORS configuration |
+| `ip_filter` | object | IP allow/deny list |
+| `path_denylist` | array of strings | Path prefixes blocked in `pass_through` mode → `403` |
+| `cache` | object | Response cache settings override |
+
+### `auth` sub-fields
+
+| Field | Values | Notes |
+|-------|--------|-------|
+| `auth_type` | `api_key`, `jwt`, `basic`, `none` | Selects the authentication mechanism |
+| `required` | `true` / `false` | If `false`, auth is attempted but failure is allowed through |
+| `jwks_url` | URL string | JWT only; JWKS endpoint URL |
+| `issuer` | string | JWT only; expected `iss` claim value |
+| `audience` | string | JWT only; expected `aud` claim value |
+| `required_claims` | array of strings | JWT only; claim names that must be present |
+| `forward_claims_as_headers` | object | JWT only; map of claim name → upstream header name |
+
+### `rate_limit` sub-fields
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `enabled` | boolean | Whether rate limiting is active at this level |
+| `requests` | integer | Number of requests permitted in the window |
+| `window_seconds` | integer | Duration of the rate limit window in seconds |
+
+### `cors` sub-fields
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `allowed_origins` | array of strings | `*` or specific origins |
+| `allowed_methods` | array of strings | Default: all methods |
+| `allowed_headers` | array of strings | Default: `Authorization`, `Content-Type` |
+| `expose_headers` | array of strings | Headers exposed to browser JS |
+| `max_age` | integer | Preflight cache duration in seconds |
+| `allow_credentials` | boolean | Whether credentials (cookies, auth headers) are allowed |
+
+### `ip_filter` sub-fields
+
+| Field | Values | Notes |
+|-------|--------|-------|
+| `mode` | `allow` / `deny` | `allow` → only listed CIDRs pass; `deny` → listed CIDRs blocked |
+| `cidrs` | array of CIDR strings | e.g. `["10.0.0.0/8", "192.168.1.0/24"]` |
+
+---
+
+## Absent Fields vs Null Fields
+
+| State | Meaning |
+|-------|---------|
+| Field absent from child's policy | Inherit parent's value |
+| Field explicitly set in child's policy | Child value wins; replaces entire parent field |
+| Field set to `null` in child's policy | Clears the field; parent's value is not used |
+
+---
+
+## Concrete Multi-Level Policy Example
+
+This example shows a real-world policy setup across all four levels for a payments API.
+
+### App policy (`default_policy`)
+
+Establishes the baseline for all traffic on the app:
+
+```json
+{
+  "auth": {
+    "auth_type": "api_key",
+    "required": true
+  },
+  "rate_limit": {
+    "enabled": true,
+    "requests": 1000,
+    "window_seconds": 60
+  },
+  "allowed_methods": ["GET", "POST", "PUT", "DELETE", "PATCH"],
+  "cors": {
+    "allowed_origins": ["https://dashboard.example.com"],
+    "allowed_methods": ["GET", "POST", "PUT", "DELETE"]
+  },
+  "ip_filter": {
+    "mode": "allow",
+    "cidrs": ["10.0.0.0/8", "172.16.0.0/12"]
+  }
+}
+```
+
+### Version policy (`default_policy` on v1)
+
+No overrides — v1 inherits the App policy exactly. Leave `default_policy` absent or `{}`.
+
+### Revision policy (`default_policy`)
+
+The `rev-2` revision uses a stricter rate limit because it fronts a smaller backend cluster:
+
+```json
+{
+  "rate_limit": {
+    "enabled": true,
+    "requests": 500,
+    "window_seconds": 60
+  }
+}
+```
+
+Effective policy at the revision level:
+
+```json
+{
+  "auth": { "auth_type": "api_key", "required": true },
+  "rate_limit": { "enabled": true, "requests": 500, "window_seconds": 60 },
+  "allowed_methods": ["GET", "POST", "PUT", "DELETE", "PATCH"],
+  "cors": { "allowed_origins": ["https://dashboard.example.com"], "allowed_methods": ["GET", "POST", "PUT", "DELETE"] },
+  "ip_filter": { "mode": "allow", "cidrs": ["10.0.0.0/8", "172.16.0.0/12"] }
+}
+```
+
+### Endpoint policy override (`policy_override`)
+
+The `GET /statements` endpoint is read-heavy and cacheable, and needs a much higher rate limit:
+
+```json
+{
+  "rate_limit": {
+    "enabled": true,
+    "requests": 5000,
+    "window_seconds": 60
+  },
+  "cache": {
+    "enabled": true,
+    "ttl_seconds": 300,
+    "cacheable_methods": ["GET"]
+  }
+}
+```
+
+Effective policy for `GET /statements`:
+
+```json
+{
+  "auth": { "auth_type": "api_key", "required": true },
+  "rate_limit": { "enabled": true, "requests": 5000, "window_seconds": 60 },
+  "allowed_methods": ["GET", "POST", "PUT", "DELETE", "PATCH"],
+  "cors": { "allowed_origins": ["https://dashboard.example.com"], "allowed_methods": ["GET", "POST", "PUT", "DELETE"] },
+  "ip_filter": { "mode": "allow", "cidrs": ["10.0.0.0/8", "172.16.0.0/12"] },
+  "cache": { "enabled": true, "ttl_seconds": 300, "cacheable_methods": ["GET"] }
+}
+```
+
+---
+
+## Policy in TOML Files
+
+When defining apps via TOML files in `config/apps/`, policies are expressed as TOML tables:
+
+```toml
+[app.default_policy]
+allowed_methods = ["GET", "POST", "PUT", "DELETE"]
+
+  [app.default_policy.auth]
+  auth_type = "api_key"
+  required  = true
+
+  [app.default_policy.rate_limit]
+  enabled        = true
+  requests       = 1000
+  window_seconds = 60
+
+  [app.default_policy.cors]
+  allowed_origins = ["https://dashboard.example.com"]
+
+  [app.default_policy.ip_filter]
+  mode  = "allow"
+  cidrs = ["10.0.0.0/8", "172.16.0.0/12"]
+
+[[app.versions.revisions]]
+revision = "rev-2"
+# ... backend fields ...
+
+  [app.versions.revisions.default_policy.rate_limit]
+  enabled        = true
+  requests       = 500
+  window_seconds = 60
+
+[[app.versions.revisions.endpoints]]
+method       = "GET"
+path         = "/statements"
+backend_path = "/statements"
+
+  [app.versions.revisions.endpoints.policy_override.rate_limit]
+  enabled        = true
+  requests       = 5000
+  window_seconds = 60
+
+  [app.versions.revisions.endpoints.policy_override.cache]
+  enabled            = true
+  ttl_seconds        = 300
+  cacheable_methods  = ["GET"]
+```
+
+---
+
+## Common Gotchas
+
+### Shallow merge means you must repeat sub-fields
+
+If the App policy sets `auth.required = true` and `auth.auth_type = "api_key"`, and you want to change only `auth_type` to `"jwt"` at the Revision level, you must include all auth fields at the Revision level:
+
+```json
+// WRONG — loses auth.required (it will fall back to type default)
+{
+  "auth": { "auth_type": "jwt" }
+}
+
+// CORRECT — both fields specified
+{
+  "auth": {
+    "auth_type": "jwt",
+    "required": true,
+    "jwks_url": "https://idp.example.com/.well-known/jwks.json",
+    "issuer": "https://idp.example.com",
+    "audience": "payments-api"
+  }
+}
+```
+
+### Endpoint `policy_override` is a merge, not a replacement
+
+The `policy_override` on an Endpoint merges with the Revision's effective policy — it does not replace it. An Endpoint can add a `cache` block without specifying `auth` or `rate_limit`; those are inherited from the Revision.
+
+### Setting a field to disable it
+
+To disable a feature at a lower level that is enabled at a higher level, set the entire sub-object with `enabled: false`:
+
+```json
+// Disable caching for a specific endpoint even though the revision enables it
+{
+  "cache": { "enabled": false }
+}
+```

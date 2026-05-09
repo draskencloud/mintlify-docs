@@ -1,0 +1,236 @@
+---
+title: "Pass-Through Routing Mode"
+description: "Forward every request to the backend after policy enforcement; the backend handles its own routing."
+---
+
+In **pass-through mode**, the gateway forwards every incoming request to the backend after applying the configured policy — no explicit endpoint registration is required. The backend is responsible for its own internal routing.
+
+---
+
+## Setting the Routing Mode
+
+Routing mode is set at **app creation** and is **immutable** thereafter. Once an app is created as `pass_through`, it cannot be changed to `managed_endpoint` (and vice versa). Create a new app if you need to change routing modes.
+
+```bash
+curl -s -X POST http://localhost:9090/api/v1/apps \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Payments API",
+    "slug": "payments-api",
+    "gateway_path": "/payments",
+    "routing_mode": "pass_through"
+  }' | jq
+```
+
+All versions and revisions under this app automatically use pass-through routing.
+
+---
+
+## How Forwarding Works
+
+For every request that passes policy validation, the gateway:
+
+1. Strips the combined app + version `gateway_path` prefix from the request path (when `strip_gateway_path = true`).
+2. Prepends `backend_base_path` from the revision configuration.
+3. Appends the remaining path and verbatim query string.
+4. Forwards to `backend_scheme://backend_host:backend_port`.
+
+**Example:**
+
+| Field | Value |
+|-------|-------|
+| App `gateway_path` | `/payments` |
+| Version `gateway_path` | `/payments/v1` |
+| Request path | `/payments/v1/orders/42?expand=items` |
+| Revision `backend_host:port` | `payments-svc:3000` |
+| Revision `backend_base_path` | `/` |
+| `strip_gateway_path` | `true` |
+
+Forwarded URL:
+```
+http://payments-svc:3000/orders/42?expand=items
+```
+
+The gateway strips `/payments/v1` (the longest matching `gateway_path`) and prepends `/` (`backend_base_path`), yielding `/orders/42`.
+
+---
+
+## Policy Is Still Fully Enforced
+
+Pass-through mode only affects path routing — all middleware and policy enforcement still applies in the normal order:
+
+```
+IP Rate Limit → Trace → Auth → Rate Limit → Header Validation
+→ IP Filter → Body Limit → Timeout → CORS → Logger → Cache → Proxy Engine
+```
+
+Each layer can still reject the request independently:
+
+| Layer | Can reject with |
+|-------|----------------|
+| IP Rate Limit | `429 Too Many Requests` |
+| Auth | `401 Unauthorized` / `403 Forbidden` |
+| Rate Limit | `429 Too Many Requests` |
+| Header Validation | `400 Bad Request` |
+| IP Filter | `403 Forbidden` |
+| Body Limit | `413 Payload Too Large` |
+| Timeout | `504 Gateway Timeout` |
+
+---
+
+## Path Denylist
+
+Even without explicit endpoint registration, you can block specific path prefixes using `path_denylist` in the policy. Any request whose path starts with a denied prefix is rejected with `403 Forbidden` before reaching the backend.
+
+```json
+{
+  "path_denylist": [
+    "/payments/v1/admin",
+    "/payments/v1/internal"
+  ]
+}
+```
+
+This gives you lightweight access control without needing to enumerate every allowed endpoint.
+
+**Denylist check response:**
+
+```json
+{"status": 403, "message": "path not allowed", "data": null}
+```
+
+The denylist uses prefix matching — `/payments/v1/admin/reset` would also be blocked by the `/payments/v1/admin` entry above.
+
+---
+
+## What Is Not Enforced
+
+Because no endpoint registry exists in pass-through mode:
+
+- There is no per-endpoint method validation (any method is forwarded unless `allowed_methods` is set in the policy).
+- There is no per-endpoint `backend_path` translation.
+- There are no per-endpoint policy overrides.
+- The gateway does not validate that the path exists on the backend — a `404` from the backend is forwarded verbatim to the client.
+
+To get per-endpoint control, use [Managed Endpoint Mode](/nexus/routing/managed-endpoint-mode) instead.
+
+---
+
+## Suitable Use Cases
+
+Pass-through mode is the right choice when:
+
+- **Your backend has its own routing framework** (Express, FastAPI, Rails, etc.) and you simply want the gateway in front for auth, rate limiting, and observability.
+- **You are migrating a legacy service** to sit behind the gateway and cannot yet enumerate all its endpoints.
+- **You do not control the backend** — e.g., you are proxying a third-party API and want to add auth and rate limiting in front of it.
+- **The API surface is large or dynamic** — endpoints are generated at runtime, making static registration impractical.
+- **You want minimal gateway configuration** while still getting the full policy stack.
+
+---
+
+## Allowed Methods Policy (optional enforcement)
+
+If you want to restrict which HTTP methods pass through without registering individual endpoints, set `allowed_methods` in the policy:
+
+```json
+{
+  "allowed_methods": ["GET", "HEAD"]
+}
+```
+
+Any request using a method not in the list returns `405 Method Not Allowed` with an `Allow` header listing the configured methods.
+
+This is useful for enforcing read-only access to a backend (e.g., proxying an internal analytics API to external consumers who should never issue writes).
+
+---
+
+## Full Example: Legacy Backend Behind the Gateway
+
+This example sets up a complete pass-through configuration for a legacy payments service.
+
+### 1. Create the app
+
+```bash
+curl -s -X POST http://localhost:9090/api/v1/apps \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Payments API",
+    "slug": "payments-api",
+    "gateway_path": "/payments",
+    "routing_mode": "pass_through",
+    "default_policy": {
+      "auth": {
+        "auth_type": "api_key",
+        "required": true
+      },
+      "rate_limit": {
+        "enabled": true,
+        "requests": 500,
+        "window_seconds": 60
+      },
+      "allowed_methods": ["GET", "POST", "PATCH", "DELETE"],
+      "path_denylist": ["/payments/v1/internal"]
+    }
+  }' | jq
+```
+
+### 2. Create a version and revision
+
+```bash
+APP_ID=<app-uuid>
+
+curl -s -X POST "http://localhost:9090/api/v1/apps/$APP_ID/versions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "version": "v1",
+    "gateway_path": "/payments/v1"
+  }' | jq
+
+VERSION_ID=<version-uuid>
+
+curl -s -X POST "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "revision": "prod-1",
+    "backend_scheme": "http",
+    "backend_host": "payments-svc",
+    "backend_port": 3000,
+    "backend_base_path": "/",
+    "strip_gateway_path": true,
+    "health_check_path": "/health"
+  }' | jq
+
+REVISION_ID=<revision-uuid>
+
+curl -s -X POST \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID/activate" \
+  | jq
+```
+
+### 3. Test
+
+```bash
+API_TOKEN=gw_...
+
+# Routed to http://payments-svc:3000/orders
+curl -s http://localhost:8080/payments/v1/orders \
+  -H "Authorization: Bearer $API_TOKEN" | jq
+
+# Routed to http://payments-svc:3000/orders/42
+curl -s http://localhost:8080/payments/v1/orders/42 \
+  -H "Authorization: Bearer $API_TOKEN" | jq
+
+# Blocked by path_denylist → 403
+curl -s http://localhost:8080/payments/v1/internal/config \
+  -H "Authorization: Bearer $API_TOKEN" | jq
+```
+
+---
+
+## Related Topics
+
+- [Managed Endpoint Mode](/nexus/routing/managed-endpoint-mode) — explicit endpoint registration with per-endpoint policies
+- [Path Rewriting](/nexus/routing/path-rewriting) — how `strip_gateway_path` and `backend_base_path` combine
+- [Policy Overview](/nexus/policies/overview) — full policy field reference
+- [Allowed Methods](/nexus/policies/allowed-methods)
+- [Header Validation](/nexus/policies/header-validation)

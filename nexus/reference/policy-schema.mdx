@@ -1,0 +1,261 @@
+---
+title: "Policy Schema"
+description: "Complete field-by-field reference for the Policy document."
+---
+
+A **Policy** is a JSONB document that configures middleware behaviour for an App, Version, Revision, or Endpoint. The same shape applies at every level — only the inheritance rules change. See [Policy Inheritance](/nexus/concepts/policy-inheritance) for the merge semantics.
+
+This page is the canonical schema reference. For tutorial-style explanations of each policy area, follow the cross-links.
+
+---
+
+## Top-level fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `auth` | object | Authentication requirements. See [`auth`](#auth) |
+| `rate_limit` | object | Per-token rate limit. See [`rate_limit`](#rate_limit) |
+| `allowed_methods` | string[] | HTTP method whitelist. Requests with other methods → `405` |
+| `required_scopes` | string[] | Token scopes required. Missing → `403` |
+| `headers` | object | Required request headers and validation rules. See [`headers`](#headers) |
+| `cors` | object | CORS rules. See [`cors`](#cors) |
+| `ip_filter` | object | IP allow / deny list. See [`ip_filter`](#ip_filter) |
+| `path_denylist` | string[] | Pass-through-only path prefix denylist. Matches → `403` |
+| `cache` | object | Response cache override. See [`cache`](#cache) |
+| `body_size_limit` | object | Request body size cap. See [`body_size_limit`](#body_size_limit) |
+| `timeout` | object | Upstream response timeout. See [`timeout`](#timeout) |
+
+All fields are optional. Omitted fields inherit from the parent.
+
+---
+
+## `auth`
+
+Authentication requirements applied by the `AuthLayer`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `auth_type` | string | `"none"` | `"api_key"`, `"jwt"`, `"basic"`, or `"none"` |
+| `required` | boolean | `true` | If `false`, auth is attempted but failure does not block the request |
+| `jwks_url` | string \| null | — | JWT only. JWKS endpoint; keys are fetched and cached |
+| `issuer` | string \| null | — | JWT only. Expected `iss` claim |
+| `audience` | string \| null | — | JWT only. Expected `aud` claim |
+| `required_claims` | string[] \| null | — | JWT only. Claim names that must be present |
+| `forward_claims_as_headers` | object<string,string> \| null | — | JWT only. Map of claim name → upstream header name |
+| `jwt_secret_env` | string \| null | — | HS256 only. Env-var name holding the secret |
+| `jwt_public_key_env` | string \| null | — | RS256/ES256 only. Env-var name holding the PEM public key |
+| `backend_mtls_profile` | string \| null | — | Name of an mTLS profile to use for backend connections |
+
+Examples and decision trees: [Authentication Overview](/nexus/auth/overview), [JWT](/nexus/auth/jwt), [API Key Tokens](/nexus/auth/api-key-tokens).
+
+---
+
+## `rate_limit`
+
+Per-token rate limit applied by `RateLimitLayer` after auth.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `false` | Master switch |
+| `requests` | integer | — | Number of requests per window |
+| `window_seconds` | integer | — | Window duration in seconds |
+| `algorithm` | string \| null | `"fixed_window"` | `"fixed_window"`, `"sliding_window"`, or `"token_bucket"` |
+
+Per-IP rate limits are configured separately at the gateway / app level — not via this field. See [IP Rate Limiting](/nexus/policies/ip-rate-limiting), [Per-Token Rate Limiting](/nexus/policies/per-token-rate-limiting).
+
+---
+
+## `allowed_methods`
+
+Array of permitted HTTP methods. Requests with a method not in this list receive `405 Method Not Allowed`.
+
+```json
+{
+  "allowed_methods": ["GET", "POST", "PUT", "DELETE"]
+}
+```
+
+When unset, all methods are allowed (subject to other policy checks). See [Allowed Methods](/nexus/policies/allowed-methods).
+
+---
+
+## `required_scopes`
+
+Array of token scope strings. **All** must be present on the validated token. Missing scopes return `403`.
+
+```json
+{
+  "required_scopes": ["proxy:read", "proxy:write"]
+}
+```
+
+See [Scopes and Access Control](/nexus/auth/scopes).
+
+---
+
+## `headers`
+
+Required request headers and validation rules. Enforced before forwarding.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `required` | string[] | Header names that must be present (case-insensitive) |
+| `inject` | object<string,string> | Static or templated headers added to forwarded requests |
+| `validate` | object<string,string> | Map of header name → regex pattern to match values |
+| `from_token_metadata` | string[] | Token metadata keys to forward as headers |
+| `from_jwt_claims` | object<string,string> | Map of JWT claim name → header name |
+
+See [Header Validation](/nexus/policies/header-validation), [Header Injection](/nexus/policies/header-injection).
+
+---
+
+## `cors`
+
+Cross-Origin Resource Sharing configuration.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `false` | Master switch |
+| `allowed_origins` | string[] | `[]` | Exact origin matches; no wildcard with credentials |
+| `allowed_methods` | string[] | `[]` | Methods echoed in `Access-Control-Allow-Methods` |
+| `allowed_headers` | string[] | `[]` | Headers echoed in `Access-Control-Allow-Headers` |
+| `expose_headers` | string[] | `[]` | Headers echoed in `Access-Control-Expose-Headers` |
+| `allow_credentials` | boolean | `false` | Adds `Access-Control-Allow-Credentials: true` |
+| `max_age` | integer | `0` | Preflight cache duration (seconds) |
+
+See [CORS](/nexus/policies/cors).
+
+---
+
+## `ip_filter`
+
+CIDR-based allow or deny list.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `mode` | string | `"allow"` or `"deny"` |
+| `cidrs` | string[] | List of CIDR ranges, IPv4 or IPv6 |
+
+```json
+{
+  "ip_filter": {
+    "mode": "allow",
+    "cidrs": ["10.0.0.0/8", "172.16.0.0/12"]
+  }
+}
+```
+
+See [IP Filtering](/nexus/policies/ip-filtering).
+
+---
+
+## `path_denylist`
+
+Array of path prefix strings. Only effective in `pass_through` routing mode (managed mode handles this via explicit endpoint registration). Matching paths receive `403`.
+
+```json
+{
+  "path_denylist": ["/admin", "/internal"]
+}
+```
+
+---
+
+## `cache`
+
+Per-policy response cache override. Caches successful upstream responses for `ttl_seconds`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `enabled` | boolean | Master switch |
+| `ttl_seconds` | integer | Cache lifetime per entry |
+| `cacheable_methods` | string[] | Methods eligible for caching (typically `["GET", "HEAD"]`) |
+| `vary_headers` | string[] | Request headers that vary the cache key |
+| `cache_status_codes` | integer[] | HTTP status codes eligible for caching |
+
+See [Cache Configuration](/nexus/configuration/cache), [Response Caching](/nexus/policies/response-caching) (consumer guide).
+
+---
+
+## `body_size_limit`
+
+Request body size cap.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `enabled` | boolean | Master switch |
+| `max_bytes` | integer | Max request body size in bytes; over → `413` |
+
+See [Body Size Limit](/nexus/policies/body-size-limit).
+
+---
+
+## `timeout`
+
+Upstream response timeout.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `connect_seconds` | integer | TCP connect timeout |
+| `read_seconds` | integer | Time to first byte from backend |
+| `total_seconds` | integer | End-to-end request timeout |
+
+Excess → `504 Gateway Timeout`. See [Timeout](/nexus/policies/timeout).
+
+---
+
+## Complete example
+
+A production-ready policy combining all sections:
+
+```json
+{
+  "auth": {
+    "auth_type": "jwt",
+    "required": true,
+    "jwks_url": "https://idp.example.com/.well-known/jwks.json",
+    "issuer": "https://idp.example.com",
+    "audience": "payments-api",
+    "required_claims": ["sub", "tenant_id"],
+    "forward_claims_as_headers": {
+      "sub": "X-User-Id",
+      "tenant_id": "X-Tenant-Id"
+    }
+  },
+  "rate_limit": {
+    "enabled": true,
+    "requests": 1000,
+    "window_seconds": 60,
+    "algorithm": "sliding_window"
+  },
+  "allowed_methods": ["GET", "POST", "PATCH", "DELETE"],
+  "required_scopes": ["payments:write"],
+  "headers": {
+    "required": ["X-Request-Id"],
+    "inject": {
+      "X-Forwarded-By": "nexus"
+    }
+  },
+  "cors": {
+    "enabled": true,
+    "allowed_origins": ["https://app.example.com"],
+    "allowed_methods": ["GET", "POST"],
+    "allowed_headers": ["Authorization", "Content-Type", "X-Request-Id"],
+    "allow_credentials": true,
+    "max_age": 3600
+  },
+  "ip_filter": {
+    "mode": "allow",
+    "cidrs": ["10.0.0.0/8"]
+  },
+  "body_size_limit": {
+    "enabled": true,
+    "max_bytes": 1048576
+  },
+  "timeout": {
+    "connect_seconds": 2,
+    "read_seconds": 10,
+    "total_seconds": 30
+  }
+}
+```

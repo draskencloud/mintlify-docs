@@ -1,0 +1,237 @@
+---
+title: "Circuit Breaker"
+description: "Per-revision Closed/Open/HalfOpen state machine isolates failing backends and probes for recovery."
+---
+
+The circuit breaker is a resilience pattern that automatically stops routing requests to a backend that is consistently failing, allowing the backend time to recover without being overwhelmed by traffic. The gateway implements a per-revision circuit breaker with three states: Closed, Open, and HalfOpen.
+
+---
+
+## Configuration
+
+Circuit breaker settings are in the server configuration:
+
+```toml
+[server]
+circuit_breaker_enabled = true
+circuit_breaker_threshold = 5
+circuit_breaker_timeout_secs = 30
+```
+
+| Config field | Default | Description |
+|--------------|---------|-------------|
+| `circuit_breaker_enabled` | `false` | Enable/disable the circuit breaker globally |
+| `circuit_breaker_threshold` | `5` | Number of consecutive backend failures before opening the circuit |
+| `circuit_breaker_timeout_secs` | `30` | Seconds to wait in Open state before transitioning to HalfOpen |
+
+Via environment variables:
+
+```bash
+GATEWAY_SERVER__CIRCUIT_BREAKER_ENABLED=true
+GATEWAY_SERVER__CIRCUIT_BREAKER_THRESHOLD=5
+GATEWAY_SERVER__CIRCUIT_BREAKER_TIMEOUT_SECS=30
+```
+
+> **Default is disabled.** Set `circuit_breaker_enabled = true` to activate the circuit breaker.
+
+---
+
+## States
+
+The circuit breaker per revision operates as a state machine:
+
+```
+                  N consecutive failures
+   [Closed] ──────────────────────────────► [Open]
+      ▲                                       │
+      │                                       │ cooldown expires
+      │                                       ▼
+      │                                  [HalfOpen]
+      │  probe succeeds                       │
+      └───────────────────────────────────────┤
+                                              │ probe fails
+                                              ▼
+                                           [Open]  (cooldown restarts)
+```
+
+### Closed (normal operation)
+
+The circuit is closed: requests pass through to the backend normally. The failure counter increments on each qualifying backend error. When the counter reaches `circuit_breaker_threshold`, the circuit transitions to Open.
+
+Successful responses reset the failure counter to zero.
+
+### Open (backend isolated)
+
+The circuit is open: **no requests are forwarded to the backend**. Instead, the gateway immediately returns a synthetic `502 Bad Gateway` response to the client with a special header indicating the circuit is open:
+
+```
+HTTP/1.1 502 Bad Gateway
+X-Circuit-Open: true
+```
+
+**Body:**
+```json
+{
+  "status": 502,
+  "message": "circuit breaker open",
+  "data": null
+}
+```
+
+Clients receive a fast failure response (no wait for a backend connection or timeout). This protects the backend from being flooded while it is recovering and prevents clients from accumulating slow requests.
+
+The circuit remains Open for `circuit_breaker_timeout_secs` seconds (the "cooldown period").
+
+### HalfOpen (probing for recovery)
+
+After the cooldown expires, the circuit transitions to HalfOpen. In this state, **one probe request** is allowed through to the backend:
+
+- **Probe succeeds** (2xx response) → circuit transitions to Closed; failure counter reset to zero; normal traffic resumes.
+- **Probe fails** (connection error, timeout, 502/503/504) → circuit returns to Open; cooldown restarts from zero.
+
+Only one request at a time is forwarded in the HalfOpen state. Any concurrent requests during the probe receive the same `502` response as in Open state.
+
+---
+
+## Failure Conditions
+
+The following backend error conditions increment the failure counter and can trigger the circuit breaker:
+
+| Condition | Triggers circuit breaker? |
+|-----------|--------------------------|
+| TCP connection refused | Yes |
+| Gateway timeout (504) | Yes |
+| Bad Gateway (502) from backend | Yes |
+| Service Unavailable (503) from backend | Yes |
+| HTTP 400, 401, 403, 404, 422, etc. | **No** — these are application-level errors, not infrastructure failures |
+| HTTP 500 Internal Server Error | **No** — application error; backend is reachable |
+| Successful 2xx response | No (resets counter) |
+
+The distinction is important: 4xx errors indicate the client sent something invalid; the backend is functioning. 5xx errors where the backend is unreachable or overwhelmed (`502`, `503`, `504`) indicate the backend itself is broken.
+
+HTTP `500` is intentionally excluded because it indicates the backend is running and responding — it just encountered an application error. Circuit breaking on `500` would hide application bugs and cause legitimate requests to be silently dropped.
+
+---
+
+## Scope: Per-Revision
+
+The circuit breaker state is maintained per revision. If a gateway serves multiple revisions simultaneously (e.g., canary deployment with two revisions), each revision has its own independent circuit breaker:
+
+```
+Version v1:
+  revision-2  (weight=90)  → circuit: Closed
+  revision-3  (weight=10)  → circuit: Open  (all probe traffic)
+```
+
+If revision-3's circuit is Open, its 10% traffic share is redirected to the synthetic `502` response. Revision-2's circuit remains Closed and serves its 90% share normally.
+
+---
+
+## Interaction with Health Probing
+
+Both the circuit breaker and the health probe task can operate simultaneously. They are complementary:
+
+| Mechanism | What it detects | How fast |
+|-----------|----------------|---------|
+| Circuit breaker | Error rate on live traffic | Instant (on each failed request) |
+| Health probe | Backend unavailability via dedicated probe | Every `health_interval_secs` (default 30s) |
+
+When a backend recovers:
+- The health probe detects recovery within one probe interval and marks `is_healthy = true`.
+- The circuit breaker detects recovery when the HalfOpen probe succeeds and transitions to Closed.
+
+Both mechanisms may clear independently. The gateway routes traffic when both conditions are satisfied (healthy per health map AND circuit Closed).
+
+---
+
+## Interaction with Retry Logic
+
+Retries and the circuit breaker interact in the following way:
+
+1. A request fails with a qualifying error (502, 503, 504).
+2. [Retry logic](/nexus/backends/retry-logic) may retry the request (for idempotent methods).
+3. **Each retry attempt** that fails also increments the circuit breaker counter.
+4. If `circuit_breaker_threshold = 5` and `proxy_retry_attempts = 3`, a single client request that exhausts all retries can increment the counter by 3 (1 original + 2 retries = 3 increments).
+
+This means the circuit may open faster under retry load than you might expect based on the threshold alone. Tune the threshold accordingly.
+
+---
+
+## Metrics
+
+```
+gateway_request_retries_total{revision_id="<uuid>"}
+gateway_backend_health{app_id="<uuid>", revision_id="<uuid>"}
+```
+
+The `gateway_request_retries_total` counter increments for each retry attempt, which also reflects circuit breaker activity. The `gateway_backend_health` gauge drops to `0` when a revision is unhealthy (detected by the health probe), which can align with circuit Open state.
+
+> A dedicated `gateway_circuit_breaker_state` metric is on the roadmap. For now, use `gateway_request_retries_total` rate and `gateway_backend_health` together to infer circuit breaker activity.
+
+---
+
+## Example: Configuring Circuit Breaker
+
+### Enable via environment variables
+
+```bash
+docker run -d \
+  --name gateway \
+  -p 8080:8080 \
+  -p 9090:9090 \
+  -e GATEWAY_SERVER__CIRCUIT_BREAKER_ENABLED=true \
+  -e GATEWAY_SERVER__CIRCUIT_BREAKER_THRESHOLD=5 \
+  -e GATEWAY_SERVER__CIRCUIT_BREAKER_TIMEOUT_SECS=30 \
+  draskencloud/gateway
+```
+
+### Enable in config file
+
+```toml
+[server]
+circuit_breaker_enabled = true
+circuit_breaker_threshold = 5    # open after 5 consecutive failures
+circuit_breaker_timeout_secs = 30 # try recovery after 30s
+```
+
+---
+
+## Tuning the Circuit Breaker
+
+### Threshold
+
+| Scenario | Recommended threshold |
+|----------|-----------------------|
+| High-traffic API (>100 RPS per revision) | 10–20 |
+| Moderate-traffic API (10–100 RPS) | 5–10 |
+| Low-traffic API (<10 RPS) | 3–5 |
+| Critical service where fast isolation is essential | 3 |
+
+Lower thresholds open the circuit faster (better protection, more false positives). Higher thresholds require more failures before isolation (fewer false positives, slower protection).
+
+### Cooldown (`circuit_breaker_timeout_secs`)
+
+| Scenario | Recommended cooldown |
+|----------|---------------------|
+| Backend restarts quickly (container restart: <10s) | 15–30s |
+| Backend restarts slowly (database recovery: 60s+) | 60–120s |
+| Backend has unpredictable recovery time | 30–60s (probe frequently) |
+
+---
+
+## Client Behaviour Recommendations
+
+When clients receive `502 Bad Gateway` with `X-Circuit-Open: true`, they should:
+
+1. **Not immediately retry** — retrying against the gateway while the circuit is open just returns more `502`s.
+2. **Use exponential backoff** — wait before retrying; the circuit will enter HalfOpen after the cooldown.
+3. **Surface the error** — treat this as a temporary service unavailability and surface it to end users or enqueue for later processing.
+
+---
+
+## Related Topics
+
+- [Health Probing](/nexus/backends/health-probing) — background probe-based health tracking (complements circuit breaker)
+- [Retry Logic](/nexus/backends/retry-logic) — automatic retry on backend errors (interacts with circuit breaker)
+- [Backend Configuration](/nexus/backends/configuration) — revision configuration
+- [Routing Overview](/nexus/routing/overview) — how circuit-open state affects request routing

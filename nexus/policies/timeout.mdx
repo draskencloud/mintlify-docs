@@ -1,0 +1,189 @@
+---
+title: "Timeout"
+description: "Per-request deadline on backend response start; exceeding the deadline returns 504."
+---
+
+The timeout middleware enforces a per-request deadline on how long the gateway waits for the upstream backend to respond. Requests that exceed the deadline are terminated and the client receives a `504 Gateway Timeout` response. This prevents slow or unresponsive backends from consuming gateway connections and degrading the experience for other clients.
+
+---
+
+## What the Timeout Measures
+
+The timeout starts when the gateway forwards the request to the backend and ends when the backend **begins sending response headers**. It does not include:
+
+- Time spent in the gateway's middleware stack before forwarding (auth, rate limiting, etc.).
+- Time to stream the response body from the backend to the client (once headers start flowing, the deadline is satisfied).
+
+This measurement matches standard reverse-proxy semantics (equivalent to Nginx's `proxy_read_timeout`).
+
+---
+
+## Global Default
+
+The global default timeout is set in the server configuration:
+
+```toml
+[server]
+proxy_timeout_ms = 30000  # 30 seconds
+```
+
+| Config field | Default | Description |
+|--------------|---------|-------------|
+| `proxy_timeout_ms` | `30000` | Default upstream response timeout in milliseconds |
+
+Via environment variable:
+
+```bash
+GATEWAY_SERVER__PROXY_TIMEOUT_MS=30000
+```
+
+---
+
+## Per-Policy Override
+
+Set `timeout_ms` in the policy document to override the global default for a specific app, version, revision, or endpoint:
+
+```json
+{
+  "timeout_ms": 5000
+}
+```
+
+The most specific level that sets `timeout_ms` takes precedence.
+
+| Level | Scope of override |
+|-------|-------------------|
+| App `default_policy` | Baseline for all requests through this app |
+| Version `policy` | Overrides app default for all revisions under this version |
+| Revision `policy` | Overrides for all requests served by this revision |
+| Endpoint `policy_override` | Overrides for this specific method + path only |
+
+---
+
+## Response on Timeout
+
+**HTTP Status:** `504 Gateway Timeout`
+
+**Body:**
+```json
+{
+  "status": 504,
+  "message": "upstream timeout",
+  "data": null
+}
+```
+
+The backend request is cancelled when the timeout fires. No partial response is returned.
+
+---
+
+## Implementation Detail
+
+The timeout is enforced by a [Tower](https://github.com/tower-rs/tower) `Timeout` middleware layer that wraps the proxy engine. It is distinct from the outbound HTTP client's connection and read timeouts (`http.request_timeout_ms`), which are enforced at the transport layer.
+
+| Setting | What it controls |
+|---------|-----------------|
+| `proxy_timeout_ms` (policy) | Time allowed for the backend to start responding (Tower layer) |
+| `http.request_timeout_ms` (server config) | Total time for the outbound HTTP client connection + read (Hyper/Reqwest layer) |
+
+In most deployments you only need to tune `proxy_timeout_ms`. Set `http.request_timeout_ms` only if you need tighter control over the TCP-level timeout for the outbound connection.
+
+---
+
+## Interaction with Retry Logic
+
+When [retry logic](/nexus/backends/retry-logic) is enabled, each retry attempt gets its own independent `proxy_timeout_ms` budget. The timeout is not shared across all attempts.
+
+```
+Attempt 1: budget = proxy_timeout_ms
+   → Times out (504 from backend)
+   → Retry eligible? (idempotent method + 504 counts)
+Attempt 2: budget = proxy_timeout_ms (fresh)
+   → Succeeds
+```
+
+Total wall time for a request with 3 attempts and a 5-second timeout can be up to 15 seconds (plus backoff). Account for this in your client-side timeouts.
+
+---
+
+## Timeout Tuning Guide
+
+| Use case | Recommended `timeout_ms` |
+|----------|--------------------------|
+| Interactive web APIs (search, autocomplete) | 500–2000 |
+| Standard CRUD APIs | 5000–10000 |
+| Complex queries, aggregation APIs | 10000–30000 |
+| Long-running job initiation (fires and returns job ID) | 5000–10000 |
+| File upload processing (async) | 60000–120000 |
+| Streaming endpoints | `0` (disable; set at endpoint level) |
+| Health checks | 2000–5000 |
+
+### Disable timeout for streaming endpoints
+
+Set `timeout_ms = 0` at the endpoint level to disable the timeout for long-lived connections (e.g., server-sent events, WebSocket upgrades, large file downloads):
+
+```json
+{
+  "method": "GET",
+  "path": "/events/stream",
+  "policy_override": {
+    "timeout_ms": 0
+  }
+}
+```
+
+> A `0` value disables the gateway-level timeout entirely for that endpoint. Ensure your backend and client both have appropriate connection timeouts so connections do not hang indefinitely.
+
+---
+
+## Complete Examples
+
+### Short timeout for a latency-sensitive endpoint
+
+```bash
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID/endpoints/$ENDPOINT_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "policy_override": {
+      "timeout_ms": 1000
+    }
+  }' | jq
+```
+
+### Longer timeout for a batch processing revision
+
+```bash
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$BATCH_REVISION_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "policy": {
+      "timeout_ms": 120000
+    }
+  }' | jq
+```
+
+### App-level default with per-endpoint override
+
+```bash
+# App default: 5s
+curl -s -X PATCH "http://localhost:9090/api/v1/apps/$APP_ID" \
+  -H "Content-Type: application/json" \
+  -d '{"default_policy": {"timeout_ms": 5000}}' | jq
+
+# Report endpoint: 60s
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID/endpoints/$REPORT_ENDPOINT_ID" \
+  -H "Content-Type: application/json" \
+  -d '{"policy_override": {"timeout_ms": 60000}}' | jq
+```
+
+---
+
+## Related Topics
+
+- [Policy Overview](/nexus/policies/overview) — full policy field reference and inheritance rules
+- [Retry Logic](/nexus/backends/retry-logic) — how retries interact with per-attempt timeouts
+- [Circuit Breaker](/nexus/backends/circuit-breaker) — how timeout errors (504) contribute to circuit breaker state
+- [Body Size Limit](/nexus/policies/body-size-limit) — companion middleware for inbound payload enforcement

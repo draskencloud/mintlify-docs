@@ -1,0 +1,255 @@
+---
+title: "Routing Overview"
+description: "How the gateway resolves a request: path match, app/version/revision selection, health, endpoint matching, forwarding."
+---
+
+This document explains how the Nexus API Gateway by Drasken Cloud resolves an incoming request to a backend, selects the correct revision, and constructs the forwarded URL. Understanding this flow is essential for diagnosing routing errors and designing your API hierarchy.
+
+---
+
+## The Resolution Chain
+
+When a request arrives on port `8080`, the gateway executes the following steps in order:
+
+```
+Incoming request
+       │
+       ▼
+1. Path match        → find App by gateway_path (longest-prefix)
+       │
+       ▼
+2. App active?       → is_active=false → 503
+       │
+       ▼
+3. Active Version    → find version with active status
+       │
+       ▼
+4. Revision select   → is_current (or weighted canary)
+       │
+       ▼
+5. Health check      → is_healthy=false → exclude; all unhealthy → 503
+       │
+       ▼
+6. Endpoint match    → (managed_endpoint mode) method + path lookup
+       │
+       ▼
+7. Policy enforce    → auth, rate limit, IP filter, headers, CORS, body limit, timeout
+       │
+       ▼
+8. Forward to backend
+```
+
+---
+
+## Step 1: Path Matching
+
+The gateway maintains a registry of all active app `gateway_path` values. When a request arrives, the path is compared against this registry using a **longest-prefix match** algorithm:
+
+- The registry may contain `/api`, `/api/v1`, `/payments`, `/internal/billing`.
+- A request to `/api/v1/users/123` matches `/api/v1` (not `/api`) because `/api/v1` is the longer prefix.
+- A request to `/unknown/path` matches nothing → `404 Not Found`.
+
+**No match** returns:
+
+```json
+{"status": 404, "message": "no route matched", "data": null}
+```
+
+### Path matching rules
+
+| Condition | Response |
+|-----------|----------|
+| No registered path is a prefix of the request path | `404 Not Found` |
+| Matching app has `is_active = false` | `503 Service Unavailable` |
+| Matching app is active | Continue to version selection |
+
+---
+
+## Step 2: Version Selection
+
+Each app has one or more versions. The gateway selects the single **active** version associated with the matching path. A version is considered active when its status field is `active`.
+
+> Versions are typically mapped to distinct `gateway_path` prefixes (e.g., `/api/v1`, `/api/v2`). Only one version will be selected per request — the one whose path prefix matches longest.
+
+---
+
+## Step 3: Revision Selection
+
+A version may have multiple revisions. The gateway selects the revision to serve from using one of two modes:
+
+### Normal traffic — single `is_current` revision
+
+In steady state, exactly one revision per version has `is_current = true`. All traffic goes to that revision.
+
+```
+Version v1
+├── revision-1  (is_current=false, traffic_weight=null)
+├── revision-2  (is_current=true,  traffic_weight=null)  ← selected
+└── revision-3  (is_current=false, traffic_weight=null)
+```
+
+### Canary traffic — weighted selection
+
+When multiple revisions within a version have `traffic_weight` set to non-null values, the gateway distributes requests proportionally. This enables gradual rollouts without DNS changes or load-balancer configuration.
+
+```
+Version v1
+├── revision-2  (is_current=true,  traffic_weight=90)   ← 90% of traffic
+└── revision-3  (is_current=false, traffic_weight=10)   ← 10% of traffic
+```
+
+Traffic weight is interpreted as a relative share. The gateway uses a consistent random selection per request based on the total weight sum. There is no session stickiness unless you route via a sticky load balancer upstream.
+
+---
+
+## Step 4: Health Exclusion
+
+Before a selected revision is used, its health status is checked:
+
+| Condition | Behaviour |
+|-----------|-----------|
+| Selected revision has `is_healthy = true` | Proceed |
+| Selected revision has `is_healthy = false` | Exclude from selection; pick next eligible revision |
+| All candidate revisions are `is_healthy = false` | `503 Service Unavailable` |
+
+Health state is set by the background health-probing task (see [Health Probing](/nexus/backends/health-probing)). Revisions without a `health_check_path` configured are always treated as healthy.
+
+**503 when all revisions are unhealthy:**
+
+```json
+{"status": 503, "message": "no healthy revision available", "data": null}
+```
+
+---
+
+## Step 5: Endpoint Matching (managed_endpoint mode)
+
+In `managed_endpoint` routing mode, the gateway performs an additional lookup after revision selection: it looks up the request's HTTP method and path in the revision's registered endpoint table.
+
+| Condition | Response |
+|-----------|----------|
+| Method + path registered | Proceed with that endpoint's config |
+| Path registered, method not registered | `405 Method Not Allowed` |
+| Path not registered at all | `404 Not Found` |
+
+In `pass_through` mode this step is skipped entirely.
+
+See [Managed Endpoint Mode](/nexus/routing/managed-endpoint-mode) for details.
+
+---
+
+## Path Forwarding
+
+After the middleware stack validates the request (auth, rate limit, IP filter, etc.), the gateway constructs the backend URL:
+
+```
+backend_scheme://backend_host:backend_port
+  + backend_base_path
+  + rewritten_path
+  + ?query_string
+```
+
+Where `rewritten_path` is derived by:
+
+1. **Stripping the gateway path prefix** (when `strip_gateway_path = true`, the default): the combined app + version `gateway_path` prefix is removed from the request path.
+2. **Prepending `backend_base_path`**: if the revision has a non-empty `backend_base_path`, it is prepended to the rewritten path.
+
+See [Path Rewriting](/nexus/routing/path-rewriting) for detailed examples.
+
+---
+
+## Query String Handling
+
+The query string is forwarded **verbatim** to the backend. The gateway does not inspect, modify, or validate query parameters (unless a `headers.validate` or `inject` rule references `request.query.<param>`).
+
+---
+
+## Body Streaming
+
+In the normal path (body under the configured `max_body_bytes` limit), the request body is streamed zero-copy from the client to the backend using Hyper's chunked transfer. The gateway does not buffer the entire body in memory.
+
+The body limit middleware checks the `Content-Length` header first. If the header indicates a body larger than the limit, the request is rejected before any data is read. For requests without `Content-Length`, the stream is measured as it flows.
+
+---
+
+## Gateway-Injected Request Headers
+
+Before forwarding to the backend, the gateway injects the following headers:
+
+| Header | Value | Notes |
+|--------|-------|-------|
+| `x-request-id` | UUID v4 | Generated if missing from inbound request; forwarded if already present |
+| Token metadata headers | Per `ApiToken.metadata` key-value pairs | Each metadata entry becomes a request header |
+| JWT claim headers | Per `AuthPolicy.forward_claims_as_headers` map | Claims from the validated JWT injected as headers |
+| Policy add headers | Per `Policy.headers.add` map | Static key-value pairs |
+| Dynamic inject headers | Per `Policy.headers.inject` rules | See [Header Validation](/nexus/policies/header-validation) |
+
+The `x-request-id` is also echoed back to the client in the response.
+
+---
+
+## Error Response Shape
+
+All error responses from the gateway use the standard error envelope:
+
+```json
+{
+  "status": <http-status-code>,
+  "message": "<human-readable message>",
+  "data": null
+}
+```
+
+| Condition | Status | Message |
+|-----------|--------|---------|
+| No path match | `404` | `no route matched` |
+| App inactive | `503` | `app is not active` |
+| All revisions unhealthy | `503` | `no healthy revision available` |
+| Path registered, wrong method | `405` | `method not allowed` |
+| Unregistered path (managed mode) | `404` | `endpoint not found` |
+
+---
+
+## Reference: Complete Routing Flow Diagram
+
+```
+[Client] ──────────────────────────────────── :8080
+                │
+         [IP Rate Limit]  ← 429 if IP over limit
+                │
+           [Trace]        ← x-request-id assigned
+                │
+            [Auth]        ← 401/403 on auth failure
+                │
+         [Rate Limit]     ← 429 if token over limit
+                │
+    [Header Validation]   ← 400 on missing/invalid headers
+                │
+          [IP Filter]     ← 403 if IP blocked
+                │
+         [Body Limit]     ← 413 if body too large
+                │
+          [Timeout]       ← wraps backend call; 504 on expiry
+                │
+            [CORS]        ← preflight handled; headers injected
+                │
+           [Logger]       ← access log emitted
+                │
+           [Cache]        ← cache HIT returns early; MISS continues
+                │
+       [Proxy Engine]     ← path rewrite, header inject, forward
+                │
+          [Backend]       ← revision selected, circuit breaker checked
+```
+
+---
+
+## Related Topics
+
+- [Pass-Through Mode](/nexus/routing/pass-through-mode)
+- [Managed Endpoint Mode](/nexus/routing/managed-endpoint-mode)
+- [Path Rewriting](/nexus/routing/path-rewriting)
+- [Header Filtering](/nexus/routing/header-filtering)
+- [Health Probing](/nexus/backends/health-probing)
+- [Circuit Breaker](/nexus/backends/circuit-breaker)
+- [Policy Overview](/nexus/policies/overview)

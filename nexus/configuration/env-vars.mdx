@@ -1,0 +1,297 @@
+---
+title: "Environment Variable Reference"
+description: "Comprehensive reference for every supported GATEWAY_* environment variable and special override variable."
+---
+
+All Nexus API Gateway by Drasken Cloud configuration can be controlled via environment variables. This page is the comprehensive reference for every supported `GATEWAY_*` variable and special override variables.
+
+## Naming Convention
+
+```
+GATEWAY_<SECTION>__<KEY>
+```
+
+- **Prefix:** `GATEWAY_` (always uppercase)
+- **Section separator:** double underscore `__`
+- **Key names:** uppercase
+- **Nesting:** additional `__` for each level (e.g., `GATEWAY_CACHE__REDIS__URL` for `cache.redis.url`)
+
+## .env File
+
+At startup the gateway loads a `.env` file from the current working directory (if present) via [dotenvy](https://docs.rs/dotenvy). Actual shell environment variables take precedence over `.env` values. The file is silently ignored when absent.
+
+```bash
+# Example .env for local development
+GATEWAY_SERVER__ADMIN_TOKEN=dev-token
+GATEWAY_DATABASE_URL=sqlite://./dev.db?mode=rwc
+GATEWAY_SERVER__LOG_FORMAT=text
+RUST_LOG=nexus=debug
+```
+
+**Do not use `.env` files in production.** Use a secrets manager or container environment injection instead.
+
+## Special Variables (Override Behaviour)
+
+These variables have special semantics beyond simple config substitution.
+
+| Variable | Overrides | Description |
+|---|---|---|
+| `RUST_LOG` | `server.log_level` | Standard `tracing` filter directives. Takes precedence over the TOML `log_level` key. Example: `nexus=debug,tower_http=warn` |
+| `GATEWAY_LICENSE_FILE` | `license.license_file` | Path to the license file on disk |
+| `GATEWAY_LICENSE_KEY` | _(inline value)_ | Inline license key text. The variable **contains** the key value, not a path |
+| `GATEWAY_OTLP_ENDPOINT` | _(activates OTLP)_ | URL of the OTLP collector (e.g., `http://otel-collector:4318`). Activates OpenTelemetry export. Requires binary built with `--features otlp` |
+| `GATEWAY_MTLS_PROFILE_<NAME>_CERT_PATH` | _(mTLS profile)_ | Client certificate path for the named mTLS profile |
+| `GATEWAY_MTLS_PROFILE_<NAME>_KEY_PATH` | _(mTLS profile)_ | Client key path for the named mTLS profile |
+| `GATEWAY_MTLS_PROFILE_<NAME>_CA_PATH` | _(mTLS profile)_ | CA certificate path for the named mTLS profile |
+
+### JWT Secret Environment Variable Names
+
+In `AuthPolicy`, the fields `jwt_secret_env` and `jwt_public_key_env` hold the **name** of an environment variable that contains the actual secret value. They are not the secret itself.
+
+```toml
+# In your app's auth policy config:
+[auth_policy]
+jwt_secret_env = "MY_APP_JWT_SECRET"
+```
+
+Then set:
+
+```bash
+export MY_APP_JWT_SECRET="the-actual-secret-value"
+```
+
+The gateway reads `MY_APP_JWT_SECRET` at runtime and uses its value as the HMAC secret. The `GATEWAY_` prefix is not required for these custom JWT secret variables — you name them and reference them in the policy.
+
+---
+
+## Complete Variable Reference by Section
+
+### Server
+
+| Variable | Default | Type | Description |
+|---|---|---|---|
+| `GATEWAY_SERVER__PROXY_PORT` | `8080` | Integer | Proxy listener port |
+| `GATEWAY_SERVER__MGMT_PORT` | `9090` | Integer | Management API port |
+| `GATEWAY_SERVER__ADMIN_TOKEN` | _(none)_ | String | Bearer token for management API authentication |
+| `GATEWAY_SERVER__TLS_ENABLED` | `false` | Boolean | Enable TLS on port 8443 |
+| `GATEWAY_SERVER__TLS_CERT_PATH` | _(none)_ | String | Path to full-chain PEM certificate |
+| `GATEWAY_SERVER__TLS_KEY_PATH` | _(none)_ | String | Path to PKCS8 or RSA PEM private key |
+| `GATEWAY_SERVER__MAX_BODY_BYTES` | `10485760` | Integer | Max request body size; 413 on violation |
+| `GATEWAY_SERVER__PROXY_TIMEOUT_MS` | `30000` | Integer | Per-request proxy deadline (ms); 504 on violation |
+| `GATEWAY_SERVER__SHUTDOWN_TIMEOUT_SECS` | `30` | Integer | Graceful shutdown drain timeout |
+| `GATEWAY_SERVER__LOG_LEVEL` | `info` | String | `trace`/`debug`/`info`/`warn`/`error`; `RUST_LOG` wins |
+| `GATEWAY_SERVER__LOG_FORMAT` | `text` | String | `text` or `json` |
+| `GATEWAY_SERVER__CRASH_LOG_PATH` | `./crash.log` | String | Panic hook output file |
+| `GATEWAY_SERVER__SWAGGER_ENABLED` | `true` | Boolean | Expose Swagger UI and OpenAPI spec |
+
+### Database
+
+| Variable | Default | Type | Description |
+|---|---|---|---|
+| `GATEWAY_DB_DRIVER` | `sqlite` | String | `sqlite`, `postgres`, `mysql`, or `cockroach` |
+| `GATEWAY_DATABASE_URL` | `sqlite://gateway.db?mode=rwc` | String | Database connection string |
+| `GATEWAY_AUTO_MIGRATE` | `true` | Boolean | Run embedded migrations at startup |
+| `GATEWAY_DB_MAX_CONNECTIONS` | `10` | Integer | Max pool connections (ignored for SQLite) |
+| `GATEWAY_DB_MIN_CONNECTIONS` | `2` | Integer | Warm pool connections |
+| `GATEWAY_DB_CONNECT_TIMEOUT_SECS` | `5` | Integer | Pool acquisition timeout |
+| `GATEWAY_DB_IDLE_TIMEOUT_SECS` | `600` | Integer | Idle connection expiry |
+| `GATEWAY_DB_CONNECT_RETRIES` | `3` | Integer | Startup connection retry count |
+
+### Cache
+
+| Variable | Default | Type | Description |
+|---|---|---|---|
+| `GATEWAY_CACHE__ENABLED` | `false` | Boolean | Enable response cache |
+| `GATEWAY_CACHE__BACKEND` | `memory` | String | `memory`, `redis`, or `memcached` |
+| `GATEWAY_CACHE__DEFAULT_TTL_SECS` | `60` | Integer | Default cache entry TTL |
+| `GATEWAY_CACHE__MEMORY_MAX_MB` | `64` | Integer | Max in-process cache memory (MiB) |
+| `GATEWAY_CACHE__MEMORY_MAX_ENTRIES` | `100000` | Integer | Max in-process cache entries |
+| `GATEWAY_CACHE__MAX_ENTRY_BYTES` | `1048576` | Integer | Max cacheable response body (bytes) |
+| `GATEWAY_CACHE__REDIS__URL` | `redis://localhost:6379` | String | Redis connection URL |
+| `GATEWAY_CACHE__REDIS__POOL_MAX_SIZE` | `10` | Integer | Redis connection pool size |
+| `GATEWAY_CACHE__REDIS__WAIT_TIMEOUT_MS` | `1000` | Integer | Redis pool acquisition timeout |
+| `GATEWAY_CACHE__MEMCACHED__URL` | `""` | String | Memcached server URL |
+
+### Auth / Routing Cache TTLs (Top-Level)
+
+| Variable | Default | Type | Description |
+|---|---|---|---|
+| `GATEWAY_TOKEN_CACHE_TTL_SECS` | `300` | Integer | Token validation result cache TTL |
+| `GATEWAY_REVISION_CACHE_TTL_SECS` | `60` | Integer | App revision record cache TTL |
+| `GATEWAY_ENDPOINT_CACHE_TTL_SECS` | `60` | Integer | Endpoint route record cache TTL |
+| `GATEWAY_JWKS_CACHE_TTL_SECS` | `300` | Integer | JWKS fetch result cache TTL |
+
+### Rate Limiting (Top-Level)
+
+| Variable | Default | Type | Description |
+|---|---|---|---|
+| `GATEWAY_RATE_LIMIT_REQUESTS` | `1000` | Integer | Requests per window per app |
+| `GATEWAY_RATE_LIMIT_WINDOW_SECS` | `60` | Integer | Rate limit window duration |
+| `GATEWAY_PER_IP_RATE_LIMIT_ENABLED` | `false` | Boolean | Enable per-IP rate limiting |
+| `GATEWAY_PER_IP_RATE_LIMIT_REQUESTS` | `1000` | Integer | Requests per IP per window |
+| `GATEWAY_PER_IP_RATE_LIMIT_WINDOW_SECS` | `60` | Integer | Per-IP rate limit window duration |
+| `GATEWAY_TRUSTED_PROXY_IPS` | `""` (empty) | String (comma-separated) | IP/CIDR ranges whose forwarded headers are trusted |
+
+### Outbound HTTP Client
+
+| Variable | Default | Type | Description |
+|---|---|---|---|
+| `GATEWAY_HTTP__CONNECT_TIMEOUT_MS` | `5000` | Integer | TCP connect + TLS handshake timeout |
+| `GATEWAY_HTTP__REQUEST_TIMEOUT_MS` | `30000` | Integer | Total request timeout on shared client |
+| `GATEWAY_HTTP__POOL_IDLE_TIMEOUT_SECS` | `90` | Integer | Idle keep-alive connection expiry |
+| `GATEWAY_HTTP__POOL_MAX_IDLE_PER_HOST` | `32` | Integer | Max idle connections per upstream host |
+
+### JWKS
+
+| Variable | Default | Type | Description |
+|---|---|---|---|
+| `GATEWAY_JWKS__CACHE_TTL_SECS` | `300` | Integer | JWKS response in-memory cache TTL |
+| `GATEWAY_JWKS__VALIDATE_ON_RELOAD` | `true` | Boolean | Validate JWKS URLs at startup and reload |
+| `GATEWAY_JWKS__FETCH_TIMEOUT_MS` | `5000` | Integer | Timeout for JWKS HTTP fetches |
+
+### Circuit Breaker
+
+| Variable | Default | Type | Description |
+|---|---|---|---|
+| `GATEWAY_CIRCUIT_BREAKER__THRESHOLD` | `5` | Integer | Consecutive failures before circuit trips |
+| `GATEWAY_CIRCUIT_BREAKER__TIMEOUT_SECS` | `30` | Integer | Open circuit duration before half-open probe |
+
+### Backend Health Probe
+
+| Variable | Default | Type | Description |
+|---|---|---|---|
+| `GATEWAY_HEALTH__INTERVAL_SECS` | `30` | Integer | Interval between health probes |
+
+### Proxy
+
+| Variable | Default | Type | Description |
+|---|---|---|---|
+| `GATEWAY_PROXY__RETRY_ATTEMPTS` | `3` | Integer | Max upstream retry attempts |
+
+### License
+
+| Variable | Default | Type | Description |
+|---|---|---|---|
+| `GATEWAY_LICENSE__VALIDATOR` | `offline_jwt` | String | `none`, `offline_jwt`, `online_api`, `dual` |
+| `GATEWAY_LICENSE__LICENSE_FILE` | _(none)_ | String | Path to license file |
+| `GATEWAY_LICENSE__LICENSE_KEY_ENV` | `GATEWAY_LICENSE_KEY` | String | Name of env var holding the inline key |
+| `GATEWAY_LICENSE__ONLINE_API_URL` | _(none)_ | String | URL for online license validation |
+| `GATEWAY_LICENSE_FILE` | _(none)_ | String | Shorthand for `GATEWAY_LICENSE__LICENSE_FILE` |
+| `GATEWAY_LICENSE_KEY` | _(none)_ | String | The inline license key value |
+
+### Update Check
+
+| Variable | Default | Type | Description |
+|---|---|---|---|
+| `GATEWAY_UPDATE_CHECK__ENABLED` | `true` | Boolean | Enable background version check at startup |
+| `GATEWAY_UPDATE_CHECK__URL` | GitHub Releases API URL | String | Version check endpoint |
+
+### App Loading and File Watch
+
+| Variable | Default | Type | Description |
+|---|---|---|---|
+| `GATEWAY_APPS_DIR` | `config/apps` | String | Directory containing app TOML files |
+| `GATEWAY_FILE_WATCH_ENABLED` | `false` | Boolean | Watch `apps_dir` for changes and hot-reload |
+| `GATEWAY_FILE_WATCH_DEBOUNCE_MS` | `500` | Integer | Debounce delay before reload on file change |
+| `GATEWAY_CRASH_LOG_PATH` | `./crash.log` | String | Panic hook output file path |
+
+### Analytics Pipeline
+
+| Variable | Default | Type | Description |
+|---|---|---|---|
+| `GATEWAY_ANALYTICS__ENABLED` | `false` | Boolean | Enable analytics event pipeline |
+| `GATEWAY_ANALYTICS__BUFFER_SIZE` | `10000` | Integer | Channel buffer capacity |
+| `GATEWAY_ANALYTICS__BATCH_SIZE` | `500` | Integer | Events per flush batch |
+| `GATEWAY_ANALYTICS__FLUSH_INTERVAL_MS` | `5000` | Integer | Max time between flushes |
+| `GATEWAY_ANALYTICS__RETRY_MAX_ATTEMPTS` | `3` | Integer | Forwarder retry count |
+| `GATEWAY_ANALYTICS__RETRY_BACKOFF_MS` | `200` | Integer | Initial retry backoff |
+| `GATEWAY_ANALYTICS__DEAD_LETTER_PATH` | `logs/dead_letter.jsonl` | String | Undeliverable event file |
+
+### Logging Pipeline
+
+| Variable | Default | Type | Description |
+|---|---|---|---|
+| `GATEWAY_LOGGING__ENABLED` | `false` | Boolean | Enable log forwarding pipeline |
+| `GATEWAY_LOGGING__BUFFER_SIZE` | `10000` | Integer | Channel buffer capacity |
+| `GATEWAY_LOGGING__BATCH_SIZE` | `500` | Integer | Log records per flush batch |
+| `GATEWAY_LOGGING__FLUSH_INTERVAL_MS` | `5000` | Integer | Max time between flushes |
+| `GATEWAY_LOGGING__RETRY_MAX_ATTEMPTS` | `3` | Integer | Forwarder retry count |
+| `GATEWAY_LOGGING__RETRY_BACKOFF_MS` | `200` | Integer | Initial retry backoff |
+| `GATEWAY_LOGGING__DEAD_LETTER_PATH` | `logs/log_dead_letter.jsonl` | String | Undeliverable log file |
+| `GATEWAY_LOGGING__SLOW_REQUEST_THRESHOLD_MS` | `1000` | Integer | Slow request log threshold (0 = disabled) |
+| `GATEWAY_LOGGING__TYPES__ACCESS` | `true` | Boolean | Log access events |
+| `GATEWAY_LOGGING__TYPES__AUDIT` | `true` | Boolean | Log audit events |
+| `GATEWAY_LOGGING__TYPES__ERROR` | `true` | Boolean | Log error events |
+| `GATEWAY_LOGGING__TYPES__SECURITY` | `true` | Boolean | Log security events |
+| `GATEWAY_LOGGING__TYPES__POLICY` | `true` | Boolean | Log policy events |
+| `GATEWAY_LOGGING__TYPES__HEALTH` | `true` | Boolean | Log health change events |
+| `GATEWAY_LOGGING__TYPES__CACHE` | `false` | Boolean | Log cache operation events |
+| `GATEWAY_LOGGING__TYPES__SLOW_REQUEST` | `true` | Boolean | Log slow request events |
+
+### Audit Pipeline
+
+| Variable | Default | Type | Description |
+|---|---|---|---|
+| `GATEWAY_AUDIT__BUFFER_SIZE` | `10000` | Integer | Channel buffer capacity |
+| `GATEWAY_AUDIT__BATCH_SIZE` | `500` | Integer | Audit records per flush batch |
+| `GATEWAY_AUDIT__FLUSH_INTERVAL_MS` | `5000` | Integer | Max time between flushes |
+| `GATEWAY_AUDIT__RETRY_MAX_ATTEMPTS` | `3` | Integer | Postgres write retry count |
+| `GATEWAY_AUDIT__RETRY_BACKOFF_MS` | `200` | Integer | Initial retry backoff |
+| `GATEWAY_AUDIT__DEAD_LETTER_PATH` | `logs/audit_dead_letter.jsonl` | String | Undeliverable audit record file |
+
+### OpenTelemetry (requires `--features otlp`)
+
+| Variable | Default | Type | Description |
+|---|---|---|---|
+| `GATEWAY_OTLP_ENDPOINT` | _(none)_ | String | OTLP collector URL. Setting this activates OTLP export. |
+
+### mTLS Profiles (Outbound)
+
+```
+GATEWAY_MTLS_PROFILE_<NAME>_CERT_PATH   Path to client certificate PEM
+GATEWAY_MTLS_PROFILE_<NAME>_KEY_PATH    Path to client key PEM
+GATEWAY_MTLS_PROFILE_<NAME>_CA_PATH     Path to CA bundle PEM
+```
+
+`<NAME>` is the profile name in uppercase (e.g., `PAYMENTS`, `INVENTORY`).
+
+---
+
+## Legacy Flat Keys (Deprecated)
+
+The following flat (non-sectioned) environment variable names are accepted for backward compatibility. When both the legacy and canonical forms are set, **the canonical form wins**. These will be removed in a future release.
+
+| Legacy variable | Canonical replacement |
+|---|---|
+| `GATEWAY_REDIS_URL` | `GATEWAY_CACHE__REDIS__URL` |
+| `GATEWAY_REDIS_ENABLED` | `GATEWAY_CACHE__ENABLED` |
+| `GATEWAY_CIRCUIT_BREAKER_THRESHOLD` | `GATEWAY_CIRCUIT_BREAKER__THRESHOLD` |
+| `GATEWAY_CIRCUIT_BREAKER_TIMEOUT_SECS` | `GATEWAY_CIRCUIT_BREAKER__TIMEOUT_SECS` |
+| `GATEWAY_HEALTH_INTERVAL_SECS` | `GATEWAY_HEALTH__INTERVAL_SECS` |
+| `GATEWAY_JWKS_CACHE_TTL_SECS` | `GATEWAY_JWKS__CACHE_TTL_SECS` |
+| `GATEWAY_JWKS_VALIDATE_ON_RELOAD` | `GATEWAY_JWKS__VALIDATE_ON_RELOAD` |
+| `GATEWAY_PROXY_RETRY_ATTEMPTS` | `GATEWAY_PROXY__RETRY_ATTEMPTS` |
+
+---
+
+## Error Envelope
+
+All management API error responses use this envelope regardless of which environment variable configuration caused the error:
+
+```json
+{
+  "status": 400,
+  "message": "invalid configuration value for GATEWAY_SERVER__MAX_BODY_BYTES",
+  "data": null
+}
+```
+
+Feature-gate violations (license tier mismatch) return HTTP 402:
+
+```json
+{
+  "status": 402,
+  "message": "feature requires Pro license or higher",
+  "data": null
+}
+```

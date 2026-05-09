@@ -1,0 +1,192 @@
+---
+title: "Body Size Limit"
+description: "Reject requests whose body exceeds max_body_bytes; checks Content-Length first, then streams."
+---
+
+The body size limit middleware rejects incoming requests whose body exceeds a configured maximum size. This prevents malicious or accidental oversized payloads from consuming gateway and backend memory, bandwidth, or processing time.
+
+---
+
+## How It Works
+
+The body limit middleware evaluates the request body size in two phases:
+
+1. **Content-Length check** — if the request includes a `Content-Length` header, its value is compared against the limit immediately. If it exceeds the limit, the request is rejected before any body bytes are read.
+
+2. **Streaming check** — for requests without `Content-Length` (e.g., chunked transfer encoding), the gateway measures the body as it streams in. If the running total exceeds the limit, the connection is dropped and `413` is returned.
+
+In the normal path (body under the limit), the body is streamed **zero-copy** from the client to the backend using Hyper. The gateway does not buffer the entire body in memory.
+
+---
+
+## Global Default
+
+The global default body size limit is set in the server configuration:
+
+```toml
+[server]
+max_body_bytes = 10485760  # 10 MiB
+```
+
+| Config field | Default | Description |
+|--------------|---------|-------------|
+| `max_body_bytes` | `10485760` (10 MiB) | Maximum allowed request body size in bytes |
+
+Via environment variable:
+
+```bash
+GATEWAY_SERVER__MAX_BODY_BYTES=10485760
+```
+
+This limit applies to all requests unless overridden by a policy.
+
+---
+
+## Per-Policy Override
+
+Any level of the policy hierarchy can set a `max_body_bytes` value to override the global default:
+
+```json
+{
+  "max_body_bytes": 52428800
+}
+```
+
+The most specific policy level that has `max_body_bytes` set takes precedence over parent levels and the global default.
+
+| Level | Scope of override |
+|-------|-------------------|
+| App `default_policy` | Applies to all versions, revisions, and endpoints under this app |
+| Version `policy` | Applies to all revisions and endpoints under this version |
+| Revision `policy` | Applies to all requests served by this revision (all its endpoints) |
+| Endpoint `policy_override` | Applies only to this specific method + path combination |
+
+---
+
+## Limit Reference Table
+
+Common sizes for quick reference:
+
+| Bytes | Human-readable |
+|-------|---------------|
+| `1048576` | 1 MiB |
+| `5242880` | 5 MiB |
+| `10485760` | 10 MiB (default) |
+| `52428800` | 50 MiB |
+| `104857600` | 100 MiB |
+
+---
+
+## Response on Violation
+
+**HTTP Status:** `413 Payload Too Large`
+
+**Body:**
+```json
+{
+  "status": 413,
+  "message": "request body too large",
+  "data": null
+}
+```
+
+---
+
+## Use Cases
+
+### Increase limit for file upload APIs
+
+A file upload endpoint might accept up to 100 MiB. Set the override at the endpoint level in managed_endpoint mode:
+
+```bash
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID/endpoints/$ENDPOINT_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "policy_override": {
+      "max_body_bytes": 104857600
+    }
+  }' | jq
+```
+
+### Decrease limit for a JSON-only API
+
+An API that only accepts small JSON payloads (e.g., login, search filters) should have a tight body limit to prevent misuse:
+
+```bash
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "policy": {
+      "max_body_bytes": 65536
+    }
+  }' | jq
+```
+
+65536 bytes (64 KiB) is a generous limit for most JSON API payloads. Anything larger is likely malformed or malicious.
+
+### Mixed revision: tighter on public, relaxed on internal
+
+Set a low limit at the app level, then override upward for a specific internal revision:
+
+```bash
+# App-level default: 64 KiB
+curl -s -X PATCH "http://localhost:9090/api/v1/apps/$APP_ID" \
+  -H "Content-Type: application/json" \
+  -d '{"default_policy": {"max_body_bytes": 65536}}' | jq
+
+# Internal revision: 100 MiB for batch uploads
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$INTERNAL_REVISION_ID" \
+  -H "Content-Type: application/json" \
+  -d '{"policy": {"max_body_bytes": 104857600}}' | jq
+```
+
+---
+
+## Interaction with Body Streaming
+
+The body limit middleware wraps the request body stream. In the normal path:
+
+```
+Client sends body
+       │
+[Body Limit middleware]  ← byte counter attached to stream
+       │
+   (body within limit)
+       │
+[Proxy Engine]           ← stream forwarded zero-copy to backend
+       │
+     Backend
+```
+
+If the body exceeds the limit mid-stream:
+
+```
+Client sends body
+       │
+[Body Limit middleware]  ← byte counter exceeds max_body_bytes
+       │
+  413 returned to client; backend connection dropped
+```
+
+---
+
+## Disable the Limit
+
+Setting `max_body_bytes = 0` disables the body size check entirely (no limit enforced). Use this only for streaming endpoints where you control the client and backend, and the backend handles its own size enforcement.
+
+```json
+{"max_body_bytes": 0}
+```
+
+> Disabling the body limit in pass-through mode means an attacker could send unlimited-size requests to your backend. Use with care.
+
+---
+
+## Related Topics
+
+- [Policy Overview](/nexus/policies/overview) — full policy field reference and inheritance rules
+- [Timeout](/nexus/policies/timeout) — request-level deadline enforcement (complements body limit for slow uploads)
+- [Routing Overview](/nexus/routing/overview) — middleware stack and Body Limit position

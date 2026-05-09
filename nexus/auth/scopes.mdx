@@ -1,0 +1,229 @@
+---
+title: "Scopes and Access Control"
+description: "Two-scope model — proxy:read for safe methods, proxy:write for mutating methods — enforced post-auth."
+---
+
+The Nexus API Gateway by Drasken Cloud enforces a two-scope access model on every authenticated request. Scopes are assigned at credential issuance time and checked after authentication succeeds, before the request is forwarded to the backend.
+
+---
+
+## Table of Contents
+
+- [The Two Scopes](#the-two-scopes)
+- [Enforcement Rules](#enforcement-rules)
+- [Scope Assignment by Auth Type](#scope-assignment-by-auth-type)
+  - [API Key Tokens](#api-key-tokens)
+  - [Basic Auth Credentials](#basic-auth-credentials)
+  - [JWT Tokens](#jwt-tokens)
+- [Policy Override: `required_scopes`](#policy-override-required_scopes)
+- [403 Forbidden Response](#403-forbidden-response)
+- [Minimal Privilege Principle](#minimal-privilege-principle)
+- [Scope Enforcement Flow](#scope-enforcement-flow)
+
+---
+
+## The Two Scopes
+
+| Scope | Description |
+|---|---|
+| `proxy:read` | Permits read-only HTTP methods: `GET`, `HEAD`, `OPTIONS` |
+| `proxy:write` | Permits mutating HTTP methods: `POST`, `PUT`, `PATCH`, `DELETE` |
+
+These two scopes cover the full HTTP method surface. There are no more granular path-level or resource-level scopes in the gateway itself — path-level access control is the responsibility of the backend service.
+
+---
+
+## Enforcement Rules
+
+Scope enforcement runs **after** successful authentication and **before** the request is forwarded to the backend:
+
+| HTTP Method | Required Scope |
+|---|---|
+| `GET` | `proxy:read` |
+| `HEAD` | `proxy:read` |
+| `OPTIONS` | `proxy:read` |
+| `POST` | `proxy:write` |
+| `PUT` | `proxy:write` |
+| `PATCH` | `proxy:write` |
+| `DELETE` | `proxy:write` |
+
+If the authenticated credential does not include the required scope for the request method, the gateway returns `403 Forbidden` and does **not** forward the request to the backend.
+
+**Scope check is cumulative, not exclusive.** A credential with both `proxy:read` and `proxy:write` can use any HTTP method. A credential with only `proxy:read` is blocked on `POST`/`PUT`/`PATCH`/`DELETE`. A credential with only `proxy:write` is blocked on `GET`/`HEAD`/`OPTIONS` (unusual; avoid this).
+
+---
+
+## Scope Assignment by Auth Type
+
+### API Key Tokens
+
+Scopes are set explicitly when the token is issued:
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps/{app_id}/tokens \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "read-only-integration",
+    "scopes": ["proxy:read"]
+  }'
+```
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps/{app_id}/tokens \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "full-access-service",
+    "scopes": ["proxy:read", "proxy:write"]
+  }'
+```
+
+The `scopes` field is required. An empty array (`[]`) is accepted but results in a credential that passes authentication yet fails scope enforcement for every HTTP method.
+
+Scopes cannot be updated after issuance. To change scopes, rotate the token (rotation inherits the old scopes) and then issue a new token with the desired scopes, or issue a new token directly.
+
+### Basic Auth Credentials
+
+Scopes are set at creation time:
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps/{app_id}/basic-credentials \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "reporting-service",
+    "password": "...",
+    "scopes": ["proxy:read"]
+  }'
+```
+
+### JWT Tokens
+
+For JWT authentication, scopes are read from the token's claims. The gateway looks for scopes in two standard claim locations:
+
+1. **`scope` claim** — a space-delimited string: `"proxy:read proxy:write"`
+2. **`scopes` claim** — a JSON array: `["proxy:read", "proxy:write"]`
+
+If neither `scope` nor `scopes` is present in the JWT payload, the authenticated identity has no scopes and all scope-checked requests fail with `403`.
+
+**Example JWT payload with scopes:**
+
+```json
+{
+  "sub": "service-account-x",
+  "iss": "https://auth.example.com/",
+  "aud": "gateway-api",
+  "exp": 1767000000,
+  "scope": "proxy:read proxy:write"
+}
+```
+
+Or using an array:
+
+```json
+{
+  "sub": "service-account-x",
+  "scopes": ["proxy:read"]
+}
+```
+
+Both formats are accepted. The space-delimited string is the OAuth 2.0 standard format; the array format is also widely used by identity providers.
+
+---
+
+## Policy Override: `required_scopes`
+
+A policy at any level (app, version, revision, or endpoint) can override scope enforcement using the `required_scopes` field:
+
+**Disable scope enforcement entirely:**
+
+```json
+{
+  "auth_type": "api_key",
+  "required": true,
+  "required_scopes": []
+}
+```
+
+An empty `required_scopes` array means "any authenticated credential may access this endpoint regardless of scopes." This is appropriate for endpoints where authentication identity matters but scope differentiation does not — for example, a status endpoint that any authenticated service can query.
+
+**Require specific scopes explicitly:**
+
+```json
+{
+  "required_scopes": ["proxy:read", "proxy:write"]
+}
+```
+
+When `required_scopes` is non-empty, it completely replaces the default method-based enforcement. The credential must carry **all** listed scopes. A credential with only `proxy:read` would be rejected even on a `GET` request if `required_scopes` is set to `["proxy:read", "proxy:write"]`.
+
+---
+
+## 403 Forbidden Response
+
+When scope enforcement fails, the gateway returns:
+
+```http
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{"status":403,"message":"insufficient scope","data":null}
+```
+
+The request is not forwarded to the backend. The backend never sees the request. The denial is recorded in the gateway's audit log with the `token_id` (or username) that presented insufficient scopes.
+
+---
+
+## Minimal Privilege Principle
+
+Issue tokens with the minimum scopes required for the consumer's function:
+
+| Consumer | Recommended Scopes |
+|---|---|
+| Reporting / analytics service | `proxy:read` |
+| Read-only API client | `proxy:read` |
+| Webhook sender that only POSTs | `proxy:write` |
+| Full CRUD service | `proxy:read`, `proxy:write` |
+| Public / unauthenticated endpoint | Set `required = false` on policy |
+
+**Why minimal privilege matters:**
+
+- A compromised read-only token cannot be used to mutate data.
+- Scope violations are logged in the audit trail, making anomalous access visible.
+- Rotating a compromised token is low-blast-radius when the token had limited scope.
+
+---
+
+## Scope Enforcement Flow
+
+The complete flow from request to backend, focusing on scope:
+
+```
+Request arrives at proxy port 8080
+  │
+  ├── [IpRateLimitLayer] — check IP rate limit
+  ├── [TraceLayer] — attach trace context
+  │
+  ├── [AuthLayer]
+  │     ├── Extract credential from Authorization header
+  │     ├── Validate credential (token hash / JWT sig / bcrypt)
+  │     ├── On failure → 401 Unauthorized
+  │     └── On success → produce AuthIdentity{scopes: [...]}
+  │
+  ├── [AuthLayer — scope check]
+  │     ├── Determine required scope from HTTP method (or required_scopes override)
+  │     ├── Check if AuthIdentity.scopes contains the required scope
+  │     ├── On mismatch → 403 Forbidden {"status":403,"message":"insufficient scope","data":null}
+  │     └── On match → pass AuthIdentity downstream
+  │
+  ├── [RateLimitLayer] — per-token rate limit using AuthIdentity.token_id
+  ├── [HeaderValidationLayer]
+  ├── [IpFilterLayer]
+  ├── [BodyLimitLayer]
+  ├── [TimeoutLayer]
+  ├── [CorsLayer]
+  ├── [LoggerLayer]
+  │
+  └── [ProxyEngine] — forward request to backend
+```

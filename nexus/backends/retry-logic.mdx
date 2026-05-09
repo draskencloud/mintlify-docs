@@ -1,0 +1,223 @@
+---
+title: "Retry Logic"
+description: "Automatic retry on infrastructure failures (502/503/504/conn-error) for idempotent methods only, with backoff."
+---
+
+The gateway automatically retries failed requests to the backend under specific conditions, improving reliability for transient infrastructure failures without adding complexity to client code. Retries are only performed for safe, idempotent HTTP methods to prevent unintended side effects.
+
+---
+
+## Configuration
+
+Retry settings are in the server configuration:
+
+```toml
+[server]
+proxy_retry_attempts = 3
+```
+
+| Config field | Default | Description |
+|--------------|---------|-------------|
+| `proxy_retry_attempts` | `3` | Maximum number of **additional** retry attempts after the initial request |
+
+Via environment variable:
+
+```bash
+GATEWAY_SERVER__PROXY_RETRY_ATTEMPTS=3
+```
+
+Total attempts = 1 (original) + `proxy_retry_attempts` (retries). With the default of `3`, each request gets up to 4 total attempts.
+
+Setting `proxy_retry_attempts = 0` disables retry entirely.
+
+---
+
+## Which Requests Are Retried
+
+### Idempotent methods only
+
+Retries are only performed for HTTP methods that are safe to repeat without side effects:
+
+| Method | Retried? | Reason |
+|--------|----------|--------|
+| `GET` | Yes | Safe and idempotent |
+| `HEAD` | Yes | Safe and idempotent |
+| `OPTIONS` | Yes | Safe and idempotent |
+| `POST` | **No** | Not idempotent; may create duplicate resources |
+| `PUT` | **No** | Not idempotent in practice (though formally idempotent, retrying risks double-processing) |
+| `PATCH` | **No** | Not idempotent; partial updates must not be applied twice |
+| `DELETE` | **No** | Not idempotent; second delete may fail or have unintended effects |
+
+### Error conditions that trigger a retry
+
+A retry is attempted when the backend returns one of these error conditions:
+
+| Condition | Retried? | Reason |
+|-----------|----------|--------|
+| TCP connection error (connection refused, reset) | Yes | Transient infrastructure failure |
+| `502 Bad Gateway` | Yes | Backend or upstream proxy failure |
+| `503 Service Unavailable` | Yes | Backend temporarily unable to handle requests |
+| `504 Gateway Timeout` | Yes | Backend did not respond in time |
+| `500 Internal Server Error` | **No** | Application error; retrying will not help |
+| Any `4xx` response | **No** | Client error; retrying will return the same error |
+
+The rule of thumb: retry on infrastructure failures (the backend is broken or unreachable), do not retry on application errors (the backend processed the request and decided to reject it).
+
+---
+
+## Backoff
+
+The gateway applies a delay between retry attempts to avoid thundering-herd effects when a backend is recovering:
+
+| Attempt | Delay before this attempt |
+|---------|--------------------------|
+| 1 (original) | None |
+| 2 (1st retry) | 100 ms |
+| 3 (2nd retry) | 200 ms + random jitter (0–100 ms) |
+| 4 (3rd retry) | Not attempted if backoff + jitter would exceed remaining timeout budget |
+
+The jitter on the second retry is a random additional delay uniformly distributed between 0 and 100 ms. Jitter prevents all retrying clients from hitting the backend at exactly the same moment.
+
+The third retry is skipped if the cumulative backoff delay plus jitter would cause the request to exceed the `proxy_timeout_ms` budget. This prevents unnecessary waits when the timeout would expire anyway.
+
+---
+
+## Per-Attempt Timeout
+
+Each retry attempt gets its own independent `proxy_timeout_ms` budget. The timeout is not shared or carried over between attempts:
+
+```
+proxy_timeout_ms = 5000 ms
+
+Attempt 1: 5000 ms budget → times out after 5000 ms
+Wait: 100 ms
+Attempt 2: 5000 ms budget → succeeds in 200 ms
+```
+
+This means the total wall time for a request with multiple retries can exceed `proxy_timeout_ms`. With `proxy_retry_attempts = 3` and `proxy_timeout_ms = 5000`, the worst-case total time is approximately:
+
+```
+5000 (attempt 1 timeout)
++ 100 (backoff)
++ 5000 (attempt 2 timeout)
++ 300 (backoff + jitter)
++ 5000 (attempt 3 timeout)
+= ~15,400 ms
+```
+
+Set your client-side timeouts accordingly when retries are enabled.
+
+---
+
+## Interaction with the Circuit Breaker
+
+Each failed retry attempt that qualifies (502, 503, 504, connection error) also **increments the circuit breaker failure counter** for that revision.
+
+```
+circuit_breaker_threshold = 5
+proxy_retry_attempts = 3
+
+A single request that exhausts all retries with 502 errors:
+  Attempt 1 → 502 → counter: 1
+  Attempt 2 → 502 → counter: 2
+  Attempt 3 → 502 → counter: 3
+
+After ~2 such requests, the circuit opens.
+```
+
+When the circuit is Open, retries are not attempted — the circuit breaker fast-fails immediately:
+
+```
+Circuit Open:
+  Request arrives → 502 returned immediately (no backend call)
+  Retries: not attempted (circuit is Open)
+```
+
+Tuning consideration: if you have both retries and a circuit breaker enabled, the effective number of failures needed to open the circuit is lower than the threshold alone suggests. Set the threshold with this multiplication in mind.
+
+---
+
+## Interaction with Health Probing
+
+The health probe runs independently of retries. If the health probe has already marked a revision as `is_healthy = false`, that revision is excluded from routing entirely — no retry can select it:
+
+```
+revision-2: is_healthy=true  → eligible for retry
+revision-3: is_healthy=false → excluded from routing (and retries)
+```
+
+If there are no healthy revisions available, the gateway returns `503 Service Unavailable` immediately without attempting any retries.
+
+---
+
+## Metric
+
+```
+gateway_request_retries_total{revision_id="<uuid>"}
+```
+
+This counter increments for each retry attempt (not including the original attempt). Use it to:
+
+- Detect backends with elevated transient error rates.
+- Correlate retry spikes with deployment events.
+- Alert when a backend is experiencing sustained errors (high retry rate + high error rate).
+
+```promql
+# Rate of retries per revision over 5 minutes
+rate(gateway_request_retries_total[5m])
+
+# Alert when retry rate exceeds 10 per second for a revision
+rate(gateway_request_retries_total[1m]) > 10
+```
+
+---
+
+## Complete Example
+
+With the defaults:
+
+```
+proxy_retry_attempts = 3
+proxy_timeout_ms = 30000
+circuit_breaker_threshold = 5
+```
+
+A client makes `GET /api/v1/resource` and the backend is temporarily down:
+
+```
+t=0ms:    Gateway forwards GET to backend
+t=30000ms: Backend times out → 504 (circuit breaker counter: 1)
+t=30100ms: Gateway retries (after 100ms backoff)
+t=60100ms: Backend times out again → 504 (circuit breaker counter: 2)
+t=60400ms: Gateway retries (after ~300ms backoff + jitter)
+t=90400ms: Backend times out again → 504 (circuit breaker counter: 3)
+t=90400ms: No more retry attempts (3 retries exhausted)
+t=90400ms: 504 returned to client
+```
+
+The client receives a single `504` response after ~90 seconds. The circuit breaker counter is now at 3 for this revision.
+
+---
+
+## Disabling Retries
+
+To disable retry for all requests:
+
+```toml
+[server]
+proxy_retry_attempts = 0
+```
+
+Disabling retries is appropriate when:
+- Your backend already has its own retry logic and double-retrying would cause problems.
+- Latency is critical and you cannot afford multiple round-trip attempts.
+- You are using `POST`/`PUT`/`PATCH`/`DELETE` exclusively (these are never retried anyway, so this setting only affects `GET`/`HEAD`/`OPTIONS`).
+
+---
+
+## Related Topics
+
+- [Circuit Breaker](/nexus/backends/circuit-breaker) — how retry failures contribute to circuit breaker state
+- [Health Probing](/nexus/backends/health-probing) — revision health tracking (affects which revisions are eligible for retries)
+- [Timeout](/nexus/policies/timeout) — per-attempt timeout configuration
+- [Backend Configuration](/nexus/backends/configuration) — revision fields

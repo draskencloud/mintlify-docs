@@ -1,0 +1,388 @@
+---
+title: "Cache Configuration Reference"
+description: "Response cache and auth/routing cache backend, TTLs, Redis/Memcached, plus rate-limit settings."
+---
+
+The gateway has two related caching subsystems:
+
+1. **Response cache** — caches upstream responses and returns them directly to clients, reducing backend load.
+2. **Auth/routing cache** — in-process caches for token validation, app revision lookups, and endpoint resolution to reduce database round-trips on the hot path.
+
+Both subsystems share the same backend configuration (memory, Redis, or Memcached).
+
+## Quick Reference
+
+```toml
+[cache]
+enabled            = false
+backend            = "memory"    # memory | redis | memcached
+default_ttl_secs   = 60
+memory_max_mb      = 64
+memory_max_entries = 100000
+max_entry_bytes    = 1048576     # 1 MiB per entry
+
+[cache.redis]
+url            = "redis://localhost:6379"
+pool_max_size  = 10
+wait_timeout_ms = 1000
+
+[cache.memcached]
+url = ""   # e.g., "memcache://localhost:11211"
+
+# Top-level keys (not under [cache])
+token_cache_ttl_secs    = 300
+revision_cache_ttl_secs = 60
+endpoint_cache_ttl_secs = 60
+jwks_cache_ttl_secs     = 300
+
+rate_limit_requests        = 1000
+rate_limit_window_secs     = 60
+per_ip_rate_limit_enabled  = false
+per_ip_rate_limit_requests = 1000
+per_ip_rate_limit_window_secs = 60
+trusted_proxy_ips          = []
+```
+
+## Response Cache Keys
+
+### `cache.enabled`
+
+| | |
+|---|---|
+| Type | Boolean |
+| Default | `false` |
+| Env var | `GATEWAY_CACHE__ENABLED` |
+| Runtime reload | Yes |
+
+Enables the response cache. When disabled (the default), all requests are forwarded to the upstream backend unconditionally. When enabled, cacheable responses are stored and subsequent identical requests are served from cache.
+
+> **License requirement:** The Redis cache backend (`cache.backend = "redis"`) requires a **Pro** license or higher. The `memory` backend is available on all tiers.
+
+---
+
+### `cache.backend`
+
+| | |
+|---|---|
+| Type | String |
+| Default | `memory` |
+| Env var | `GATEWAY_CACHE__BACKEND` |
+| Accepted values | `memory`, `redis`, `memcached` |
+| Runtime reload | No — requires restart |
+
+Selects the cache storage backend.
+
+| Backend | Description | Multi-instance |
+|---|---|---|
+| `memory` | In-process LRU/ARC map. Fast, zero dependencies. Each instance has its own cache. | No — per-instance |
+| `redis` | Shared Redis cache. All instances read/write the same keys. Requires `[cache.redis]` config. | Yes |
+| `memcached` | Shared Memcached cache. Requires `memcached` Cargo feature and `[cache.memcached]` config. | Yes |
+
+The `memcached` backend requires a binary built with `--features memcached`.
+
+---
+
+### `cache.default_ttl_secs`
+
+| | |
+|---|---|
+| Type | Integer (seconds) |
+| Default | `60` |
+| Env var | `GATEWAY_CACHE__DEFAULT_TTL_SECS` |
+| Runtime reload | Yes |
+
+Default time-to-live for cached responses when no cache-control directives specify a TTL. Per-route TTL overrides can be set in app TOML configuration.
+
+---
+
+### `cache.memory_max_mb`
+
+| | |
+|---|---|
+| Type | Integer (MiB) |
+| Default | `64` |
+| Env var | `GATEWAY_CACHE__MEMORY_MAX_MB` |
+| Runtime reload | No |
+
+Maximum memory the in-process cache may use (in MiB). When the limit is reached, the least-recently-used entries are evicted. Has no effect when `backend = "redis"` or `backend = "memcached"`.
+
+---
+
+### `cache.memory_max_entries`
+
+| | |
+|---|---|
+| Type | Integer |
+| Default | `100000` |
+| Env var | `GATEWAY_CACHE__MEMORY_MAX_ENTRIES` |
+| Runtime reload | No |
+
+Maximum number of entries in the in-process cache. Eviction is LRU when the entry count exceeds this limit. Both `memory_max_mb` and `memory_max_entries` are enforced; whichever limit is reached first triggers eviction.
+
+---
+
+### `cache.max_entry_bytes`
+
+| | |
+|---|---|
+| Type | Integer (bytes) |
+| Default | `1048576` (1 MiB) |
+| Env var | `GATEWAY_CACHE__MAX_ENTRY_BYTES` |
+| Runtime reload | Yes |
+
+Maximum size of a single cacheable response body. Responses larger than this value are forwarded to the client but not stored in the cache. Applies to all backends.
+
+---
+
+## Redis Backend Settings
+
+```toml
+[cache.redis]
+url            = "redis://localhost:6379"
+pool_max_size  = 10
+wait_timeout_ms = 1000
+```
+
+### `cache.redis.url`
+
+| | |
+|---|---|
+| Type | String (URL) |
+| Default | `redis://localhost:6379` |
+| Env var | `GATEWAY_CACHE__REDIS__URL` |
+| Legacy env var | `GATEWAY_REDIS_URL` (deprecated) |
+| Runtime reload | No — requires restart |
+
+Redis server connection URL. Supports the standard Redis URI format:
+
+```
+redis://[:<password>@]<host>[:<port>][/<db>]
+redis://:secretpassword@redis.example.com:6379/0
+rediss://redis.example.com:6380   # TLS
+```
+
+For Redis Sentinel or Cluster, consult the deadpool-redis documentation for the appropriate URL format.
+
+---
+
+### `cache.redis.pool_max_size`
+
+| | |
+|---|---|
+| Type | Integer |
+| Default | `10` |
+| Env var | `GATEWAY_CACHE__REDIS__POOL_MAX_SIZE` |
+| Runtime reload | No |
+
+Maximum number of Redis connections in the pool. Scale this in proportion to the expected concurrent request rate and the number of gateway instances sharing the Redis server.
+
+---
+
+### `cache.redis.wait_timeout_ms`
+
+| | |
+|---|---|
+| Type | Integer (milliseconds) |
+| Default | `1000` |
+| Env var | `GATEWAY_CACHE__REDIS__WAIT_TIMEOUT_MS` |
+| Runtime reload | No |
+
+Maximum time to wait for a Redis connection to become available from the pool. If a connection cannot be acquired within this timeout the cache operation fails gracefully — the request continues without caching.
+
+---
+
+## Memcached Backend Settings
+
+```toml
+[cache.memcached]
+url = "memcache://localhost:11211"
+```
+
+### `cache.memcached.url`
+
+| | |
+|---|---|
+| Type | String (URL) |
+| Default | `""` (empty) |
+| Env var | `GATEWAY_CACHE__MEMCACHED__URL` |
+| Runtime reload | No — requires restart |
+
+Memcached server URL. Requires a binary built with `--features memcached`. The `memcache://` scheme is used.
+
+```bash
+cargo build --release --features memcached
+```
+
+---
+
+## Auth and Routing Cache TTLs
+
+These TTLs control the internal in-process caches that the auth and routing layers use to avoid database round-trips on every request. They are top-level keys (not under `[cache]`).
+
+### `token_cache_ttl_secs`
+
+| | |
+|---|---|
+| Type | Integer (seconds) |
+| Default | `300` (5 minutes) |
+| Env var | `GATEWAY_TOKEN_CACHE_TTL_SECS` |
+| Runtime reload | Yes |
+
+How long validated token records are cached. After a token is validated (JWT signature verified or API key hash matched against the database) the result is cached for this duration. Revoked tokens continue to be accepted until the cache entry expires. Reduce this value if faster token revocation is required.
+
+With a Redis cache backend, this cache is shared across instances, so revocation propagates more quickly than with a per-instance memory cache.
+
+---
+
+### `revision_cache_ttl_secs`
+
+| | |
+|---|---|
+| Type | Integer (seconds) |
+| Default | `60` |
+| Env var | `GATEWAY_REVISION_CACHE_TTL_SECS` |
+| Runtime reload | Yes |
+
+How long app revision records are cached. Each revision defines upstream URL, auth policy, rate limits, and routing rules. Increasing this reduces database load at the cost of slower propagation of revision updates.
+
+---
+
+### `endpoint_cache_ttl_secs`
+
+| | |
+|---|---|
+| Type | Integer (seconds) |
+| Default | `60` |
+| Env var | `GATEWAY_ENDPOINT_CACHE_TTL_SECS` |
+| Runtime reload | Yes |
+
+How long endpoint route records are cached. Endpoint records define path patterns and their associated policies. Same trade-off as `revision_cache_ttl_secs`.
+
+---
+
+### `jwks_cache_ttl_secs`
+
+| | |
+|---|---|
+| Type | Integer (seconds) |
+| Default | `300` |
+| Env var | `GATEWAY_JWKS_CACHE_TTL_SECS` |
+| Runtime reload | Yes |
+
+How long JWKS (JSON Web Key Set) responses from remote JWKS URLs are cached in memory. When expired the gateway fetches fresh keys. Set lower if keys rotate frequently; set higher to reduce latency on the JWKS endpoint.
+
+---
+
+## Rate Limiting
+
+### `rate_limit_requests`
+
+| | |
+|---|---|
+| Type | Integer |
+| Default | `1000` |
+| Env var | `GATEWAY_RATE_LIMIT_REQUESTS` |
+| Runtime reload | Yes |
+
+Maximum number of requests allowed per `rate_limit_window_secs` window, per app. With a Redis cache backend this counter is shared across all gateway instances. With the memory backend each instance tracks its own counter independently.
+
+---
+
+### `rate_limit_window_secs`
+
+| | |
+|---|---|
+| Type | Integer (seconds) |
+| Default | `60` |
+| Env var | `GATEWAY_RATE_LIMIT_WINDOW_SECS` |
+| Runtime reload | Yes |
+
+The sliding window duration for the global rate limit counter.
+
+---
+
+### `per_ip_rate_limit_enabled`
+
+| | |
+|---|---|
+| Type | Boolean |
+| Default | `false` |
+| Env var | `GATEWAY_PER_IP_RATE_LIMIT_ENABLED` |
+| Runtime reload | Yes |
+
+When enabled, applies a separate rate limit per source IP address. The client IP is extracted from the `X-Forwarded-For` or `X-Real-IP` headers when the request came through a trusted proxy, or from the direct connection address otherwise.
+
+---
+
+### `per_ip_rate_limit_requests`
+
+| | |
+|---|---|
+| Type | Integer |
+| Default | `1000` |
+| Env var | `GATEWAY_PER_IP_RATE_LIMIT_REQUESTS` |
+| Runtime reload | Yes |
+
+Maximum requests per IP per `per_ip_rate_limit_window_secs` window.
+
+---
+
+### `per_ip_rate_limit_window_secs`
+
+| | |
+|---|---|
+| Type | Integer (seconds) |
+| Default | `60` |
+| Env var | `GATEWAY_PER_IP_RATE_LIMIT_WINDOW_SECS` |
+| Runtime reload | Yes |
+
+Window duration for the per-IP rate limit counter.
+
+---
+
+### `trusted_proxy_ips`
+
+| | |
+|---|---|
+| Type | Array of strings |
+| Default | `[]` (empty — use direct connection IP) |
+| Env var | `GATEWAY_TRUSTED_PROXY_IPS` (comma-separated) |
+| Runtime reload | Yes |
+
+List of IP addresses (or CIDR ranges) whose `X-Forwarded-For` and `X-Real-IP` headers are trusted. When a request arrives from a trusted proxy IP, the gateway uses the leftmost non-trusted IP in `X-Forwarded-For` as the client IP for rate limiting and logging.
+
+```toml
+trusted_proxy_ips = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+```
+
+```bash
+GATEWAY_TRUSTED_PROXY_IPS=10.0.0.0/8,172.16.0.0/12
+```
+
+**Do not add public IP addresses here.** A malicious client could forge `X-Forwarded-For` headers to bypass per-IP rate limits.
+
+---
+
+## Cache Metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `gateway_cache_ops_total` | Counter | `region`, `backend`, `op`, `result` | Total cache operations. `op`: `get`/`set`/`delete`. `result`: `hit`/`miss`/`error`. |
+| `gateway_cache_memory_bytes` | Gauge | — | Current in-process cache memory usage in bytes (memory backend only) |
+
+### Useful PromQL Queries
+
+```promql
+# Cache hit rate (all regions)
+sum(rate(gateway_cache_ops_total{op="get", result="hit"}[5m]))
+  /
+sum(rate(gateway_cache_ops_total{op="get"}[5m]))
+
+# Cache hit rate by region
+sum by (region) (rate(gateway_cache_ops_total{op="get", result="hit"}[5m]))
+  /
+sum by (region) (rate(gateway_cache_ops_total{op="get"}[5m]))
+
+# Cache error rate
+rate(gateway_cache_ops_total{result="error"}[5m])
+```

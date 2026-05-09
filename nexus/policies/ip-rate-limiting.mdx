@@ -1,0 +1,202 @@
+---
+title: "IP Rate Limiting"
+description: "Pre-auth per-IP request limiting that protects auth and backends from flood attacks; uses trusted proxies."
+---
+
+IP-based rate limiting is a pre-authentication defence that limits how many requests a single IP address (or IP prefix) can make in a rolling time window. Because it runs before authentication, it protects your auth middleware and backends from quota-exhaustion and credential-stuffing attacks without requiring a valid token.
+
+---
+
+## How It Differs from Token Rate Limiting
+
+| | IP Rate Limiting | Token Rate Limiting |
+|--|-----------------|---------------------|
+| **Runs** | Before authentication | After authentication |
+| **Keyed on** | Source IP (bucketed prefix) | Authenticated token ID |
+| **Auth required** | No | Yes |
+| **Config location** | Server config (global) | Policy document (per app/version/revision/endpoint) |
+| **Purpose** | Protect auth and backends from flood attacks | Enforce API quotas on legitimate clients |
+| **Response** | `429` + `{"message": "ip rate limit exceeded"}` | `429` + `{"message": "rate limit exceeded"}` |
+
+---
+
+## Configuration
+
+IP rate limiting is configured globally in the server configuration file (`config/default.toml`) or via environment variables. It applies to all traffic on the proxy port.
+
+```toml
+[server]
+per_ip_rate_limit_enabled = true
+per_ip_rate_limit_requests = 1000
+per_ip_rate_limit_window_secs = 60
+trusted_proxy_ips = ["10.0.0.0/8", "172.16.0.0/12"]
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `per_ip_rate_limit_enabled` | `false` | Enable/disable IP rate limiting |
+| `per_ip_rate_limit_requests` | `1000` | Maximum requests per IP prefix per window |
+| `per_ip_rate_limit_window_secs` | `60` | Window duration in seconds |
+| `trusted_proxy_ips` | `[]` | CIDR ranges of trusted upstream proxies for `X-Forwarded-For` trust |
+
+> **Default is disabled.** You must explicitly set `per_ip_rate_limit_enabled = true` to activate IP rate limiting.
+
+Via environment variables:
+
+```bash
+GATEWAY_SERVER__PER_IP_RATE_LIMIT_ENABLED=true
+GATEWAY_SERVER__PER_IP_RATE_LIMIT_REQUESTS=1000
+GATEWAY_SERVER__PER_IP_RATE_LIMIT_WINDOW_SECS=60
+GATEWAY_SERVER__TRUSTED_PROXY_IPS='["10.0.0.0/8"]'
+```
+
+---
+
+## Source IP Extraction
+
+The gateway determines the client's IP in the following priority order:
+
+1. **`X-Forwarded-For` header** — if the direct connection's IP (`TCP peer address`) is in `trusted_proxy_ips`, the gateway reads `X-Forwarded-For` and uses the rightmost IP that is not itself a trusted proxy.
+2. **TCP peer address** — if the direct connection's IP is not in `trusted_proxy_ips`, the raw connection IP is used.
+
+### Why trust matters
+
+Without trust validation, a malicious client could spoof `X-Forwarded-For: 1.2.3.4` and bypass rate limiting entirely. The gateway only reads `X-Forwarded-For` from sources it trusts (i.e., your load balancer or CDN).
+
+### Example with a load balancer
+
+```
+Client (203.0.113.42)
+    → Load balancer (10.0.1.5) adds X-Forwarded-For: 203.0.113.42
+    → Gateway (TCP peer = 10.0.1.5, trusted)
+
+Source IP extracted: 203.0.113.42
+```
+
+If the TCP peer `10.0.1.5` is in `trusted_proxy_ips`, the gateway trusts `X-Forwarded-For` and uses `203.0.113.42` as the source IP.
+
+---
+
+## IP Bucketing
+
+To prevent cardinality explosion in Redis keys and metrics, the gateway **buckets IP addresses** to a coarser prefix:
+
+| IP version | Bucket | Rationale |
+|------------|--------|-----------|
+| IPv4 | `/24` (e.g., `203.0.113.0/24`) | Limits key space; addresses within a /24 typically belong to the same customer or region |
+| IPv6 | `/48` (e.g., `2001:db8:0100::/48`) | ISPs typically allocate /48 per customer; /128 would allow trivial evasion |
+
+This means all addresses in `203.0.113.0–203.0.113.255` share the same rate limit counter. This is intentional: it reduces the effectiveness of IP rotation within a small range, which is a common evasion technique.
+
+---
+
+## Storage Backend
+
+| Backend | Behaviour |
+|---------|-----------|
+| **Redis** (when available) | Atomic counters using Redis `INCR` with expiry; counters are shared across all gateway instances in a replica set |
+| **In-process DashMap** (fallback) | Per-instance counters; not shared; effective only for single-instance deployments |
+
+When Redis is unavailable, the gateway falls back to in-process storage automatically. A log warning is emitted. In multi-replica deployments without Redis, each instance maintains its own counters — a client can bypass the limit by spreading requests across instances.
+
+### Redis key format
+
+```
+ip_rate_limit:<bucketed_ip_prefix>
+```
+
+Example:
+```
+ip_rate_limit:203.0.113.0/24
+```
+
+---
+
+## Rate Limit Response
+
+When the IP rate limit is exceeded, the gateway returns:
+
+**HTTP Status:** `429 Too Many Requests`
+
+**Body:**
+```json
+{
+  "status": 429,
+  "message": "ip rate limit exceeded",
+  "data": null
+}
+```
+
+No `Retry-After` header is added for IP rate limit violations (unlike token rate limiting). The window duration is not exposed to clients to avoid facilitating evasion timing.
+
+---
+
+## Metrics
+
+The following Prometheus metric is incremented each time an IP rate limit violation is detected:
+
+```
+gateway_ip_rate_limit_blocked_total{source_ip_prefix="203.0.113.0/24"}
+```
+
+Labels:
+- `source_ip_prefix` — the bucketed IP prefix that was blocked
+
+Use this metric to identify attackers, misconfigured clients, or benign clients that need their limits reviewed.
+
+---
+
+## Operational Recommendations
+
+### Setting the limit
+
+A reasonable starting point for public APIs:
+- `per_ip_rate_limit_requests = 500`
+- `per_ip_rate_limit_window_secs = 60`
+
+This allows legitimate browsers and mobile clients (which often share IPs via NAT) while blocking most automated scanners.
+
+For APIs where clients are known to be behind NAT (office networks, university campuses), increase the limit to accommodate multiple users sharing a /24:
+- `per_ip_rate_limit_requests = 2000`
+- `per_ip_rate_limit_window_secs = 60`
+
+### Monitoring
+
+Alert when `gateway_ip_rate_limit_blocked_total` is increasing rapidly for a prefix you do not recognise — this is a strong signal of an ongoing attack or scrape attempt.
+
+### Interaction with token rate limiting
+
+IP rate limiting and token rate limiting are independent. A request blocked by IP rate limiting never reaches the auth middleware and therefore never counts against any token's quota.
+
+```
+[IP Rate Limit]  ← blocked here (429)
+      │
+   (never reached)
+[Auth]
+[Token Rate Limit]
+```
+
+---
+
+## Example: Enable IP Rate Limiting in Docker
+
+```bash
+docker run -d \
+  --name gateway \
+  -p 8080:8080 \
+  -p 9090:9090 \
+  -e GATEWAY_SERVER__PER_IP_RATE_LIMIT_ENABLED=true \
+  -e GATEWAY_SERVER__PER_IP_RATE_LIMIT_REQUESTS=1000 \
+  -e GATEWAY_SERVER__PER_IP_RATE_LIMIT_WINDOW_SECS=60 \
+  -e GATEWAY_SERVER__TRUSTED_PROXY_IPS='["10.0.0.0/8"]' \
+  draskencloud/gateway
+```
+
+---
+
+## Related Topics
+
+- [Per-Token Rate Limiting](/nexus/policies/per-token-rate-limiting) — post-auth quota enforcement per authenticated token
+- [IP Filtering](/nexus/policies/ip-filtering) — CIDR allowlist/denylist enforcement (policy-level)
+- [Routing Overview](/nexus/routing/overview) — middleware stack execution order
+- [Policy Overview](/nexus/policies/overview) — policy field reference

@@ -1,0 +1,277 @@
+---
+title: "API Key Tokens"
+description: "Cryptographically random tokens, hashed at rest, Redis-cached for sub-millisecond hot-path validation."
+---
+
+API key tokens are the primary machine-to-machine credential for the Nexus API Gateway by Drasken Cloud. They are cryptographically random, stored as hashes, and cached in Redis for high-throughput validation with sub-millisecond overhead on the hot path.
+
+---
+
+## Table of Contents
+
+- [Token Format](#token-format)
+- [Storage Model](#storage-model)
+- [Request Header](#request-header)
+- [Validation Flow](#validation-flow)
+- [Cache Behaviour](#cache-behaviour)
+- [Revocation](#revocation)
+- [Token Metadata and Header Injection](#token-metadata-and-header-injection)
+- [Issuance](#issuance)
+- [Rotation](#rotation)
+- [Error Responses](#error-responses)
+
+---
+
+## Token Format
+
+Every API token is:
+
+- **48 bytes** of cryptographically random data (sourced from the OS CSPRNG via `rand::rngs::OsRng`).
+- **Base64url-encoded** (no padding, URL-safe alphabet) — producing a 64-character string.
+- **No prefix** — the raw token is the entire credential value. There is no `gw_`, `sk_`, or similar prefix.
+
+Example raw token value (64 characters):
+
+```
+pK3mXvQj8oLnR2sYwC5eFtBdNhA0uZGq7IyMxVD1JcP4kHWOlSbgE6TiUjFr
+```
+
+Tokens contain no encoded metadata. All metadata (app association, scopes, expiry) lives in the database, looked up by the hash of the token.
+
+---
+
+## Storage Model
+
+| What is stored | Where | Details |
+|---|---|---|
+| SHA-256 hash of the raw token | PostgreSQL `api_tokens` table | Used as the lookup key |
+| Token metadata (name, scopes, expiry, key-value map) | PostgreSQL `api_tokens` table | Retrieved on validation |
+| Cached metadata | Redis (`token:<hash>` key) | Avoids DB round-trips on repeated calls |
+| Raw token value | **Nowhere** | Returned once on issuance; never persisted |
+
+> **The raw token value is returned exactly once** — in the response body of the issuance API call. It cannot be retrieved again. Treat it like a password and store it in a secrets manager immediately.
+
+SHA-256 hashing is performed by the gateway on every incoming request before any lookup. The database and cache never see the raw token.
+
+---
+
+## Request Header
+
+Tokens are sent as HTTP Bearer tokens in the `Authorization` header:
+
+```http
+Authorization: Bearer pK3mXvQj8oLnR2sYwC5eFtBdNhA0uZGq7IyMxVD1JcP4kHWOlSbgE6TiUjFr
+```
+
+There is no alternative header or query parameter mechanism. If the `Authorization` header is absent or malformed, the gateway returns `401` immediately (unless `required = false`).
+
+---
+
+## Validation Flow
+
+For each request with a Bearer token where `auth_type = "api_key"`:
+
+```
+1. Extract token from "Authorization: Bearer <token>" header
+2. Compute SHA-256(token) → hash
+3. Look up Redis key "token:<hash>"
+   ├── Cache HIT  → deserialise cached metadata
+   │               → check revoked_at (reject if set)
+   │               → check expires_at (reject if < now)
+   │               → return AuthIdentity ✓
+   └── Cache MISS → query PostgreSQL WHERE token_hash = $1
+                   ├── Row not found → 401
+                   └── Row found     → check revoked_at (reject if set)
+                                     → check expires_at (reject if < now)
+                                     → write metadata to Redis (see Cache Behaviour)
+                                     → return AuthIdentity ✓
+```
+
+**On cache hit, no database call is made.** The entire validation path — including revocation and expiry checks — is served from Redis metadata.
+
+---
+
+## Cache Behaviour
+
+The Redis key for a token is:
+
+```
+token:<sha256_hex_of_raw_token>
+```
+
+The cached value is a serialised JSON object containing all token metadata needed for validation: `token_id`, `app_id`, `scopes`, `revoked_at`, `expires_at`, and the metadata map.
+
+**Cache TTL calculation:**
+
+```
+ttl = min(token_cache_ttl_secs, time_until_expiry_secs)
+```
+
+- `token_cache_ttl_secs` is configured via `GATEWAY_CACHE__TOKEN_CACHE_TTL_SECS` (default: `300`).
+- If a token has `expires_at = null` (no expiry), the TTL is exactly `token_cache_ttl_secs`.
+- If a token has `expires_at` in the future, the TTL is capped so the cache entry expires no later than the token itself.
+- **A token is never cached beyond its expiry time.** An expired token cannot produce a cache hit.
+
+**Revocation in cache:** The cached metadata includes `revoked_at`. When the gateway revokes a token, it:
+
+1. Sets `revoked_at` in PostgreSQL immediately.
+2. Deletes the Redis cache entry immediately.
+
+After revocation, the next request will get a cache miss and hit PostgreSQL, which now returns `revoked_at` set — resulting in `401`. This ensures revocation is effective within milliseconds.
+
+---
+
+## Revocation
+
+Revoking a token:
+
+```bash
+curl -X DELETE http://localhost:9090/api/v1/apps/{app_id}/tokens/{token_id} \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+- Sets `revoked_at = now()` in PostgreSQL.
+- **Immediately deletes the Redis cache entry** for that token's hash.
+- Any in-flight request that already passed validation is not affected; revocation takes effect for the next request.
+- Revoked tokens cannot be un-revoked. If you need to re-enable access, issue a new token.
+
+---
+
+## Token Metadata and Header Injection
+
+Every token can carry an arbitrary key-value metadata map. On successful authentication, **each metadata entry is injected as a request header to the backend**:
+
+```json
+{
+  "name": "customer-integration-token",
+  "scopes": ["proxy:read", "proxy:write"],
+  "metadata": {
+    "customer_id": "cust_7f3a9b",
+    "environment": "production",
+    "tier": "enterprise"
+  }
+}
+```
+
+The backend receives these as HTTP headers:
+
+```http
+X-Token-Meta-Customer-Id: cust_7f3a9b
+X-Token-Meta-Environment: production
+X-Token-Meta-Tier: enterprise
+```
+
+Header names are derived by prefixing `X-Token-Meta-` and converting the metadata key to Title-Case-Hyphen format.
+
+This lets you encode customer identity, tier, or routing context into the token itself, so the backend receives rich context without needing to call back to the gateway.
+
+**Security note:** Metadata headers are backend-internal. They are added on the gateway-to-backend leg and are never echoed back to the client.
+
+---
+
+## Issuance
+
+Issue a new token via the management API on port `9090`:
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps/{app_id}/tokens \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "my-service-token",
+    "scopes": ["proxy:read", "proxy:write"],
+    "expires_at": "2027-01-01T00:00:00Z",
+    "metadata": {
+      "customer_id": "cust_7f3a9b",
+      "tier": "enterprise"
+    }
+  }'
+```
+
+**Response (201 Created):**
+
+```json
+{
+  "status": 201,
+  "message": "created",
+  "data": {
+    "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "app_id": "1e4d6f8a-9b2c-4e7f-a012-3456789abcde",
+    "name": "my-service-token",
+    "token": "pK3mXvQj8oLnR2sYwC5eFtBdNhA0uZGq7IyMxVD1JcP4kHWOlSbgE6TiUjFr",
+    "scopes": ["proxy:read", "proxy:write"],
+    "expires_at": "2027-01-01T00:00:00Z",
+    "metadata": {
+      "customer_id": "cust_7f3a9b",
+      "tier": "enterprise"
+    },
+    "created_at": "2026-05-09T12:00:00Z"
+  }
+}
+```
+
+The `token` field in the response is the raw value. **This is the only time it appears.** Copy it to your secrets manager before closing this response.
+
+Subsequent `GET` calls to list or retrieve a token will never include the raw value.
+
+---
+
+## Rotation
+
+Token rotation issues a new token and atomically invalidates the old one. This enables zero-downtime credential rotation:
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps/{app_id}/tokens/{token_id}/rotate \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**What rotation does:**
+
+1. Creates a new token record with a fresh 48-byte random value, inheriting the `name`, `scopes`, `expires_at`, and `metadata` of the old token.
+2. Sets `revoked_at` on the old token record in PostgreSQL.
+3. Deletes the old token's Redis cache entry immediately.
+4. Returns the new raw token value (only this once).
+
+**Response (200 OK):**
+
+```json
+{
+  "status": 200,
+  "message": "rotated",
+  "data": {
+    "id": "9c1d4e7b-2f3a-4b5c-8d9e-0f1a2b3c4d5e",
+    "app_id": "1e4d6f8a-9b2c-4e7f-a012-3456789abcde",
+    "name": "my-service-token",
+    "token": "Rz9nWqXk4pMsT6vYbE1cFuLhN3jOaJH8IDyGC2eKsUiV0dtBXfwPgQmSlA7oZ",
+    "scopes": ["proxy:read", "proxy:write"],
+    "expires_at": "2027-01-01T00:00:00Z",
+    "metadata": {
+      "customer_id": "cust_7f3a9b",
+      "tier": "enterprise"
+    },
+    "rotated_from": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "created_at": "2026-05-09T13:00:00Z"
+  }
+}
+```
+
+The `rotated_from` field records the previous token ID for audit purposes.
+
+**Rotation strategy for zero downtime:**
+
+1. Call `/rotate` — receive the new raw token.
+2. Update your secrets manager with the new value.
+3. Roll out the new token to your services.
+4. The old token is already invalid; no second step needed.
+
+---
+
+## Error Responses
+
+| Scenario | HTTP Status | Body |
+|---|---|---|
+| Missing `Authorization` header | `401` | `{"status":401,"message":"missing authorization header","data":null}` |
+| Token not found in DB | `401` | `{"status":401,"message":"invalid token","data":null}` |
+| Token is revoked | `401` | `{"status":401,"message":"token revoked","data":null}` |
+| Token is expired | `401` | `{"status":401,"message":"token expired","data":null}` |
+| Insufficient scope | `403` | `{"status":403,"message":"insufficient scope","data":null}` |

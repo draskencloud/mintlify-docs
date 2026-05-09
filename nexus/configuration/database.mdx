@@ -1,0 +1,279 @@
+---
+title: "Database Configuration Reference"
+description: "SQLx-backed driver, connection string, pool sizing, retries, migrations, and Cargo feature flags."
+---
+
+The gateway uses [SQLx](https://github.com/launchbadder/sqlx) for all database operations. Storage backend support is compiled in at build time via Cargo feature flags. The default build includes only SQLite.
+
+## Quick Reference
+
+```toml
+# Top-level keys (not under a [section])
+db_driver             = "sqlite"
+database_url          = "sqlite://gateway.db?mode=rwc"
+auto_migrate          = true
+db_max_connections    = 10
+db_min_connections    = 2
+db_connect_timeout_secs = 5
+db_idle_timeout_secs  = 600
+db_connect_retries    = 3
+```
+
+## Key Reference
+
+### `db_driver`
+
+| | |
+|---|---|
+| Type | String |
+| Default | `sqlite` |
+| Env var | `GATEWAY_DB_DRIVER` |
+| Accepted values | `sqlite`, `postgres`, `mysql`, `cockroach` |
+| Runtime reload | No — requires restart |
+
+Selects the database driver. The driver must be compiled into the binary via the corresponding Cargo feature flag. Selecting a driver that was not compiled in returns an error at startup.
+
+| Driver value | Cargo feature | Notes |
+|---|---|---|
+| `sqlite` | `store-sqlite` (default) | Zero external dependencies; single-writer; not suitable for multi-instance |
+| `postgres` | `store-postgres` | Full multi-instance support |
+| `mysql` | `store-mysql` | Full multi-instance support |
+| `cockroach` | `store-cockroach` (alias for `store-postgres`) | CockroachDB uses the Postgres wire protocol |
+
+---
+
+### `database_url`
+
+| | |
+|---|---|
+| Type | String |
+| Default | `sqlite://gateway.db?mode=rwc` |
+| Env var | `GATEWAY_DATABASE_URL` |
+| Runtime reload | No — requires restart |
+
+Connection string for the selected database. The format is driver-specific.
+
+#### Connection String Examples
+
+**SQLite**
+
+```toml
+# Relative path — file created in working directory
+database_url = "sqlite://gateway.db?mode=rwc"
+
+# Absolute path
+database_url = "sqlite:///var/lib/gateway/gateway.db?mode=rwc"
+
+# In-memory (development only — data lost on restart)
+database_url = "sqlite://:memory:"
+```
+
+The `?mode=rwc` query parameter creates the file if it does not exist. Omit it only if the file already exists.
+
+**PostgreSQL**
+
+```toml
+database_url = "postgres://user:password@localhost:5432/gateway"
+
+# With SSL
+database_url = "postgres://user:password@db.example.com:5432/gateway?sslmode=require"
+
+# With connection pool sizing in the URL (SQLx ignores pool params in the URL; use config keys)
+database_url = "postgres://user:password@localhost/gateway"
+```
+
+**MySQL / MariaDB**
+
+```toml
+database_url = "mysql://user:password@localhost:3306/gateway"
+```
+
+**CockroachDB**
+
+```toml
+# CockroachDB accepts the Postgres wire protocol
+database_url = "postgres://root@localhost:26257/gateway?sslmode=disable"
+
+# With TLS (recommended for production CockroachDB)
+database_url = "postgres://user:password@cockroachdb.example.com:26257/gateway?sslmode=require"
+```
+
+---
+
+### `auto_migrate`
+
+| | |
+|---|---|
+| Type | Boolean |
+| Default | `true` |
+| Env var | `GATEWAY_AUTO_MIGRATE` |
+| Runtime reload | No |
+
+When `true`, the gateway runs embedded SQL migrations at startup using SQLx's built-in migration runner. Migrations are idempotent — already-applied migrations are skipped. The migration table (`_sqlx_migrations`) is created automatically on first run.
+
+In multi-instance deployments, all instances may attempt to run migrations simultaneously on startup. SQLx uses an advisory lock in Postgres to ensure only one instance applies any given migration at a time; the others wait and then proceed once the lock is released.
+
+Set to `false` if you manage migrations externally (e.g., via a CI/CD job that runs `sqlx migrate run` before deploying).
+
+---
+
+### `db_max_connections`
+
+| | |
+|---|---|
+| Type | Integer |
+| Default | `10` |
+| Env var | `GATEWAY_DB_MAX_CONNECTIONS` |
+| Runtime reload | No |
+
+Maximum number of connections in the connection pool. This setting is **ignored for SQLite**, which is intentionally limited to a single connection to avoid write contention.
+
+For Postgres and MySQL, tune this based on the number of gateway instances and the database's `max_connections` setting:
+
+```
+db_max_connections_per_instance × num_instances < db_max_connections
+```
+
+---
+
+### `db_min_connections`
+
+| | |
+|---|---|
+| Type | Integer |
+| Default | `2` |
+| Env var | `GATEWAY_DB_MIN_CONNECTIONS` |
+| Runtime reload | No |
+
+Minimum number of connections to maintain in the pool (warm connections). The pool creates this many connections at startup and keeps them alive. Ignored for SQLite.
+
+---
+
+### `db_connect_timeout_secs`
+
+| | |
+|---|---|
+| Type | Integer (seconds) |
+| Default | `5` |
+| Env var | `GATEWAY_DB_CONNECT_TIMEOUT_SECS` |
+| Runtime reload | No |
+
+Timeout for acquiring a connection from the pool (i.e., waiting for a connection to become available or for a new connection to be established). If a request waits longer than this, it fails with a database-unavailable error.
+
+---
+
+### `db_idle_timeout_secs`
+
+| | |
+|---|---|
+| Type | Integer (seconds) |
+| Default | `600` (10 minutes) |
+| Env var | `GATEWAY_DB_IDLE_TIMEOUT_SECS` |
+| Runtime reload | No |
+
+How long an idle connection can remain in the pool before being closed. Keeps the pool from holding connections that the database has already timed out. Ignored for SQLite.
+
+---
+
+### `db_connect_retries`
+
+| | |
+|---|---|
+| Type | Integer |
+| Default | `3` |
+| Env var | `GATEWAY_DB_CONNECT_RETRIES` |
+| Runtime reload | No |
+
+Number of retry attempts when the initial database connection fails at startup. Retries use exponential backoff starting at 2 seconds (2s, 4s, 8s, …). After all retries are exhausted without a successful connection the gateway exits with a non-zero code.
+
+This setting helps the gateway survive transient database unavailability during rolling deployments.
+
+---
+
+## Cargo Feature Flags
+
+The driver must be compiled into the binary. The default build includes only SQLite.
+
+| Feature flag | Driver | Command |
+|---|---|---|
+| `store-sqlite` | SQLite | Included by default — `cargo build --release` |
+| `store-postgres` | PostgreSQL | `cargo build --release --features store-postgres` |
+| `store-mysql` | MySQL / MariaDB | `cargo build --release --features store-mysql` |
+| `store-cockroach` | CockroachDB | `cargo build --release --features store-cockroach` |
+
+Multiple drivers can be compiled into the same binary:
+
+```bash
+cargo build --release --features store-sqlite,store-postgres,store-mysql
+```
+
+The driver used at runtime is determined by `db_driver`.
+
+---
+
+## Migrations
+
+Migrations are embedded in the binary under `migrations/`. They are plain SQL files numbered sequentially and tested against all supported drivers.
+
+Run migrations manually (without starting the gateway):
+
+```bash
+# Requires DATABASE_URL set in the environment
+sqlx migrate run --database-url "$GATEWAY_DATABASE_URL"
+```
+
+Revert the last migration:
+
+```bash
+sqlx migrate revert --database-url "$GATEWAY_DATABASE_URL"
+```
+
+Check current migration status:
+
+```bash
+sqlx migrate info --database-url "$GATEWAY_DATABASE_URL"
+```
+
+---
+
+## Pool Metrics
+
+The gateway exports Prometheus metrics for the database connection pool:
+
+| Metric | Type | Description |
+|---|---|---|
+| `gateway_store_db_pool_size` | Gauge | Current total connections in the pool (idle + active) |
+| `gateway_store_db_pool_idle` | Gauge | Current number of idle connections in the pool |
+
+Query pool utilisation:
+
+```promql
+# Pool utilisation percentage
+(gateway_store_db_pool_size - gateway_store_db_pool_idle) / gateway_store_db_pool_size * 100
+```
+
+High sustained utilisation (>80%) indicates the pool size should be increased.
+
+---
+
+## SQLite Considerations
+
+SQLite is the default and requires no external services. It is well-suited for:
+
+- Single-instance production deployments with low-to-moderate write volume
+- Development and testing
+- Deployments where operational simplicity is the priority
+
+**Limitations:**
+- Single writer — concurrent writes are serialized at the database level
+- Cannot be shared across multiple process instances (file locking)
+- Not suitable for [horizontal scaling](/nexus/deployment/horizontal-scaling)
+- The pool size is forced to 1 regardless of `db_max_connections`
+
+**SQLite in Docker:** Mount `/data` to persist the database across container restarts:
+
+```bash
+docker run -v ./data:/data \
+  -e GATEWAY_DATABASE_URL="sqlite:///data/gateway.db?mode=rwc" \
+  draskencloud/gateway
+```

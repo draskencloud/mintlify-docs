@@ -1,0 +1,252 @@
+---
+title: "Core Concepts"
+description: "The App → Version → Revision → Endpoint hierarchy, policy inheritance, routing modes, and tokens."
+---
+
+Nexus API Gateway by Drasken Cloud organises every proxied API using a four-level hierarchy: **App → Version → Revision → Endpoint**. Understanding this model is the foundation for everything else in the gateway.
+
+---
+
+## The Hierarchy at a Glance
+
+```
+App  (slug: "payments", gateway_path: "/payments", routing_mode: pass_through)
+│
+├── Version  (version: "v1", gateway_path: "/payments/v1", status: active)
+│   ├── Revision  (revision: "rev-1", backend_host: "payments-v1.internal", is_current: true)
+│   │   ├── Endpoint  GET /orders      → backend_path: /v1/orders
+│   │   ├── Endpoint  POST /orders     → backend_path: /v1/orders
+│   │   └── Endpoint  GET /orders/{id} → backend_path: /v1/orders/{id}
+│   └── Revision  (revision: "rev-2", backend_host: "payments-v2.internal", is_current: false)
+│
+└── Version  (version: "v2", gateway_path: "/payments/v2", status: active)
+    └── Revision  (revision: "rev-1", backend_host: "payments-v2.internal", is_current: true)
+```
+
+Each level inherits policy from its parent and can override individual fields. The gateway resolves the effective policy at request time by merging from the top down.
+
+---
+
+## App
+
+An **App** is the top-level API product. It defines the base gateway path and the routing strategy. Every version, revision, endpoint, and API token belongs to an App.
+
+### Fields
+
+| Field | Type | Immutable | Description |
+|-------|------|-----------|-------------|
+| `id` | UUID | — | System-generated primary key |
+| `name` | string | No | Human-readable display name |
+| `slug` | string | **Yes** | URL-safe unique identifier; used in logs and metrics labels |
+| `gateway_path` | string | **Yes** | Base path prefix on the proxy (e.g. `/payments`) |
+| `routing_mode` | string | **Yes** | `pass_through` or `managed_endpoint` |
+| `default_policy` | object | No | App-level default policy; inherited by all children |
+| `is_active` | boolean | No | Soft-delete flag; inactive apps return `503` to all traffic |
+
+### Immutability rules
+
+`gateway_path` and `routing_mode` cannot change after creation.
+
+- Changing `gateway_path` would break all client integrations and invalidate every cached route.
+- Changing `routing_mode` would change how the proxy interprets requests — from forwarding everything to requiring explicit endpoint registration — without clients knowing.
+
+If you need to change either field, create a new App and migrate traffic to it.
+
+### App deactivation
+
+Setting `is_active = false` via `PATCH /api/v1/apps/:id` immediately stops all traffic to that app. The proxy returns `503 Service Unavailable`. The app and all its data (versions, revisions, tokens) remain in place and can be reactivated by setting `is_active = true`.
+
+---
+
+## Version
+
+A **Version** is the public API contract version visible to your clients. Versions carry the public path segment clients use (e.g. `/payments/v1`). Internal changes — switching backends, updating policies, rolling back — happen inside Revisions without changing the Version path.
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | System-generated |
+| `app_id` | UUID | Parent App |
+| `version` | string | Public label, unique per App (e.g. `v1`, `v2`, `2026-01`) |
+| `gateway_path` | string | Full public path (e.g. `/payments/v1`); globally unique |
+| `status` | string | `active`, `deprecated`, or `retired` |
+| `default_policy` | object | Version-level policy; merges with App policy |
+
+### Version status lifecycle
+
+| Status | Traffic behaviour | Transition |
+|--------|-----------------|-----------|
+| `active` | All requests served normally | → `deprecated` allowed |
+| `deprecated` | Requests served; `Deprecation: true` response header added | → `retired` allowed |
+| `retired` | All requests rejected with `404 Not Found` | No transition back to `active` — create a new version instead |
+
+The `active → deprecated` transition is non-breaking: clients continue to work. The `Deprecation` header is a signal to client developers that migration is needed. The `deprecated → retired` transition immediately stops traffic; all revision caches under the version are invalidated.
+
+---
+
+## Revision
+
+A **Revision** is an internal deployment iteration of a Version. It owns the backend configuration: where to send requests. Clients never see revision identifiers; revisions are an implementation detail.
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | System-generated |
+| `app_version_id` | UUID | Parent Version |
+| `revision` | string | Internal label, unique per Version (e.g. `rev-1`, `rev-2`) |
+| `backend_scheme` | string | `http` or `https` |
+| `backend_host` | string | Backend hostname (k8s Service, consul VIP, LB address) |
+| `backend_port` | integer | Backend port |
+| `backend_base_path` | string | Path prepended to forwarded requests (default: `/`) |
+| `strip_gateway_path` | boolean | Strip the matched gateway path before forwarding (default: `true`) |
+| `default_policy` | object | Revision-level policy; merges with Version policy |
+| `traffic_weight` | integer | Proportion of traffic this revision receives (0–100) |
+| `is_current` | boolean | Exactly one revision per version is current; it is the stable traffic target |
+| `health_check_path` | string | (Optional) HTTP path the health prober requests to determine backend health |
+
+### URL rewriting
+
+The gateway constructs the backend URL from the revision's backend fields:
+
+```
+Incoming:    GET /payments/v1/orders/123
+gateway_path: /payments/v1
+strip_gateway_path: true
+backend_host: payments.internal
+backend_port: 443
+backend_scheme: https
+backend_base_path: /api/v1
+
+Forwarded:   GET https://payments.internal:443/api/v1/orders/123
+                                               ───────── ──────────────
+                                               base_path  remaining path
+                                               (prepended) (gateway path stripped)
+```
+
+### `is_current`
+
+Only one revision per Version can have `is_current = true` at any time. Activating a revision (via `POST .../revisions/:id/activate`) sets `is_current = true` on that revision and clears it from the previously active one. The previously active revision remains registered and available for rollback.
+
+### Backend addressing
+
+In v1, `backend_host` is a **single stable address** — a Kubernetes Service DNS name, a Consul VIP, an HAProxy virtual IP, or a Docker Compose service name. Instance-level load balancing across multiple backend pods or containers is delegated to the infrastructure layer below the gateway.
+
+---
+
+## Endpoint
+
+An **Endpoint** is an explicit method + path combination registered under a Revision. Endpoints are only used when the App's `routing_mode` is `managed_endpoint`.
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | System-generated |
+| `app_revision_id` | UUID | Parent Revision |
+| `method` | string | HTTP method (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, etc.) |
+| `path` | string | Path relative to the Version's gateway path (e.g. `/orders`) |
+| `backend_path` | string | (Optional) Alternative path sent to the backend; defaults to `path` |
+| `policy_override` | object | Endpoint-specific policy merged on top of Revision policy |
+| `is_active` | boolean | Inactive endpoints are excluded from matching |
+
+### Behaviour in managed_endpoint mode
+
+- A request to a path with no matching Endpoint returns `404 Not Found`.
+- A request to a registered path with an unregistered method returns `405 Method Not Allowed`.
+- `backend_path` replaces the path when forwarding; the gateway does not append the original path.
+- `policy_override` is merged on top of the effective Revision policy, so an Endpoint can tighten or relax individual policy fields without replacing the entire policy.
+
+---
+
+## Policy
+
+A **Policy** is a JSONB document that configures the middleware behaviour for an App, Version, Revision, or Endpoint. Policies are **inherited down the hierarchy** and merged field-by-field: a child's explicit fields override the parent's; absent fields inherit from the parent.
+
+### Policy fields
+
+| Field | Description |
+|-------|-------------|
+| `auth` | Authentication requirements: `auth_type` (`api_key`, `jwt`, `basic`, `none`), `required`, JWT-specific fields (`jwks_url`, `issuer`, `audience`, `required_claims`) |
+| `rate_limit` | Per-token rate limiting: `enabled`, `requests`, `window_seconds` |
+| `allowed_methods` | Array of permitted HTTP methods; requests with other methods receive `405` |
+| `required_scopes` | Array of token scope strings that must be present for access |
+| `headers` | Required request headers; missing headers receive `400` |
+| `cors` | CORS configuration: `allowed_origins`, `allowed_methods`, `allowed_headers`, `max_age` |
+| `ip_filter` | IP allow/deny list: `mode` (`allow` or `deny`), `cidrs` (array of CIDR strings) |
+| `path_denylist` | Array of path prefixes (pass_through mode only); matching paths receive `403` |
+| `cache` | Response cache override: `enabled`, `ttl_seconds`, `cacheable_methods` |
+
+### Policy example
+
+```json
+{
+  "auth": {
+    "auth_type": "jwt",
+    "required": true,
+    "jwks_url": "https://idp.example.com/.well-known/jwks.json",
+    "issuer": "https://idp.example.com",
+    "audience": "payments-api"
+  },
+  "rate_limit": {
+    "enabled": true,
+    "requests": 500,
+    "window_seconds": 60
+  },
+  "allowed_methods": ["GET", "POST", "PUT", "DELETE"],
+  "cors": {
+    "allowed_origins": ["https://app.example.com"],
+    "allowed_methods": ["GET", "POST"],
+    "allowed_headers": ["Authorization", "Content-Type"]
+  },
+  "ip_filter": {
+    "mode": "allow",
+    "cidrs": ["10.0.0.0/8", "172.16.0.0/12"]
+  },
+  "cache": {
+    "enabled": false
+  }
+}
+```
+
+Policies are set in the `default_policy` field of Apps, Versions, and Revisions, and in `policy_override` on Endpoints. See [Policy Inheritance](/nexus/concepts/policy-inheritance) for the merge rules.
+
+---
+
+## Routing Modes
+
+The `routing_mode` on an App controls how the proxy engine matches incoming requests:
+
+| Mode | Behaviour | Best for |
+|------|-----------|---------|
+| `pass_through` | All paths forwarded to the backend; only `path_denylist` enforced | Backends with their own routing, gradual migration |
+| `managed_endpoint` | Only registered method + path combinations accepted; others → `404`/`405` | Strict API contracts, per-endpoint policy overrides |
+
+`routing_mode` is immutable after App creation. See [Routing Modes](/nexus/concepts/routing-modes) for a full comparison.
+
+---
+
+## API Tokens
+
+API tokens are credentials scoped to an App. The raw token value is returned once at creation and never stored — the gateway stores only a SHA-256 hash for constant-time comparison on each request.
+
+Token lifecycle:
+1. **Create** — `POST /api/v1/apps/:app_id/tokens`; receive raw token value once.
+2. **Validate** — presented as `Authorization: Bearer <token>` on proxy requests; validated against RuntimeStore → Redis → database.
+3. **Revoke** — `DELETE /api/v1/apps/:app_id/tokens/:token_id`; invalidates the Redis cache entry immediately.
+
+Tokens support optional `expires_at` and `scopes` (e.g. `["proxy:read", "proxy:write"]`). Required scopes can be enforced at the Revision or Endpoint policy level using `required_scopes`.
+
+---
+
+## Summary
+
+| Concept | Owns | Immutable fields | Notes |
+|---------|------|-----------------|-------|
+| App | Routing mode, gateway base path, top-level policy | `gateway_path`, `routing_mode` | Parent of everything |
+| Version | Public API contract, version path, version status | — | Clients use version path directly |
+| Revision | Backend config, traffic weight, is_current flag | — | One is_current per version at a time |
+| Endpoint | Method + path registration, backend path override | — | managed_endpoint mode only |
+| Policy | Auth, rate limit, CORS, IP filter, cache, headers | — | Inherits + overrides through hierarchy |
+| Token | Auth credential | — | Hash stored; raw value returned once |

@@ -1,66 +1,275 @@
 ---
-title: Metrics
-description: Prometheus-compatible metrics exposed by Nexus.
+title: "Prometheus Metrics Reference"
+description: "Always-public /metrics endpoint exposing request, auth, backend, cache, pipeline, and license metrics."
 ---
 
-Nexus exposes Prometheus metrics at `/metrics` on the management port (`9090`).
+Nexus API Gateway by Drasken Cloud exposes a Prometheus-compatible metrics endpoint on the management port.
 
-## Scrape Endpoint
+**Endpoint:** `GET http://<host>:9090/metrics`
+**Auth:** None required (always public, even when `GATEWAY_SERVER__ADMIN_TOKEN` is set)
+**Content-Type:** `text/plain; version=0.0.4` (OpenMetrics-compatible)
+
+Scrape this endpoint from your Prometheus server or any compatible collector (Grafana Agent, VictoriaMetrics, Datadog Agent with OpenMetrics).
+
+---
+
+## Request / Response
+
+These metrics cover all traffic through the **proxy port (8080)**.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `gateway_requests_total` | Counter | `method`, `route`, `status` | Total HTTP requests handled by the proxy, partitioned by HTTP method, matched route slug, and response status code |
+| `gateway_request_duration_seconds` | Histogram | `method`, `route` | End-to-end request latency from connection accept to last byte sent. Buckets: 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0 seconds |
+| `gateway_active_connections` | Gauge | — | Current number of in-flight proxy connections |
+
+**Label details:**
+- `route` — the app's `slug` value (e.g., `my-api`); `unknown` when no route is matched
+- `status` — the HTTP response status code as a string (e.g., `"200"`, `"502"`)
+
+**Example scrape output:**
 
 ```
-GET http://localhost:9090/metrics
+# HELP gateway_requests_total Total HTTP requests handled by the proxy
+# TYPE gateway_requests_total counter
+gateway_requests_total{method="GET",route="my-api",status="200"} 12345
+gateway_requests_total{method="POST",route="my-api",status="429"} 7
+
+# HELP gateway_request_duration_seconds End-to-end request latency
+# TYPE gateway_request_duration_seconds histogram
+gateway_request_duration_seconds_bucket{method="GET",route="my-api",le="0.05"} 10200
+gateway_request_duration_seconds_bucket{method="GET",route="my-api",le="0.1"} 11900
+gateway_request_duration_seconds_bucket{method="GET",route="my-api",le="+Inf"} 12345
+gateway_request_duration_seconds_sum{method="GET",route="my-api"} 432.1
+gateway_request_duration_seconds_count{method="GET",route="my-api"} 12345
+```
+
+---
+
+## Authentication
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `gateway_auth_failures_total` | Counter | `reason` | Authentication failures on the proxy port |
+
+**`reason` values:**
+
+| Value | Meaning |
+|---|---|
+| `unauthorized` | Missing or malformed `Authorization` header; token not found |
+| `forbidden` | Token valid but scope does not permit the requested operation |
+| `error` | Internal error during token lookup or JWT validation |
+
+---
+
+## Backend & Circuit Breaker
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `gateway_backend_latency_seconds` | Histogram | `app_id`, `revision_id` | Round-trip latency to the upstream backend (excludes gateway overhead) |
+| `gateway_backend_health` | Gauge | `app_id`, `revision_id` | Current health state of a revision: `1` = healthy, `0` = unhealthy |
+| `gateway_request_retries_total` | Counter | `revision_id` | Number of upstream request retries (not including the initial attempt) |
+
+**Usage:** Alert on `gateway_backend_health == 0` for critical revisions. Use `gateway_backend_latency_seconds` to detect upstream degradation before it causes timeouts.
+
+---
+
+## Rate Limiting
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `gateway_rate_limit_decisions_total` | Counter | `algorithm`, `decision` | Rate-limiter decisions, partitioned by algorithm and outcome |
+| `gateway_ip_rate_limit_blocked_total` | Counter | `source_ip_prefix` | Per-IP blocks from the IP rate limiter; `source_ip_prefix` is the /24 (IPv4) or /48 (IPv6) prefix |
+
+**`algorithm` values:** `fixed_window`, `sliding_window`, `token_bucket`, `leaky_bucket`
+
+**`decision` values:**
+
+| Value | Meaning |
+|---|---|
+| `allowed` | Request passed the rate limiter |
+| `blocked` | Request rejected with HTTP 429 |
+
+---
+
+## Policy
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `gateway_policy_denials_total` | Counter | `reason` | Requests rejected by the policy engine |
+
+**`reason` values:**
+
+| Value | Meaning |
+|---|---|
+| `method` | HTTP method not in the allowed methods list |
+| `scope` | Token scope does not cover the requested operation |
+| `path` | Path blocked by policy path filter |
+| `ip_filter` | Source IP not in the allowlist / in the denylist |
+| `header_validation` | Required header missing or failed validation |
+
+---
+
+## Cache
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `gateway_cache_ops_total` | Counter | `region`, `backend`, `op`, `result` | Cache operations by region, backend, operation type, and outcome |
+| `gateway_cache_evictions_total` | Counter | `backend`, `reason` | Cache entries evicted from the in-memory cache |
+| `gateway_cache_memory_bytes` | Gauge | — | Current size of the in-memory cache in bytes |
+
+**`region` values:** `tokens`, `revisions`, `endpoints`, `basic_auth`, `responses`
+
+**`backend` values:** `memory`, `redis`, `memcached`
+
+**`op` values:** `get`, `set`, `delete`
+
+**`result` values:**
+
+| Value | Meaning |
+|---|---|
+| `hit` | Cache hit on a `get` operation |
+| `miss` | Cache miss on a `get` operation |
+| `ok` | Successful `set` or `delete` |
+| `error` | Operation failed (e.g., Redis connection error) |
+
+**`reason` values for evictions:** `capacity`, `ttl_expired`, `explicit`
+
+---
+
+## Slow Requests
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `gateway_slow_requests_total` | Counter | `app_slug` | Requests that exceeded `logging.slow_request_threshold_ms` (default: 1000 ms) |
+
+Configure the threshold via `GATEWAY_LOGGING__SLOW_REQUEST_THRESHOLD_MS`. Set to `0` to disable slow-request tracking. See [pipelines/logging](/nexus/pipelines/logging) for related log forwarding.
+
+---
+
+## Analytics Pipeline
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `gateway_analytics_events_total` | Counter | `event_type`, `forwarder` | Events successfully sent to a forwarder |
+| `gateway_analytics_dropped_total` | Counter | `reason` | Events dropped due to buffer overflow or delivery failure |
+| `gateway_analytics_buffer_size` | Gauge | `forwarder` | Current number of events waiting in the forwarder's buffer |
+| `gateway_analytics_flush_duration_seconds` | Histogram | `forwarder` | Time taken to flush a batch to the forwarder |
+| `gateway_analytics_delivery_failures_total` | Counter | `forwarder`, `reason` | Delivery attempts that failed (before retry exhaustion) |
+
+**`event_type` values:** `access`, `security`, `audit`
+
+**`reason` values for dropped:** `channel` (buffer full), `dead_letter` (retry exhaustion)
+
+---
+
+## Logging Pipeline
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `gateway_log_records_total` | Counter | `log_type`, `forwarder` | Log records successfully sent to a forwarder |
+| `gateway_log_dropped_total` | Counter | `reason` | Log records dropped due to buffer overflow or delivery failure |
+| `gateway_log_buffer_size` | Gauge | `forwarder` | Current number of records waiting in the forwarder's buffer |
+| `gateway_log_flush_duration_seconds` | Histogram | `forwarder` | Time taken to flush a batch |
+| `gateway_log_delivery_failures_total` | Counter | `forwarder`, `reason` | Delivery attempts that failed (before retry exhaustion) |
+
+**`log_type` values:** `access`, `audit`, `error`, `security`, `policy`, `health`, `cache`, `slow_request`
+
+---
+
+## Audit Pipeline
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `gateway_audit_delivery_failures_total` | Counter | `forwarder`, `reason` | Delivery failures from the audit pipeline (back-pressured; never drops) |
+| `gateway_audit_buffer_size` | Gauge | `forwarder` | Current number of audit events in the pipeline buffer |
+
+> The audit pipeline uses a **Block** overflow policy — it never drops events. A rising `gateway_audit_buffer_size` indicates the audit forwarder cannot keep up with inbound traffic. If this persists, expect request latency to increase as back-pressure propagates.
+
+---
+
+## License & Feature Gates
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `gateway_license_tier_info` | Gauge | `tier` | Always `1`; the `tier` label encodes the active license tier (`community`, `pro`, `enterprise`) |
+| `gateway_feature_gate_blocks_total` | Counter | `feature`, `tier` | Requests blocked because the feature requires a higher tier |
+| `gateway_feature_gate_allows_total` | Counter | `feature`, `tier` | Requests allowed through a feature gate |
+
+Use `gateway_license_tier_info` in dashboards to annotate which tier is active. Alert on `gateway_feature_gate_blocks_total > 0` if a required feature is being gated.
+
+---
+
+## Infrastructure
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `gateway_cache_backend_up` | Gauge | `backend` | `1` if the cache backend is reachable, `0` if not |
+| `gateway_store_db_pool_size` | Gauge | — | Total connections in the database pool |
+| `gateway_store_db_pool_idle` | Gauge | — | Idle (available) connections in the database pool |
+| `gateway_cache_redis_pool_size` | Gauge | — | Total connections in the Redis pool |
+| `gateway_cache_redis_pool_available` | Gauge | — | Available connections in the Redis pool |
+
+**`backend` values:** `memory`, `redis`, `memcached`
+
+Alert on `gateway_cache_backend_up{backend="redis"} == 0` to detect Redis outages before they impact caching.
+
+---
+
+## Prometheus Scrape Configuration
+
+```yaml
+scrape_configs:
+  - job_name: draskencloud_gateway
+    static_configs:
+      - targets:
+          - "gateway-host:9090"
+    metrics_path: /metrics
+    scrape_interval: 15s
+    scrape_timeout: 10s
 ```
 
 No authentication is required for the metrics endpoint.
 
-## Prometheus Configuration
+---
 
-Add Nexus as a scrape target:
-
-```yaml
-scrape_configs:
-  - job_name: nexus
-    static_configs:
-      - targets: ["nexus:9090"]
-```
-
-In Kubernetes, use a `ServiceMonitor` if you have the Prometheus Operator:
+## Recommended Alerts
 
 ```yaml
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: nexus
-  namespace: drasken-infra-dev
-spec:
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: nexus
-  endpoints:
-    - port: mgmt
-      path: /metrics
-      interval: 30s
+groups:
+  - name: gateway
+    rules:
+      - alert: GatewayBackendDown
+        expr: gateway_backend_health == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backend revision {{ $labels.revision_id }} is unhealthy"
+
+      - alert: GatewayHighErrorRate
+        expr: |
+          rate(gateway_requests_total{status=~"5.."}[5m]) /
+          rate(gateway_requests_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Error rate above 5% on route {{ $labels.route }}"
+
+      - alert: GatewayAuditBufferFull
+        expr: gateway_audit_buffer_size > 8000
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Audit pipeline buffer at {{ $value }} / 10000 — back-pressure imminent"
+
+      - alert: GatewayAuthFailures
+        expr: rate(gateway_auth_failures_total[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High auth failure rate: {{ $value | humanize }}/s"
 ```
-
-## Key Metrics
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `gateway_requests_total` | Counter | Total proxy requests by app, version, status |
-| `gateway_request_duration_seconds` | Histogram | Request latency distribution |
-| `gateway_upstream_errors_total` | Counter | Backend errors by revision |
-| `gateway_circuit_breaker_state` | Gauge | Circuit state per revision (0=closed, 1=open, 2=half-open) |
-| `gateway_cache_hits_total` | Counter | Cache hit count |
-| `gateway_cache_misses_total` | Counter | Cache miss count |
-| `gateway_rate_limit_hits_total` | Counter | Rate limit rejections |
-| `gateway_auth_failures_total` | Counter | Auth failures by type |
-| `gateway_uptime_seconds` | Gauge | Process uptime |
-
-## Grafana Dashboard
-
-Import the dashboard using the Prometheus datasource. Key panels to build:
-
-- Request rate by app (`rate(gateway_requests_total[5m])`)
-- P99 latency (`histogram_quantile(0.99, gateway_request_duration_seconds_bucket)`)
-- Error rate (`rate(gateway_upstream_errors_total[5m])`)
-- Circuit breaker state (`gateway_circuit_breaker_state`)

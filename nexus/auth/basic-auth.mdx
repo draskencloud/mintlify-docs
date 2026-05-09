@@ -1,0 +1,250 @@
+---
+title: "HTTP Basic Authentication"
+description: "Username/password credentials with bcrypt hashing and constant-time comparison for legacy clients."
+---
+
+The Nexus API Gateway by Drasken Cloud supports HTTP Basic Authentication for scenarios where clients cannot present Bearer tokens or JWTs. Credentials are stored as bcrypt hashes and validated with constant-time comparison to prevent timing attacks.
+
+---
+
+## Table of Contents
+
+- [When to Use Basic Auth](#when-to-use-basic-auth)
+- [Request Header](#request-header)
+- [Credential Management](#credential-management)
+  - [Create a Credential](#create-a-credential)
+  - [List Credentials](#list-credentials)
+  - [Delete a Credential](#delete-a-credential)
+- [Password Storage](#password-storage)
+- [Validation Flow](#validation-flow)
+- [Cache Behaviour](#cache-behaviour)
+- [Scopes](#scopes)
+- [Error Responses](#error-responses)
+- [Security Considerations](#security-considerations)
+
+---
+
+## When to Use Basic Auth
+
+| Use case | Recommendation |
+|---|---|
+| Legacy clients that only support HTTP Basic Auth | Basic auth is appropriate |
+| Service-to-service where token management is overhead | Basic auth is acceptable |
+| Browser clients using `XMLHttpRequest` or `fetch` | Basic auth is acceptable if HTTPS is enforced |
+| New integrations with modern HTTP clients | Prefer API key tokens |
+| User-facing applications with federation or SSO | Prefer JWT |
+
+Basic auth is supported for compatibility. For new integrations, API key tokens offer more flexibility (metadata injection, rotation, per-token scopes) with a similar operational model.
+
+---
+
+## Request Header
+
+Basic auth credentials are transmitted using the standard `Authorization: Basic` header. The value is `base64(username:password)` using the standard (non-URL-safe) base64 alphabet with padding:
+
+```http
+Authorization: Basic dXNlcm5hbWU6cGFzc3dvcmQ=
+```
+
+The gateway decodes the header, splits on the first `:`, and treats the left side as the username and the right side as the password.
+
+**On authentication failure**, the gateway returns:
+
+```http
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Basic realm="gateway"
+Content-Type: application/json
+
+{"status":401,"message":"invalid credentials","data":null}
+```
+
+The `WWW-Authenticate` header triggers the browser's built-in credential prompt in browser-based environments.
+
+---
+
+## Credential Management
+
+Credentials are managed via the management API on port `9090`. Each credential is scoped to a specific app.
+
+### Create a Credential
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps/{app_id}/basic-credentials \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "my-service",
+    "password": "correct-horse-battery-staple",
+    "scopes": ["proxy:read", "proxy:write"]
+  }'
+```
+
+**Response (201 Created):**
+
+```json
+{
+  "status": 201,
+  "message": "created",
+  "data": {
+    "id": "7a2e1f9c-4d3b-5c6a-8e7f-0a1b2c3d4e5f",
+    "app_id": "1e4d6f8a-9b2c-4e7f-a012-3456789abcde",
+    "username": "my-service",
+    "scopes": ["proxy:read", "proxy:write"],
+    "created_at": "2026-05-09T12:00:00Z"
+  }
+}
+```
+
+The password is **not** returned in any response — only in this call you can confirm the value you submitted. The stored value is a bcrypt hash.
+
+### List Credentials
+
+```bash
+curl http://localhost:9090/api/v1/apps/{app_id}/basic-credentials \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "status": 200,
+  "message": "ok",
+  "data": [
+    {
+      "id": "7a2e1f9c-4d3b-5c6a-8e7f-0a1b2c3d4e5f",
+      "app_id": "1e4d6f8a-9b2c-4e7f-a012-3456789abcde",
+      "username": "my-service",
+      "scopes": ["proxy:read", "proxy:write"],
+      "created_at": "2026-05-09T12:00:00Z"
+    }
+  ]
+}
+```
+
+Passwords are never included in list or get responses.
+
+### Delete a Credential
+
+```bash
+curl -X DELETE http://localhost:9090/api/v1/apps/{app_id}/basic-credentials/{credential_id} \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+Deletion removes the credential from PostgreSQL and immediately evicts it from the Redis cache. Subsequent requests using the deleted username/password receive `401`.
+
+---
+
+## Password Storage
+
+| What is stored | How it is stored |
+|---|---|
+| Password | bcrypt hash (cost factor: `12` by default) |
+| Username | Plaintext (used as a lookup key) |
+| Scopes | Array in PostgreSQL |
+
+bcrypt is chosen because:
+
+- It is designed to be slow: each verification takes approximately 200–400 ms on modern hardware at cost factor 12, making offline brute-force attacks expensive.
+- It incorporates a random salt automatically — identical passwords produce different hashes.
+- It is a widely audited, well-understood algorithm.
+
+The gateway **never stores the plaintext password** and has no mechanism to retrieve or display it. If a password is lost, delete the credential and create a new one.
+
+---
+
+## Validation Flow
+
+For each request with a `Basic` auth header where `auth_type = "basic"`:
+
+```
+1. Extract "Authorization: Basic <b64>" header
+2. Base64-decode → "username:password"
+3. Split on first ":" → (username, password)
+4. Compute a cache lookup key:
+     key = "basic:<app_id>:<username>"
+5. Redis cache lookup
+   ├── Cache HIT  → deserialise cached scopes and credential_id
+   │               → perform constant-time bcrypt verify(password, cached_hash)
+   │               → return AuthIdentity if verify passes; 401 if not
+   └── Cache MISS → query PostgreSQL WHERE app_id = $1 AND username = $2
+                   ├── Row not found
+                   │     → perform dummy bcrypt verify (prevents timing oracle)
+                   │     → return 401
+                   └── Row found
+                         → perform constant-time bcrypt verify(password, stored_hash)
+                         ├── Verify passes → write metadata to Redis; return AuthIdentity
+                         └── Verify fails  → return 401
+```
+
+**Constant-time comparison:** The bcrypt verification itself involves constant-time string comparison internally. Additionally, the gateway always runs bcrypt verify even when the username is not found (using a dummy hash) to prevent timing-based user enumeration attacks.
+
+**Why Redis caches the hash, not the verification result:**
+
+Caching a simple "username X is valid" boolean would allow a compromised cache to grant access without knowing the password. Instead, the cache stores the bcrypt hash alongside the credential metadata. The password is still verified on every request — Redis only saves the PostgreSQL round-trip, not the bcrypt computation.
+
+---
+
+## Cache Behaviour
+
+The Redis key for a basic auth credential is:
+
+```
+basic:<app_id>:<username>
+```
+
+The cached value includes: `credential_id`, `bcrypt_hash`, `scopes`.
+
+**Cache TTL:** Equal to `token_cache_ttl_secs` (same setting as API key tokens). Default: `300` seconds.
+
+Cache invalidation happens immediately on:
+
+- Credential deletion (`DELETE /api/v1/apps/:app_id/basic-credentials/:id`)
+- Any future password-rotation endpoint
+
+---
+
+## Scopes
+
+Basic auth credentials carry a `scopes` array, enforced identically to API key token scopes:
+
+| Scope | Permits |
+|---|---|
+| `proxy:read` | `GET`, `HEAD`, `OPTIONS` |
+| `proxy:write` | `POST`, `PUT`, `PATCH`, `DELETE` |
+
+Assign the minimal scopes needed:
+
+```json
+{"scopes": ["proxy:read"]}        // read-only
+{"scopes": ["proxy:write"]}       // write-only (unusual)
+{"scopes": ["proxy:read", "proxy:write"]} // full access
+```
+
+A credential with an empty `scopes` array (`[]`) passes authentication but fails scope enforcement for all methods. Grant at least one scope.
+
+---
+
+## Error Responses
+
+| Scenario | HTTP Status | Body |
+|---|---|---|
+| Missing `Authorization` header | `401` | `{"status":401,"message":"missing authorization header","data":null}` |
+| Malformed `Basic` header (not valid base64) | `401` | `{"status":401,"message":"invalid authorization header","data":null}` |
+| Username not found | `401` | `{"status":401,"message":"invalid credentials","data":null}` |
+| Password incorrect | `401` | `{"status":401,"message":"invalid credentials","data":null}` |
+| Insufficient scope | `403` | `{"status":403,"message":"insufficient scope","data":null}` |
+
+Note that "username not found" and "password incorrect" return identical messages. This is intentional — distinguishing them would allow user enumeration.
+
+---
+
+## Security Considerations
+
+**Always use HTTPS.** Basic auth transmits the password base64-encoded (not encrypted). Without TLS, any network observer can extract the plaintext password. Never deploy basic auth on an unencrypted connection.
+
+**bcrypt is slow by design.** Unlike API key token validation (which is a fast SHA-256 hash lookup), basic auth validation involves bcrypt, which takes 200–400 ms per request at cost factor 12. This is appropriate for human-speed logins but may affect throughput if high request rates are expected from basic-auth clients. Consider API key tokens for high-throughput machine clients.
+
+**No metadata injection.** Basic auth credentials do not support the token metadata map. If you need to inject context headers into upstream requests, use API key tokens with a `metadata` map, or configure JWT `forward_claims_as_headers`.
+
+**Avoid shared credentials.** Issue a separate credential per service or client. This ensures you can revoke one client's access without affecting others and produces cleaner audit log entries.

@@ -1,0 +1,266 @@
+---
+title: "Bare-Metal / Native Deployment"
+description: "Build the gateway with cargo, run as a process or systemd service, and tune signal handling."
+---
+
+This guide covers building and running the Nexus API Gateway by Drasken Cloud directly on a host, without containers.
+
+## Prerequisites
+
+| Requirement | Notes |
+|---|---|
+| Rust toolchain (stable) | Install via [rustup](https://rustup.rs/). The project targets the current stable release. |
+| `pkg-config` + C linker | Required by several crates on Linux (`build-essential` or `gcc` package). |
+| PostgreSQL client libraries | Only needed when building with `--features store-postgres` or `store-mysql`. |
+| Redis | Optional. In-process fallbacks are available; Redis is required for multi-instance deployments. |
+| curl | Used for the built-in health check; not required by the binary itself. |
+
+Verify your toolchain:
+
+```bash
+rustc --version   # should print rustc 1.x.x (stable)
+cargo --version
+```
+
+## Building
+
+### Default Build (SQLite, No External DB)
+
+The default feature set includes only the SQLite driver. The resulting binary has zero external runtime dependencies other than the OS.
+
+```bash
+cd /path/to/DraskenCloud.Gateway.Service
+cargo build --release
+```
+
+The binary is written to `target/release/nexus`.
+
+### Build with PostgreSQL Support
+
+```bash
+cargo build --release --features store-postgres
+```
+
+The `store-cockroach` feature also enables Postgres (CockroachDB uses the Postgres wire protocol):
+
+```bash
+cargo build --release --features store-cockroach
+```
+
+### Build with MySQL Support
+
+```bash
+cargo build --release --features store-mysql
+```
+
+### Build with All Storage Backends + Optional Features
+
+```bash
+cargo build --release --features store-postgres,store-mysql,otlp,memcached
+```
+
+| Feature flag | Enables |
+|---|---|
+| `store-sqlite` | SQLite driver (included by default) |
+| `store-postgres` | PostgreSQL driver |
+| `store-mysql` | MySQL/MariaDB driver |
+| `store-cockroach` | CockroachDB (alias for `store-postgres`) |
+| `otlp` | OpenTelemetry OTLP export via `GATEWAY_OTLP_ENDPOINT` |
+| `memcached` | Memcached cache backend |
+
+> **SQLx offline mode**: The CI environment uses `SQLX_OFFLINE=true` to skip database connectivity at compile time. Set this variable if you build in an environment without a live database:
+>
+> ```bash
+> SQLX_OFFLINE=true cargo build --release
+> ```
+
+## Configuration
+
+### Config File
+
+The gateway auto-loads `config/default.toml` relative to the working directory at startup. A full annotated example ships with the repository. Key sections:
+
+```toml
+[server]
+proxy_port = 8080
+mgmt_port  = 9090
+admin_token = "change-me"
+log_level  = "info"
+log_format = "text"
+
+db_driver    = "sqlite"
+database_url = "sqlite://gateway.db?mode=rwc"
+auto_migrate = true
+```
+
+See the [Configuration Overview](/nexus/configuration/overview) and [Server Reference](/nexus/configuration/server) for all available keys.
+
+### .env File
+
+The gateway calls `dotenvy` at startup and loads a `.env` file from the current working directory if one exists. This is a convenience for local development:
+
+```bash
+# .env
+GATEWAY_SERVER__ADMIN_TOKEN=dev-token
+GATEWAY_DATABASE_URL=sqlite://./dev.db?mode=rwc
+RUST_LOG=nexus=debug
+```
+
+Actual environment variables in the shell always override `.env` values.
+
+### Environment Variable Override
+
+Every config key can be set via environment variable using the `GATEWAY_` prefix and `__` for nesting:
+
+```bash
+export GATEWAY_SERVER__LOG_FORMAT=json
+export GATEWAY_SERVER__PROXY_TIMEOUT_MS=60000
+export GATEWAY_DATABASE_URL="postgres://user:pass@localhost/gateway"
+```
+
+## Running
+
+```bash
+./target/release/nexus
+```
+
+Or from the project root (which auto-resolves `config/default.toml`):
+
+```bash
+cargo run --release
+```
+
+The process logs to stdout. On startup you should see lines like:
+
+```
+INFO  nexus: proxy listening on 0.0.0.0:8080
+INFO  nexus: management API listening on 0.0.0.0:9090
+```
+
+Verify the service is healthy:
+
+```bash
+curl http://localhost:9090/api/v1/health
+```
+
+## Log Output
+
+Logs go to **stdout** by default. To redirect to a file while also keeping them in the terminal:
+
+```bash
+./target/release/nexus 2>&1 | tee gateway.log
+```
+
+For structured JSON logs (recommended for log shippers like Filebeat, Fluentd, or Vector):
+
+```bash
+GATEWAY_SERVER__LOG_FORMAT=json ./target/release/nexus 2>&1 | tee gateway.log
+```
+
+To increase verbosity:
+
+```bash
+RUST_LOG=nexus=debug ./target/release/nexus
+```
+
+`RUST_LOG` accepts standard `tracing` filter directives and takes precedence over `log_level` in the config file.
+
+## Signal Handling
+
+| Signal | Behaviour |
+|---|---|
+| `SIGTERM` | Graceful shutdown (drains in-flight requests up to `shutdown_timeout_secs`) |
+| `SIGINT` (Ctrl-C) | Same as `SIGTERM` |
+| `SIGHUP` | No effect (config reload is via the management API: `POST /api/v1/config/reload`) |
+
+See [Graceful Shutdown](/nexus/deployment/graceful-shutdown) for the full shutdown sequence.
+
+## Systemd Service Unit
+
+Create `/etc/systemd/system/gateway.service`:
+
+```ini
+[Unit]
+Description=Nexus API Gateway by Drasken Cloud
+Documentation=https://docs.draskencloud.io/gateway
+After=network-online.target
+Wants=network-online.target
+# Add these lines if using Postgres/Redis:
+# After=postgresql.service redis.service
+# Requires=postgresql.service
+
+[Service]
+Type=exec
+User=gateway
+Group=gateway
+WorkingDirectory=/opt/gateway
+ExecStart=/opt/gateway/bin/nexus
+Restart=on-failure
+RestartSec=5s
+
+# Load secrets from an environment file (not checked into version control)
+EnvironmentFile=-/opt/gateway/gateway.env
+
+# Standard output → journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gateway
+
+# Graceful shutdown: send SIGTERM and wait up to 35s (matches shutdown_timeout_secs + buffer)
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=35
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/gateway/data /opt/gateway/logs
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Set up the service:
+
+```bash
+# Create service user
+sudo useradd -r -s /sbin/nologin -d /opt/gateway gateway
+
+# Copy binary and config
+sudo mkdir -p /opt/gateway/{bin,data,logs,config/apps}
+sudo cp target/release/nexus /opt/gateway/bin/
+sudo cp config/default.toml /opt/gateway/config/
+
+# Create secrets file (readable only by root / systemd)
+sudo tee /opt/gateway/gateway.env > /dev/null <<'EOF'
+GATEWAY_SERVER__ADMIN_TOKEN=your-secure-token
+GATEWAY_DATABASE_URL=sqlite:///opt/gateway/data/gateway.db
+EOF
+sudo chmod 600 /opt/gateway/gateway.env
+
+# Set ownership
+sudo chown -R gateway:gateway /opt/gateway
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable --now gateway
+```
+
+View logs:
+
+```bash
+journalctl -u gateway -f
+```
+
+## Upgrading
+
+1. Build the new binary: `cargo build --release`
+2. Copy it alongside the running binary: `sudo cp target/release/nexus /opt/gateway/bin/nexus.new`
+3. Atomically replace and restart:
+   ```bash
+   sudo mv /opt/gateway/bin/nexus.new /opt/gateway/bin/nexus
+   sudo systemctl restart gateway
+   ```
+
+For zero-downtime upgrades on a single host, use a load balancer and perform a rolling restart — see [Horizontal Scaling](/nexus/deployment/horizontal-scaling).

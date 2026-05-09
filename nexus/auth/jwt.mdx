@@ -1,0 +1,299 @@
+---
+title: "JWT Authentication"
+description: "Stateless JWT validation supporting HS256 and asymmetric algorithms with JWKS-based key rotation."
+---
+
+The Nexus API Gateway by Drasken Cloud supports stateless JWT authentication for both symmetric (HS256) and asymmetric (RS256/RS384/RS512/ES256/ES384) algorithms. JWT validation is performed on every request; only the JWKS key set is cached — there is no per-token cache.
+
+---
+
+## Table of Contents
+
+- [Supported Algorithms](#supported-algorithms)
+- [Request Header](#request-header)
+- [Configuration by Algorithm](#configuration-by-algorithm)
+  - [HS256 — Symmetric Secret](#hs256--symmetric-secret)
+  - [RS256 / RS384 / RS512 / ES256 / ES384 — Asymmetric Keys](#rs256--rs384--rs512--es256--es384--asymmetric-keys)
+  - [JWKS Endpoint](#jwks-endpoint)
+- [JWKS Caching and Proactive Refresh](#jwks-caching-and-proactive-refresh)
+- [Claim Validation](#claim-validation)
+- [Required Claims](#required-claims)
+- [Forwarding Claims as Backend Headers](#forwarding-claims-as-backend-headers)
+- [Validation Errors](#validation-errors)
+- [Full Configuration Example](#full-configuration-example)
+
+---
+
+## Supported Algorithms
+
+| Algorithm | Type | Key Material |
+|---|---|---|
+| `HS256` | Symmetric HMAC | Shared secret (minimum 32 bytes recommended) |
+| `RS256` | Asymmetric RSA | RSA public key (PEM) or JWKS |
+| `RS384` | Asymmetric RSA | RSA public key (PEM) or JWKS |
+| `RS512` | Asymmetric RSA | RSA public key (PEM) or JWKS |
+| `ES256` | Asymmetric ECDSA | EC public key (PEM, P-256 curve) or JWKS |
+| `ES384` | Asymmetric ECDSA | EC public key (PEM, P-384 curve) or JWKS |
+
+The algorithm is determined by the `alg` header field in the incoming JWT. The gateway rejects tokens whose `alg` does not match the configured algorithm for the policy.
+
+---
+
+## Request Header
+
+JWTs are sent as HTTP Bearer tokens in the `Authorization` header:
+
+```http
+Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6Im15LWtleS0xIn0.eyJzdWIiOiJ1c2VyXzEyMyIsImlzcyI6Imh0dHBzOi8vYXV0aC5leGFtcGxlLmNvbS8iLCJhdWQiOiJteS1hcGkiLCJleHAiOjE3NjcwMDAwMDAsIm9yZ19pZCI6Im9yZ184OTAifQ.SIGNATURE
+```
+
+---
+
+## Configuration by Algorithm
+
+### HS256 — Symmetric Secret
+
+For HS256, the shared secret is read from an environment variable at runtime. The variable name is set in the policy; the secret value is **never placed in the config file or policy JSON**.
+
+**Policy configuration:**
+
+```json
+{
+  "auth_type": "jwt",
+  "required": true,
+  "jwt_secret_env": "MY_APP_JWT_SECRET"
+}
+```
+
+**Environment variable:**
+
+```bash
+export MY_APP_JWT_SECRET="your-secret-value-at-least-32-bytes-long"
+```
+
+At startup the gateway reads `process.env["MY_APP_JWT_SECRET"]` and loads the secret into memory. If the variable is not set, the gateway fails to start with a configuration error.
+
+> **Security:** HS256 requires the verifier to possess the same secret as the signer. Any service that needs to verify tokens must share the secret. Prefer asymmetric algorithms (RS256/ES256) for multi-service environments where the signer and verifiers are separate systems.
+
+---
+
+### RS256 / RS384 / RS512 / ES256 / ES384 — Asymmetric Keys
+
+For asymmetric algorithms, supply the **public key** only. The gateway never needs the private key.
+
+**Option A — PEM file via environment variable:**
+
+```json
+{
+  "auth_type": "jwt",
+  "required": true,
+  "jwt_public_key_env": "MY_APP_JWT_PUBLIC_KEY"
+}
+```
+
+```bash
+# Set the env var to the PEM content (multi-line):
+export MY_APP_JWT_PUBLIC_KEY="$(cat /run/secrets/jwt-public-key.pem)"
+```
+
+The environment variable must contain the complete PEM block, including `-----BEGIN PUBLIC KEY-----` and `-----END PUBLIC KEY-----` delimiters (PKCS#8 SubjectPublicKeyInfo format).
+
+**Option B — JWKS URL** (see below).
+
+---
+
+### JWKS Endpoint
+
+The JWKS (JSON Web Key Set) option is recommended for managed identity providers such as Auth0, Keycloak, Okta, or any OpenID Connect provider.
+
+```json
+{
+  "auth_type": "jwt",
+  "required": true,
+  "jwks_url": "https://auth.example.com/.well-known/jwks.json",
+  "issuer": "https://auth.example.com/",
+  "audience": "my-api"
+}
+```
+
+**Validation flow for JWKS-backed tokens:**
+
+```
+1. Parse the incoming JWT header → extract "kid" claim
+2. Look up DashMap<url, (JwkSet, fetched_at)> for jwks_url
+   ├── Cache HIT and key with matching kid exists
+   │     → use cached JWK to verify signature
+   └── Cache MISS or kid not found in cached set
+         → fetch JWKS from jwks_url (timeout: jwks.fetch_timeout_ms)
+         → update DashMap entry with fresh JwkSet + now()
+         → select JWK by kid
+         → verify signature
+3. Validate claims (exp, iss, aud, required_claims)
+4. Produce AuthIdentity
+```
+
+The JWKS cache is an **in-process `DashMap`** keyed by URL. It is **not** stored in Redis — it is local to each gateway instance. This is intentional: JWKS responses can be large, and key material is not shared state in the same way tokens are.
+
+---
+
+## JWKS Caching and Proactive Refresh
+
+| Config Key | Env Var | Default | Description |
+|---|---|---|---|
+| `jwks.fetch_timeout_ms` | `GATEWAY_JWKS__FETCH_TIMEOUT_MS` | `5000` | Maximum time to wait for a JWKS URL response (milliseconds) |
+| `jwks.cache_ttl_secs` | `GATEWAY_JWKS__CACHE_TTL_SECS` | `3600` | How long a fetched JWKS is considered fresh (seconds) |
+| `jwks.validate_on_reload` | `GATEWAY_JWKS__VALIDATE_ON_RELOAD` | `true` | Whether to verify JWKS URL reachability at gateway startup |
+
+**Proactive background refresh:**
+
+A background Tokio task refreshes each JWKS URL at `cache_ttl_secs / 2` intervals. This means:
+
+- With the default 3600 s TTL, the background task refreshes every 1800 s.
+- Key rotations at the identity provider propagate within at most `cache_ttl_secs / 2` seconds.
+- On-demand requests do not stall waiting for a stale cache to refresh.
+- If a request arrives with a `kid` that is not in the cached set (e.g., the provider just rotated keys), the gateway performs an immediate synchronous fetch before rejecting the token.
+
+**Startup validation (`jwks.validate_on_reload = true`):**
+
+At startup, the gateway fetches every distinct `jwks_url` found in any active policy. If any fetch fails or returns a non-2xx response, the gateway logs a warning but does **not** fail to start — it retries on first use. Set `validate_on_reload = false` to skip startup fetches in environments where the JWKS endpoint may not be immediately reachable.
+
+---
+
+## Claim Validation
+
+The following claims are validated on every JWT:
+
+| Claim | Validation | Behaviour on Failure |
+|---|---|---|
+| `exp` | Always checked; token must not be expired | `401` — token expired |
+| `nbf` | Checked if present; token must not be used before `nbf` | `401` — token not yet valid |
+| `iss` | Checked if `issuer` is set in policy | `401` — issuer mismatch |
+| `aud` | Checked if `audience` is set in policy | `401` — audience mismatch |
+| `alg` (header) | Must match configured algorithm | `401` — algorithm mismatch |
+
+There is **no clock skew tolerance** by default. All timestamps are compared against the gateway's system clock. Ensure your token issuer and the gateway host have synchronised clocks (NTP).
+
+---
+
+## Required Claims
+
+The `required_claims` policy field specifies claim names that must be present in the JWT payload. If any listed claim is absent, the request is rejected with `401`:
+
+```json
+{
+  "auth_type": "jwt",
+  "required_claims": ["sub", "org_id", "email"]
+}
+```
+
+This check runs **after** signature validation and standard claim validation. It verifies presence only — not value. To enforce specific values, use the backend's own claim inspection or the `forward_claims_as_headers` feature to pass claims to the backend for application-layer enforcement.
+
+---
+
+## Forwarding Claims as Backend Headers
+
+The `forward_claims_as_headers` map controls which JWT claims are forwarded to the backend as HTTP headers:
+
+```json
+{
+  "forward_claims_as_headers": {
+    "sub": "X-User-Id",
+    "org_id": "X-Org-Id",
+    "email": "X-User-Email",
+    "roles": "X-User-Roles"
+  }
+}
+```
+
+After successful JWT validation:
+
+- The gateway reads each named claim from the JWT payload.
+- If the claim is present, its value is set as the named header on the upstream request.
+- If the claim is absent, no header is added (the claim is not listed in `required_claims` by default — add it there if the header is mandatory).
+- String, number, and boolean claim values are stringified. Array claim values are serialised as a comma-separated list.
+
+**The JWT itself is not forwarded to the backend.** Only the extracted claim values are passed as individual headers. This avoids exposing the full token (and its signature) to upstream services.
+
+**Example upstream request headers after JWT validation:**
+
+```http
+GET /api/users HTTP/1.1
+X-User-Id: user_123
+X-Org-Id: org_890
+X-User-Email: alice@example.com
+X-User-Roles: admin,member
+```
+
+---
+
+## Validation Errors
+
+All JWT validation failures return `401 Unauthorized`. The error message describes the failure:
+
+| Scenario | Body |
+|---|---|
+| Missing `Authorization` header | `{"status":401,"message":"missing authorization header","data":null}` |
+| Malformed JWT (not three base64 segments) | `{"status":401,"message":"invalid token format","data":null}` |
+| Signature verification failed | `{"status":401,"message":"invalid token signature","data":null}` |
+| Token expired (`exp` in the past) | `{"status":401,"message":"token expired","data":null}` |
+| Token not yet valid (`nbf` in the future) | `{"status":401,"message":"token not yet valid","data":null}` |
+| Issuer mismatch | `{"status":401,"message":"invalid issuer","data":null}` |
+| Audience mismatch | `{"status":401,"message":"invalid audience","data":null}` |
+| Algorithm mismatch | `{"status":401,"message":"algorithm not accepted","data":null}` |
+| Missing required claim | `{"status":401,"message":"missing required claim: <name>","data":null}` |
+| JWKS fetch timeout | `{"status":401,"message":"unable to verify token","data":null}` |
+| Insufficient scope | `{"status":403,"message":"insufficient scope","data":null}` |
+
+---
+
+## Full Configuration Example
+
+**Policy JSON (stored in database):**
+
+```json
+{
+  "auth_type": "jwt",
+  "required": true,
+  "jwks_url": "https://auth.example.com/.well-known/jwks.json",
+  "issuer": "https://auth.example.com/",
+  "audience": "gateway-api",
+  "required_claims": ["sub", "org_id"],
+  "forward_claims_as_headers": {
+    "sub": "X-User-Id",
+    "org_id": "X-Org-Id",
+    "plan": "X-User-Plan"
+  }
+}
+```
+
+**Gateway configuration (`config/default.toml` section):**
+
+```toml
+[jwks]
+fetch_timeout_ms = 5000      # env: GATEWAY_JWKS__FETCH_TIMEOUT_MS
+cache_ttl_secs = 3600        # env: GATEWAY_JWKS__CACHE_TTL_SECS
+validate_on_reload = true    # env: GATEWAY_JWKS__VALIDATE_ON_RELOAD
+```
+
+**Issuing a JWT (for testing with HS256):**
+
+```bash
+# Using jwt-cli (https://github.com/mike-engel/jwt-cli)
+jwt encode \
+  --alg HS256 \
+  --secret "$MY_APP_JWT_SECRET" \
+  --sub "user_123" \
+  --iss "https://auth.example.com/" \
+  --aud "gateway-api" \
+  --exp "+1h" \
+  '{"org_id":"org_890","plan":"enterprise"}'
+```
+
+**Testing a JWT-authenticated request:**
+
+```bash
+TOKEN="eyJhbGciOiJIUzI1NiJ9..."
+
+curl http://localhost:8080/api/users \
+  -H "Authorization: Bearer $TOKEN"
+```

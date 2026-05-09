@@ -1,0 +1,287 @@
+---
+title: "Apps, Versions, and Revisions"
+description: "Full lifecycle of an API through the gateway: from creating the App to live traffic, versioning, promotion, rollback."
+---
+
+This document covers the full lifecycle of an API through the gateway: from creating the App to routing live traffic, through versioning strategies, revision promotion, rollback, and deactivation.
+
+---
+
+## Full Lifecycle
+
+```
+1. Create App            → defines routing mode and base gateway path
+2. Create Version        → defines the public API contract version (v1, v2, …)
+3. Create Revision       → defines the backend target and policy
+4. Activate Revision     → promotes revision to is_current; traffic begins flowing
+5. (Optional) Canary     → create revision with traffic_weight < 100; route partial traffic
+6. Promote new Revision  → activate the new revision; old becomes rollback target
+7. Rollback              → re-activate the previous revision if needed
+8. Deprecate Version     → signal clients to migrate; traffic continues
+9. Retire Version        → traffic stops; 404 returned for all paths
+10. Deactivate App       → 503 returned for all app paths
+```
+
+---
+
+## Step-by-Step: From App to First Request
+
+### 1. Create the App
+
+```bash
+curl -s -X POST http://localhost:9090/api/v1/apps \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Orders Service",
+    "slug": "orders",
+    "gateway_path": "/orders",
+    "routing_mode": "managed_endpoint",
+    "default_policy": {
+      "auth": { "auth_type": "api_key", "required": true },
+      "rate_limit": { "enabled": true, "requests": 1000, "window_seconds": 60 }
+    }
+  }' | jq .data.id
+```
+
+Save the returned UUID as `APP_ID`.
+
+### 2. Create Version v1
+
+```bash
+curl -s -X POST "http://localhost:9090/api/v1/apps/$APP_ID/versions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "version": "v1",
+    "gateway_path": "/orders/v1"
+  }' | jq .data.id
+```
+
+Save as `VERSION_ID`.
+
+### 3. Create a Revision with Backend Config
+
+```bash
+curl -s -X POST \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "revision": "rev-1",
+    "backend_scheme": "https",
+    "backend_host": "orders.internal.cluster.local",
+    "backend_port": 443,
+    "backend_base_path": "/",
+    "strip_gateway_path": true,
+    "health_check_path": "/health"
+  }' | jq .data.id
+```
+
+Save as `REVISION_ID`.
+
+### 4. Activate the Revision
+
+```bash
+curl -s -X POST \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID/activate" \
+  | jq .data.is_current
+# true
+```
+
+### 5. Issue an API Token
+
+```bash
+curl -s -X POST "http://localhost:9090/api/v1/apps/$APP_ID/tokens" \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "production-token", "scopes": ["proxy:read", "proxy:write"] }' \
+  | jq .data.token
+# "gw_abc123..."
+```
+
+### 6. Register Endpoints (managed_endpoint mode)
+
+```bash
+for endpoint in \
+  '{"method":"GET","path":"/","backend_path":"/"}' \
+  '{"method":"POST","path":"/","backend_path":"/"}' \
+  '{"method":"GET","path":"/{id}","backend_path":"/{id}"}' \
+  '{"method":"PUT","path":"/{id}","backend_path":"/{id}"}' \
+  '{"method":"DELETE","path":"/{id}","backend_path":"/{id}"}'; do
+  curl -s -X POST \
+    "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID/endpoints" \
+    -H "Content-Type: application/json" \
+    -d "$endpoint" | jq .data.id
+done
+```
+
+### 7. Make the First Proxied Request
+
+```bash
+API_TOKEN=gw_abc123...
+
+curl -s http://localhost:8080/orders/v1/ \
+  -H "Authorization: Bearer $API_TOKEN" | jq
+```
+
+---
+
+## Multiple Simultaneous Active Versions
+
+The gateway supports multiple Version objects in `active` status for the same App at the same time. `v1` and `v2` can coexist and both serve traffic:
+
+```
+/orders/v1  →  Version v1 (status: active)  →  Revision rev-3 (is_current)
+/orders/v2  →  Version v2 (status: active)  →  Revision rev-1 (is_current)
+```
+
+This enables zero-downtime API versioning: deploy v2 alongside v1, migrate clients incrementally, then retire v1 when migration is complete.
+
+```bash
+# Create v2 alongside existing v1
+curl -s -X POST "http://localhost:9090/api/v1/apps/$APP_ID/versions" \
+  -H "Content-Type: application/json" \
+  -d '{ "version": "v2", "gateway_path": "/orders/v2" }' | jq
+```
+
+---
+
+## Revision Promotion (Deploying a New Backend)
+
+When deploying a new version of your backend service, create a new Revision and activate it. The old revision stays registered as a rollback target.
+
+```bash
+# Step 1: Create new revision pointing at the new backend
+curl -s -X POST \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "revision": "rev-2",
+    "backend_scheme": "https",
+    "backend_host": "orders-v2.internal.cluster.local",
+    "backend_port": 443,
+    "backend_base_path": "/",
+    "strip_gateway_path": true
+  }' | jq .data.id
+# NEW_REVISION_ID=...
+
+# Step 2: Activate the new revision (traffic switches immediately)
+curl -s -X POST \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$NEW_REVISION_ID/activate" \
+  | jq
+```
+
+After activation:
+- `rev-2.is_current = true` — all stable traffic goes here
+- `rev-1.is_current = false` — registered but receives no traffic
+- The Revision table retains both records; no data is deleted
+
+---
+
+## Rollback
+
+Rolling back means activating the previous revision. No new revision creation is required — activate the prior revision's ID:
+
+```bash
+# PREV_REVISION_ID is rev-1 from above
+curl -s -X POST \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$PREV_REVISION_ID/activate" \
+  | jq
+```
+
+The route cache is invalidated immediately; traffic switches back within milliseconds.
+
+---
+
+## Version Status Lifecycle
+
+```
+active → deprecated → retired
+```
+
+| Transition | API call | Effect |
+|-----------|---------|--------|
+| Mark as deprecated | `PATCH .../versions/:id` with `{"status": "deprecated"}` | Traffic continues; `Deprecation: true` response header added |
+| Retire version | `PATCH .../versions/:id` with `{"status": "retired"}` | All requests to paths under this version return `404`; revision caches invalidated immediately |
+| Retire → active | Not supported | Create a new version |
+
+### Deprecation header
+
+When a Version is in `deprecated` status, every response from that version includes:
+
+```
+Deprecation: true
+```
+
+This header is the signal to client developers that they need to migrate. Clients that ignore it will break when the version is eventually retired.
+
+### Retirement
+
+Retiring a version stops traffic **immediately**. There is no grace period. Use the `deprecated` status first to give clients time to migrate before you retire.
+
+---
+
+## App Deactivation
+
+Deactivating an App stops all traffic to that app instantly — across all versions and revisions.
+
+```bash
+# Soft-deactivate the app
+curl -s -X PATCH "http://localhost:9090/api/v1/apps/$APP_ID" \
+  -H "Content-Type: application/json" \
+  -d '{"is_active": false}' | jq
+
+# All requests to /orders/* now return:
+# {"status": 503, "message": "service unavailable", "data": null}
+```
+
+Reactivating:
+
+```bash
+curl -s -X PATCH "http://localhost:9090/api/v1/apps/$APP_ID" \
+  -H "Content-Type: application/json" \
+  -d '{"is_active": true}' | jq
+```
+
+App deactivation does not delete any data. All tokens, versions, revisions, and endpoints remain intact and resume functioning when the app is reactivated.
+
+---
+
+## Hard Delete vs Soft Delete
+
+| Operation | API call | Effect |
+|-----------|---------|--------|
+| Deactivate App | `PATCH /apps/:id` with `{"is_active": false}` | Traffic stops; data preserved |
+| Delete App | `DELETE /apps/:id` | App and all children cascade-deleted; tokens deleted; audit log `app_id` set to NULL (preserves history) |
+| Retire Version | `PATCH .../versions/:id` with `{"status": "retired"}` | Traffic stops under this version; data preserved |
+| Delete Version | `DELETE .../versions/:id` | Version and all revisions and endpoints deleted |
+| Delete Revision | `DELETE .../revisions/:id` | Revision and its endpoints deleted |
+
+Prefer soft operations (deactivate / deprecate / retire) in production. Hard deletes are not reversible.
+
+---
+
+## Listing and Inspecting
+
+```bash
+# All apps
+curl -s http://localhost:9090/api/v1/apps | jq
+
+# Versions for an app
+curl -s "http://localhost:9090/api/v1/apps/$APP_ID/versions" | jq
+
+# Revisions for a version
+curl -s "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions" | jq
+
+# Which revision is currently active?
+curl -s "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions" \
+  | jq '.data[] | select(.is_current == true)'
+```
+
+---
+
+## Common Mistakes
+
+| Mistake | Consequence | Fix |
+|---------|------------|-----|
+| Creating a revision but not activating it | No traffic flows; `404` on all paths | `POST .../revisions/:id/activate` |
+| Retiring a version before clients have migrated | All clients break immediately | Use `deprecated` first; give clients time |
+| Deleting a revision instead of deactivating the App | Cascades all endpoints; harder to undo | Deactivate the App or retire the Version |
+| Setting `is_current` by editing the record directly | Bypasses cache invalidation | Always use the `/activate` endpoint |

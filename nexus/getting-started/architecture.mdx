@@ -1,0 +1,267 @@
+---
+title: "Architecture Overview"
+description: "Single process, two ports: data plane on 8080 and control plane on 9090, with the full middleware stack."
+---
+
+Nexus API Gateway by Drasken Cloud runs as a **single OS process** that binds two TCP ports. Both listeners share connection pools, caches, and in-memory routing state, but they serve fundamentally different traffic with different security postures.
+
+---
+
+## Dual-Port Design
+
+| Port | Role | Who connects | Network policy |
+|------|------|-------------|----------------|
+| `:8080` | **Proxy / data plane** — forwards client requests to registered backends | External API clients, public internet, load balancer | Exposed via ingress or public load balancer |
+| `:9090` | **Management API / control plane** — configuration, token management, metrics | Internal tooling, CI/CD pipelines, operators | **Must be firewalled** — internal / cluster network only |
+
+### Why one process and two ports?
+
+A single process eliminates inter-service communication, synchronised deployments, and network hops between the two planes. The trade-off is that a crash takes both planes down simultaneously. This is acceptable for the v1 operational model and is mitigated by graceful shutdown (configurable `shutdown_timeout_secs`) and health probing.
+
+Port `9090` does not require a network-level request to carry an admin token in development, though `GATEWAY_SERVER__ADMIN_TOKEN` can be set to enforce bearer authentication on all management routes. In production, restrict `9090` to cluster-internal IPs at the firewall or Kubernetes `NetworkPolicy` level as a primary defence; the admin token is a secondary defence-in-depth measure.
+
+---
+
+## Full Middleware Stack
+
+Every request arriving on `:8080` passes through the Tower middleware stack in strict order. Each layer is a `tower::Service` implementation that either short-circuits (returns a response directly to the client) or calls the next layer.
+
+```
+                                    :8080
+                                      │
+                              ┌───────▼────────┐
+                              │  TCP Accept     │
+                              │  (Tokio async)  │
+                              └───────┬────────┘
+                                      │
+                    ┌─────────────────▼──────────────────┐
+                    │  1. IP Rate Limit                    │
+                    │     Global per-IP request cap        │
+                    │     Blocks floods before any work    │
+                    └─────────────────┬──────────────────┘
+                                      │
+                    ┌─────────────────▼──────────────────┐
+                    │  2. Trace                            │
+                    │     Assign / propagate request ID    │
+                    │     Start span for observability     │
+                    └─────────────────┬──────────────────┘
+                                      │
+                    ┌─────────────────▼──────────────────┐
+                    │  3. Auth                             │
+                    │     API key / JWT / Basic Auth       │
+                    │     Check RuntimeStore → Redis → DB  │
+                    │     Short-circuit: 401 on failure    │
+                    └─────────────────┬──────────────────┘
+                                      │
+                    ┌─────────────────▼──────────────────┐
+                    │  4. Rate Limit                       │
+                    │     Per-token sliding window         │
+                    │     Redis INCR + EXPIRE              │
+                    │     Short-circuit: 429 + Retry-After │
+                    └─────────────────┬──────────────────┘
+                                      │
+                    ┌─────────────────▼──────────────────┐
+                    │  5. Header Validation                │
+                    │     Required headers check           │
+                    │     Short-circuit: 400 on violation  │
+                    └─────────────────┬──────────────────┘
+                                      │
+                    ┌─────────────────▼──────────────────┐
+                    │  6. IP Filter                        │
+                    │     Allow / deny CIDRs from policy  │
+                    │     Runs after auth so denied IPs    │
+                    │     do not consume rate-limit quota  │
+                    │     Short-circuit: 403 on deny       │
+                    └─────────────────┬──────────────────┘
+                                      │
+                    ┌─────────────────▼──────────────────┐
+                    │  7. Body Limit                       │
+                    │     Enforce max_body_bytes           │
+                    │     Short-circuit: 413 on excess     │
+                    └─────────────────┬──────────────────┘
+                                      │
+                    ┌─────────────────▼──────────────────┐
+                    │  8. Timeout                          │
+                    │     Enforce proxy_timeout_ms         │
+                    │     Short-circuit: 504 on deadline   │
+                    └─────────────────┬──────────────────┘
+                                      │
+                    ┌─────────────────▼──────────────────┐
+                    │  9. CORS                             │
+                    │     Add Access-Control headers       │
+                    │     Sits after Timeout so CORS       │
+                    │     headers appear on error responses│
+                    └─────────────────┬──────────────────┘
+                                      │
+                    ┌─────────────────▼──────────────────┐
+                    │  10. Logger                          │
+                    │     Record start time                │
+                    │     Call inner; record status/ms     │
+                    │     Emit structured log line         │
+                    │     Spawn async audit write (non-    │
+                    │     blocking, never adds latency)    │
+                    └─────────────────┬──────────────────┘
+                                      │
+                    ┌─────────────────▼──────────────────┐
+                    │  11. Cache                           │
+                    │     Check response cache             │
+                    │     HIT: return cached response      │
+                    │     MISS: continue to proxy          │
+                    └─────────────────┬──────────────────┘
+                                      │
+                    ┌─────────────────▼──────────────────┐
+                    │  12. Proxy Engine                    │
+                    │     Resolve route from RuntimeStore  │
+                    │     Match managed endpoints if mode  │
+                    │     Rewrite URL (strip + base_path)  │
+                    │     Copy headers (drop hop-by-hop)   │
+                    │     Forward via Hyper HTTP client    │
+                    │     Stream response body back        │
+                    │     Optionally populate cache        │
+                    └─────────────────┬──────────────────┘
+                                      │
+                                   Backend
+```
+
+**Key invariants:**
+- Layers are stateless per-request; shared state lives in `Arc<AppState>`.
+- Auth short-circuits before rate-limit work begins, so unauthenticated requests do not consume token rate-limit quota.
+- IP Filter runs after Auth so denied IPs do not consume per-token rate-limit counters.
+- CORS sits after Timeout so preflight responses include CORS headers even when the gateway is under load.
+- Audit log writes are async (`tokio::spawn`) — they never add to response latency.
+
+---
+
+## Response Path
+
+The response travels back through the same middleware stack in reverse order (unwinding). Each layer has an opportunity to inspect or modify the response:
+
+```
+Backend response
+  → Proxy Engine (stream body, apply response header transforms)
+  → Cache (store response if policy allows)
+  → Logger (record final status code and latency)
+  → CORS (headers already added on the way in; no-op on response)
+  → Timeout (cancel budget — response arrived in time)
+  → Body Limit (no-op on response path)
+  → IP Filter (no-op on response path)
+  → Header Validation (no-op on response path)
+  → Rate Limit (no-op on response path)
+  → Auth (no-op on response path)
+  → Trace (close span)
+  → IP Rate Limit (no-op on response path)
+  → Client
+```
+
+Audit log entry is written asynchronously by the Logger layer after the response is handed back — it does not block the client from receiving the response.
+
+---
+
+## Component Map
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          Gateway Process                             │
+│                                                                      │
+│  ┌──────────────────────────┐    ┌──────────────────────────────┐   │
+│  │   Data Plane  :8080      │    │  Control Plane  :9090        │   │
+│  │                          │    │                              │   │
+│  │  Tower middleware stack  │    │  Axum router                 │   │
+│  │  (12 layers, see above)  │    │  ├─ /api/v1/apps             │   │
+│  │                          │    │  ├─ /api/v1/apps/:id/        │   │
+│  │  Proxy Engine            │    │  │    versions               │   │
+│  │  ├─ RuntimeStore lookup  │    │  ├─ .../revisions            │   │
+│  │  ├─ Canary weight select │    │  ├─ .../endpoints            │   │
+│  │  ├─ Circuit breaker check│    │  ├─ /api/v1/tokens           │   │
+│  │  └─ Hyper HTTP client    │    │  ├─ /api/v1/health           │   │
+│  │                          │    │  ├─ /metrics (Prometheus)    │   │
+│  └──────────────────────────┘    │  └─ /swagger-ui              │   │
+│              │                   └──────────────────────────────┘   │
+│              │                                 │                     │
+│  ┌───────────▼─────────────────────────────────▼──────────────┐     │
+│  │                    Store Layer                               │     │
+│  │  ┌───────────────────────┐   ┌──────────────────────────┐  │     │
+│  │  │  RuntimeStore         │   │  Cache Layer              │  │     │
+│  │  │  (Arc<RwLock<...>>)   │   │  (memory / Redis /        │  │     │
+│  │  │  routing_table        │   │   Memcached)              │  │     │
+│  │  │  endpoints            │   └──────────────────────────┘  │     │
+│  │  │  token_cache          │   ┌──────────────────────────┐  │     │
+│  │  │  jwks_cache           │   │  Database Pool            │  │     │
+│  │  │  app_index            │   │  (SQLite or PostgreSQL)   │  │     │
+│  │  └───────────────────────┘   └──────────────────────────┘  │     │
+│  └─────────────────────────────────────────────────────────────┘     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### RuntimeStore
+
+The `RuntimeStore` is an in-process, `Arc<RwLock<...>>` structure that holds all routing and policy data. The proxy hot path reads from it without any I/O:
+
+- **`routing_table`** — sorted by path length (longest-prefix first); each entry is a fully merged `CachedRevision` with app + version + revision policy already combined.
+- **`endpoints`** — per-revision endpoint list for `managed_endpoint` mode apps; each entry has the resolved `policy_override`.
+- **`token_cache`** — in-process validated token store (LRU-bounded, default 50,000 entries); checked before Redis.
+- **`jwks_cache`** — JWT signing key sets keyed by JWKS URL; refreshed in the background.
+- **`app_index`** — slug → UUID lookup for management API operations.
+
+### Cache Layer
+
+Separate from the RuntimeStore. The response cache (for HTTP response bodies) is configurable: `memory` (default, in-process LRU), `redis` (shared across replicas), or `memcached`.
+
+### Database (SQLite / PostgreSQL)
+
+Stores API tokens and optional audit history. App, version, revision, and endpoint definitions live in TOML files and the RuntimeStore — not the database.
+
+---
+
+## Background Tasks
+
+The gateway starts several background Tokio tasks at process startup. They share the same `AppState` and run independently of request handling:
+
+| Task | Description |
+|------|-------------|
+| **Health prober** | Periodically sends HTTP requests to each revision's `health_check_path`. Marks revisions unhealthy in the in-memory health map; the proxy engine excludes unhealthy revisions from routing. |
+| **JWKS refresh** | Re-fetches JWKS key sets from configured IdP URLs before their cache TTL expires. Ensures JWT validation uses current signing keys without per-request fetches. |
+| **Update check** | Polls the GitHub releases API to detect newer gateway versions; logs a notice when a newer release is available. |
+| **File watcher** | (Optional, when `file_watch_enabled = true`) Watches `config/apps/` for changes using OS filesystem events; reloads changed TOML files and applies them to the RuntimeStore with a debounce delay (`file_watch_debounce_ms`). |
+| **Audit pipeline drain** | Receives audit records from the Logger middleware via an async channel. Batches writes to the database and configured forwarders. Drains the buffer gracefully on shutdown before the process exits. |
+
+---
+
+## External Dependencies
+
+| Dependency | Required | When needed |
+|-----------|----------|-------------|
+| **SQLite** | No (embedded) | Always present; used by default. Zero external process. |
+| **PostgreSQL** | No | Multi-replica deployments with a shared token store. Switch by setting `GATEWAY_DATABASE_URL`. |
+| **Redis** | No | Multi-replica shared response cache and distributed token revocation. Single-instance deployments run without Redis using in-process fallbacks. |
+| **Memcached** | No | Alternative response cache backend. |
+
+---
+
+## Data Flow: Where Each Operation Goes
+
+| Operation | Storage hit | Why |
+|-----------|------------|-----|
+| Route lookup (every proxied request) | RuntimeStore (in-process, zero I/O) | Routing table is pre-built at startup and updated on config changes |
+| Token validation (cache hit) | RuntimeStore token cache | Zero I/O; LRU-bounded |
+| Token validation (cache miss) | Redis → database | Redis is the fast path; database is source of truth |
+| Rate limit counter | Redis `INCR` + `EXPIRE` | Atomic increment + TTL reset maps exactly to Redis primitives |
+| Response cache lookup | In-process or Redis | Configurable; Redis for shared cache across replicas |
+| Audit log write | Async channel → database | Non-blocking; writes are buffered and batched |
+| Token revocation | Database `UPDATE` + Redis `DEL` | Database is source of truth; Redis entry deleted immediately to avoid serving revoked tokens within TTL |
+
+---
+
+## Concurrency Model
+
+The gateway runs a single **Tokio multi-threaded runtime**. All I/O — TCP connections, database queries, Redis commands, upstream HTTP requests — is async. No blocking work is done on async task threads. CPU-bound work (e.g. token hashing) uses `tokio::task::spawn_blocking` to avoid stalling the async executor.
+
+Shared state is in `Arc`-wrapped types and cloned cheaply into each handler or middleware instance. There is no `Mutex` on the request hot path — all per-request state is local to the async task.
+
+**Connection pools:**
+
+| Pool | Default size | Notes |
+|------|-------------|-------|
+| sqlx database pool | 10 (`db_max_connections`) | SQLite: intentionally 1; Postgres: tune for workload |
+| deadpool-redis | 10 (`cache.redis.pool_max_size`) | Redis connections are cheap; rarely the bottleneck |
+| Hyper HTTP client | Unlimited (per-host keepalive) | Connection reuse per backend host; configured via `[http]` section |

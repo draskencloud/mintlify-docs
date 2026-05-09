@@ -1,0 +1,178 @@
+---
+title: "Error Catalog"
+description: "Every HTTP status code Nexus returns, what triggers it, and how to fix it."
+---
+
+This is the canonical list of every status code the gateway can return on the **data plane** (port `8080`/`8443`) and the **control plane** (port `9090`). Use it to debug failing requests and to set up alert rules.
+
+The response body for any non-2xx status follows this envelope:
+
+```json
+{
+  "status": 404,
+  "message": "App not found",
+  "data": null
+}
+```
+
+---
+
+## 2xx — Success
+
+| Code | Meaning | When |
+|------|---------|------|
+| `200 OK` | Standard success | Backend returned 2xx, or management API read/update succeeded |
+| `201 Created` | Resource created | `POST` to a collection on the management API |
+| `204 No Content` | Success with no body | `DELETE` on the management API |
+| `304 Not Modified` | Conditional GET succeeded | Response served from cache; client's `If-None-Match` matched |
+
+---
+
+## 4xx — Client Errors
+
+### `400 Bad Request`
+
+| Trigger | Resolution |
+|---------|-----------|
+| Malformed JSON in request body | Validate JSON before sending; check `Content-Type: application/json` |
+| Missing required header (per `headers` policy) | Add the required header. See [Header Validation](/nexus/policies/header-validation) |
+| Header value fails regex validation | Inspect the policy's pattern and supply a conforming value |
+| Body exceeds policy validation rules (non-size) | Inspect policy `headers` / body validation rules |
+
+### `401 Unauthorized`
+
+| Trigger | Resolution |
+|---------|-----------|
+| Missing `Authorization` header | Send `Authorization: Bearer <token>` |
+| Invalid or unrecognized token | Verify the token exists and is not revoked |
+| Expired token (`expires_at` in past) | Issue or rotate the token |
+| JWT signature invalid | Confirm the JWKS / public key matches the issuer's signing key |
+| JWT `iss` / `aud` mismatch | Match `policy.auth.issuer` and `policy.auth.audience` to the issued token |
+| Required JWT claim missing | Inspect `policy.auth.required_claims`; ensure the IdP issues them |
+| Admin token wrong on management API | Verify `GATEWAY_SERVER__ADMIN_TOKEN` matches what you send |
+
+### `402 Payment Required`
+
+| Trigger | Resolution |
+|---------|-----------|
+| Feature gated behind a higher license tier | Upgrade tier, or disable the feature. See [License Tiers](/nexus/deployment/license-tiers) |
+
+### `403 Forbidden`
+
+| Trigger | Resolution |
+|---------|-----------|
+| Token lacks required scope | Reissue token with the missing scope, or relax `required_scopes` |
+| IP address not in `ip_filter.cidrs` (allow mode) | Add the source IP/CIDR to the allowlist |
+| IP address in `ip_filter.cidrs` (deny mode) | Remove from the denylist or change source IP |
+| Path matched a `path_denylist` prefix (pass-through mode) | Remove the path from the denylist or route differently |
+
+### `404 Not Found`
+
+| Trigger | Resolution |
+|---------|-----------|
+| No App matches the path prefix | Verify `gateway_path` and that the App is `is_active = true` |
+| Version status is `retired` | Recreate the Version under a new label, or set status to `deprecated` |
+| Path not registered (managed_endpoint mode) | Register the Endpoint, or switch the App to `pass_through` |
+| Management API resource not found | Verify the UUID; check the resource exists |
+
+### `405 Method Not Allowed`
+
+| Trigger | Resolution |
+|---------|-----------|
+| Method not in `allowed_methods` policy | Add the method or call a different one |
+| Endpoint registered for a different method (managed mode) | Register an Endpoint for this method, or use a registered one |
+
+### `408 Request Timeout`
+
+| Trigger | Resolution |
+|---------|-----------|
+| Client too slow sending body | Increase the client's send buffer, or check network |
+
+### `409 Conflict`
+
+| Trigger | Resolution |
+|---------|-----------|
+| App slug or `gateway_path` already exists | Choose a unique slug / path |
+| Version label already exists for this App | Pick a unique version label |
+| Revision label already exists for this Version | Pick a unique revision label |
+| `(method, path)` Endpoint already exists | Use `PATCH` to update, or pick a new path |
+
+### `413 Payload Too Large`
+
+| Trigger | Resolution |
+|---------|-----------|
+| Request body exceeds `body_size_limit` | Raise the limit per policy or reduce payload. See [Body Size Limit](/nexus/policies/body-size-limit) |
+
+### `415 Unsupported Media Type`
+
+| Trigger | Resolution |
+|---------|-----------|
+| `Content-Type` not allowed by policy | Send a supported `Content-Type` |
+
+### `422 Unprocessable Entity`
+
+| Trigger | Resolution |
+|---------|-----------|
+| Management API: validation failure on body fields | Inspect `message` for the failing field; fix and resubmit |
+| Config reload failed validation (`POST /config/reload`) | Fix the config file; the previous config remains active |
+
+### `429 Too Many Requests`
+
+| Trigger | Resolution |
+|---------|-----------|
+| Per-IP rate limit exceeded | Wait for window to reset (response includes `Retry-After`); raise limit if legitimate |
+| Per-token rate limit exceeded | Wait, raise the policy `rate_limit.requests`, or distribute across tokens |
+
+---
+
+## 5xx — Server Errors
+
+### `500 Internal Server Error`
+
+| Trigger | Resolution |
+|---------|-----------|
+| Uncaught panic or database error | Check structured logs; report at GitHub Issues |
+| Cache backend (Redis) unreachable while required | Verify Redis connectivity; fall back to in-process cache for eval |
+
+### `502 Bad Gateway`
+
+| Trigger | Resolution |
+|---------|-----------|
+| Backend connection refused / DNS failure | Verify backend host, port, and network reachability |
+| Backend returned malformed response | Check backend logs; the gateway forwards the upstream payload |
+| TLS handshake to backend failed | Verify `backend_scheme`, server cert chain, mTLS profile |
+
+### `503 Service Unavailable`
+
+| Trigger | Resolution |
+|---------|-----------|
+| App `is_active = false` | Reactivate via `PATCH /api/v1/apps/:id` |
+| Circuit breaker open for the Revision | Wait for recovery window. See [Circuit Breaker](/nexus/backends/circuit-breaker) |
+| All Revisions for the Version are unhealthy | Inspect health probe logs; fix backends or `health_check_path` |
+| Graceful shutdown in progress | Expected during deploys; load balancer should drain |
+
+### `504 Gateway Timeout`
+
+| Trigger | Resolution |
+|---------|-----------|
+| Backend exceeded the `timeout` policy | Raise the policy timeout or optimize the backend |
+| Slow connect to backend | Check network latency; verify connection pool warmth |
+
+---
+
+## Headers Added to Error Responses
+
+| Header | When |
+|--------|------|
+| `Retry-After: <seconds>` | On `429` and `503` (graceful shutdown) |
+| `Deprecation: true` | On 2xx responses for Versions in `deprecated` status |
+| `Sunset: <date>` | On 2xx for `deprecated` Versions when `sunset_at` is set |
+| `X-RateLimit-Remaining` | On every authenticated request when rate limit policy is enabled |
+| `X-RateLimit-Limit` | Same as above |
+| `X-RateLimit-Reset` | Same as above |
+
+---
+
+## Distinguishing Gateway Errors from Backend Errors
+
+Gateway-generated errors carry the response envelope shown above and the header `X-Gateway-Source: gateway`. Errors forwarded from your backend pass through unchanged with `X-Gateway-Source: backend` (when configured). Use this to triage whether a 5xx came from Nexus or the upstream service.

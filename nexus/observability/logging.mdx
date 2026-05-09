@@ -1,0 +1,187 @@
+---
+title: "Structured Logging"
+description: "Stdout text or JSON logs with x-request-id correlation, levels, and key gateway lifecycle events."
+---
+
+Nexus API Gateway by Drasken Cloud emits structured log output to **stdout** on every startup. This page covers log formats, levels, configuration, trace correlation, and production recommendations. For the optional log-forwarding pipeline that ships logs to external systems, see [pipelines/logging](/nexus/pipelines/logging).
+
+---
+
+## Configuration
+
+Logging behaviour is controlled by two keys in the `[server]` section of `config/default.toml` or their environment variable equivalents.
+
+| Config key | Env var | Default | Values |
+|---|---|---|---|
+| `server.log_level` | `GATEWAY_SERVER__LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
+| `server.log_format` | `GATEWAY_SERVER__LOG_FORMAT` | `text` | `text`, `json` |
+
+> **Precedence:** `RUST_LOG` overrides `server.log_level` when both are set. `RUST_LOG` supports the full `tracing-subscriber` filter syntax (e.g., `RUST_LOG=gateway=debug,tower_http=warn`).
+
+---
+
+## Log Levels
+
+| Level | When it fires |
+|---|---|
+| `error` | Unrecoverable errors, panics caught at boundaries, failed writes to dead-letter |
+| `warn` | Recoverable errors, circuit breaker trips, retry exhaustion, cache misses on critical paths |
+| `info` | Normal lifecycle events: startup, config load, revision activation, shutdown |
+| `debug` | Per-request middleware decisions, cache lookups, policy evaluations |
+| `trace` | Full request/response headers, raw SQL queries, hot-path internals |
+
+Set `log_level = "debug"` (or `RUST_LOG=debug`) during development. Use `info` or `warn` in production to avoid log volume overwhelming your aggregator.
+
+---
+
+## Output Formats
+
+### Text format (`log_format = "text"`)
+
+Human-readable. Recommended for local development and quick log tailing.
+
+```
+2026-01-15T12:34:56.789Z  INFO gateway::proxy::engine: request forwarded revision_id=01234567-89ab-cdef-0123-456789abcdef status=200 latency_ms=42 x-request-id=a1b2c3d4-e5f6-7890-abcd-ef1234567890
+```
+
+Each line contains: timestamp · level · target (module path) · message · key=value fields.
+
+### JSON format (`log_format = "json"`)
+
+One JSON object per line (JSONL). Recommended for production; structured for machine parsing and log aggregators.
+
+```json
+{
+  "timestamp": "2026-01-15T12:34:56.789Z",
+  "level": "INFO",
+  "target": "gateway::proxy::engine",
+  "message": "request forwarded",
+  "fields": {
+    "revision_id": "01234567-89ab-cdef-0123-456789abcdef",
+    "status": 200,
+    "latency_ms": 42,
+    "x-request-id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+  }
+}
+```
+
+All fields are typed: integers are not quoted, booleans are `true`/`false`, timestamps are RFC 3339.
+
+---
+
+## Trace Correlation
+
+Every log line emitted inside a request context includes the `x-request-id` field. This ID is a UUID v4 that the gateway generates on every inbound request (or propagates if the client sends one).
+
+```json
+{
+  "level": "WARN",
+  "target": "gateway::middleware::auth",
+  "message": "token expired",
+  "fields": {
+    "x-request-id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "app_id": "9f8e7d6c-5b4a-3210-fedc-ba9876543210",
+    "token_id": "tok_..."
+  }
+}
+```
+
+Use `x-request-id` to:
+- Correlate gateway logs with backend service logs (the gateway forwards the header to the upstream).
+- Link to OpenTelemetry spans when OTLP export is enabled. See [distributed-tracing](/nexus/observability/distributed-tracing).
+- Filter a request's full journey across all log lines in an aggregator.
+
+---
+
+## Key Log Events
+
+The following events are always logged at `info` or above and are safe to alert on.
+
+### Startup sequence
+
+```
+INFO gateway: loading configuration path="config/default.toml"
+INFO gateway: database pool acquired connections=10
+INFO gateway: running pending migrations count=3
+INFO gateway: starting proxy listener addr=0.0.0.0:8080
+INFO gateway: starting management listener addr=0.0.0.0:9090
+INFO gateway: startup complete uptime_secs=0
+```
+
+### Config load and hot-reload
+
+```
+INFO gateway::api::config: config reloaded source="PATCH /api/v1/config"
+WARN gateway::api::config: config field not hot-reloadable field="server.proxy_port" ignored=true
+```
+
+### Revision activation
+
+```
+INFO gateway::store::revision: revision activated app_id=... version_id=... revision_id=...
+INFO gateway::store::revision: previous revision deactivated revision_id=...
+```
+
+### Health state changes
+
+```
+WARN gateway::health: backend unhealthy app_id=... revision_id=... url="http://backend:8000/health" status=503
+INFO gateway::health: backend recovered app_id=... revision_id=...
+```
+
+### Circuit breaker transitions
+
+```
+WARN gateway::proxy::engine: circuit breaker opened revision_id=... failures=5
+INFO gateway::proxy::engine: circuit breaker half-open revision_id=...
+INFO gateway::proxy::engine: circuit breaker closed revision_id=...
+```
+
+### Graceful shutdown drain
+
+```
+INFO gateway: SIGTERM received; initiating graceful shutdown
+INFO gateway: proxy listener closed; draining in-flight requests
+INFO gateway: audit pipeline draining remaining_events=12
+INFO gateway: audit pipeline drain complete
+INFO gateway: shutdown complete elapsed_secs=3
+```
+
+---
+
+## Log Rotation
+
+The console logger writes to stdout and does not rotate. Log rotation is the responsibility of your process supervisor, container runtime, or log-forwarding pipeline:
+
+- **Docker / Kubernetes**: use the container runtime's logging driver (e.g., `json-file` with `max-size` and `max-file`, or ship to a DaemonSet log collector).
+- **systemd**: `journald` manages retention automatically.
+- **Log forwarding pipeline**: the optional [logging pipeline](/nexus/pipelines/logging) writes to a file forwarder with configurable `max_mb` and `max_days` rotation, plus optional gzip compression. This is independent of console output.
+
+---
+
+## Production Recommendations
+
+| Setting | Production value | Reason |
+|---|---|---|
+| `log_format` | `json` | Structured for aggregators (Loki, Elasticsearch, Splunk) |
+| `log_level` | `info` or `warn` | `debug`/`trace` generate very high volumes |
+| `RUST_LOG` | unset or same as `log_level` | Avoid accidental override with over-verbose filters |
+| Sampling | At aggregator level | Do not suppress info/warn at source; sample in the aggregator if needed |
+
+### Shipping logs to an aggregator
+
+1. Set `log_format = "json"` (or `GATEWAY_SERVER__LOG_FORMAT=json`).
+2. Enable the [logging pipeline](/nexus/pipelines/logging) (`logging.enabled = true`) and configure a forwarder (file, webhook, or postgres).
+3. Point your log collector (Fluent Bit, Vector, Promtail) at stdout or at the log file the pipeline writes.
+
+Alternatively, collect stdout directly via the container runtime and forward to your aggregator — no pipeline forwarder needed.
+
+---
+
+## Quick-start: tailing JSON logs in development
+
+```bash
+GATEWAY_SERVER__LOG_FORMAT=json cargo run 2>&1 | jq -r '"\(.timestamp) \(.level) \(.target) \(.message) \(.fields | to_entries | map("\(.key)=\(.value)") | join(" "))"'
+```
+
+This renders a readable one-liner from JSON output while preserving structured fields.

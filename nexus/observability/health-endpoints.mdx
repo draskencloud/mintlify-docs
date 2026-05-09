@@ -1,0 +1,216 @@
+---
+title: "Health Endpoints"
+description: "Always-public /api/v1/health and /api/v1/version endpoints on the management port for liveness/readiness."
+---
+
+Nexus API Gateway by Drasken Cloud exposes health check endpoints on the management port (9090). These endpoints are always public — they bypass admin token authentication even when `GATEWAY_SERVER__ADMIN_TOKEN` is set.
+
+---
+
+## Liveness / Readiness: `GET /api/v1/health`
+
+**URL:** `http://<host>:9090/api/v1/health`
+**Method:** `GET`
+**Auth:** None required
+
+This endpoint checks the health of all gateway infrastructure components and returns an aggregate status.
+
+### Response: Healthy (HTTP 200)
+
+```json
+{
+  "status": 200,
+  "message": "ok",
+  "data": {
+    "uptime_secs": 3600,
+    "components": {
+      "postgres": "up",
+      "redis": "up"
+    }
+  }
+}
+```
+
+### Response: Degraded (HTTP 503)
+
+```json
+{
+  "status": 503,
+  "message": "degraded",
+  "data": {
+    "uptime_secs": 3600,
+    "components": {
+      "postgres": "up",
+      "redis": "down"
+    }
+  }
+}
+```
+
+### Components checked
+
+| Component | Description | When "down" |
+|---|---|---|
+| `postgres` | Database connectivity; a lightweight `SELECT 1` query is executed | Connection timeout, pool exhausted, auth failure |
+| `redis` | Redis PING command (only checked when Redis is enabled) | Connection refused, timeout, AUTH failure |
+
+Redis is only present in the components map when `redis_enabled = true` (or `GATEWAY_REDIS_ENABLED=true`). When Redis is disabled, the component is omitted.
+
+### HTTP status codes
+
+| Code | Meaning |
+|---|---|
+| `200` | All components healthy |
+| `503` | One or more components down; gateway may return errors |
+
+---
+
+## Version Info: `GET /api/v1/version`
+
+**URL:** `http://<host>:9090/api/v1/version`
+**Method:** `GET`
+**Auth:** None required
+
+```bash
+curl http://localhost:9090/api/v1/version
+```
+
+```json
+{
+  "status": 200,
+  "message": "ok",
+  "data": {
+    "version": "1.2.0",
+    "build_hash": "a3f7b29c"
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `version` | Semantic version from `Cargo.toml` |
+| `build_hash` | Short git commit hash baked in at build time |
+
+---
+
+## Per-Backend Health: Prometheus Gauge
+
+Individual revision health is not exposed through the `/health` endpoint. Use the Prometheus gauge instead:
+
+```
+gateway_backend_health{app_id="<uuid>", revision_id="<uuid>"}
+```
+
+- Value `1` = healthy
+- Value `0` = unhealthy (health probe failed; requests to this revision return 503)
+
+See [metrics](/nexus/observability/metrics) for the full metrics reference.
+
+---
+
+## Kubernetes Probe Configuration
+
+The `/api/v1/health` endpoint is suitable for both liveness and readiness probes.
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /api/v1/health
+    port: 9090
+  initialDelaySeconds: 10
+  periodSeconds: 15
+  failureThreshold: 3
+  timeoutSeconds: 5
+
+readinessProbe:
+  httpGet:
+    path: /api/v1/health
+    port: 9090
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+  timeoutSeconds: 5
+```
+
+**Recommendation:** Use the same endpoint for both liveness and readiness. A 503 from `/health` means the gateway cannot serve traffic reliably (e.g., database is down). Kubernetes will stop routing traffic to the pod until the probe passes again.
+
+### Startup probe (for slow database migrations)
+
+If `auto_migrate = true` and you have many pending migrations, the gateway may take longer than usual to become ready. Add a startup probe with a generous `failureThreshold`:
+
+```yaml
+startupProbe:
+  httpGet:
+    path: /api/v1/health
+    port: 9090
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  failureThreshold: 24   # 24 × 5s = 2 minutes for migrations to complete
+  timeoutSeconds: 5
+```
+
+---
+
+## Load Balancer Configuration
+
+### AWS ALB / NLB
+
+Target group health check settings:
+
+| Setting | Recommended value |
+|---|---|
+| Protocol | HTTP |
+| Port | 9090 |
+| Path | `/api/v1/health` |
+| Healthy threshold | 2 |
+| Unhealthy threshold | 3 |
+| Timeout | 5 seconds |
+| Interval | 15 seconds |
+| Success codes | 200 |
+
+### nginx upstream health check
+
+```nginx
+upstream gateway {
+    server gateway-1:8080;
+    server gateway-2:8080;
+    keepalive 32;
+}
+
+# With nginx-plus or lua-resty-healthcheck:
+# health_check uri=/api/v1/health port=9090 interval=10s;
+```
+
+For open-source nginx, use a separate health-check proxy pass to port 9090 before routing to port 8080.
+
+### HAProxy
+
+```
+backend gateway_backend
+    option httpchk GET /api/v1/health HTTP/1.1\r\nHost:\ gateway
+    http-check expect status 200
+    server gw1 gateway-1:8080 check port 9090
+    server gw2 gateway-2:8080 check port 9090
+```
+
+---
+
+## curl Examples
+
+```bash
+# Basic health check
+curl -s http://localhost:9090/api/v1/health | jq .
+
+# Check exit code (0 = healthy, non-zero = degraded)
+curl -sf http://localhost:9090/api/v1/health > /dev/null && echo "healthy" || echo "degraded"
+
+# Get version
+curl -s http://localhost:9090/api/v1/version | jq .data
+
+# Poll until healthy (useful in scripts after startup)
+until curl -sf http://localhost:9090/api/v1/health > /dev/null; do
+  echo "waiting for gateway..."
+  sleep 2
+done
+echo "gateway is healthy"
+```

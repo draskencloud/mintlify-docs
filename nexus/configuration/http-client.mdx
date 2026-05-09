@@ -1,0 +1,152 @@
+---
+title: "HTTP Client Configuration Reference"
+description: "Tunables for the shared outbound reqwest client used for proxy upstream calls, JWKS fetches, and webhooks."
+---
+
+The gateway maintains a shared outbound HTTP client backed by [reqwest](https://docs.rs/reqwest) for all egress traffic that is not subject to per-revision mTLS. The settings in this section tune that shared client.
+
+## What Uses the Shared Client
+
+| Use case | Description |
+|---|---|
+| **Proxy upstream calls** | Forwarding client requests to registered backend services |
+| **JWKS URL fetches** | Fetching JSON Web Key Sets from remote identity providers |
+| **Analytics webhook delivery** | POSTing analytics events to webhook forwarders |
+| **Logging webhook delivery** | POSTing log events to webhook forwarders |
+| **Update check** | `GET` to the GitHub Releases API at startup |
+
+**mTLS backend clients are separate.** When a revision specifies a `backend_mtls_profile`, the gateway uses a dedicated `reqwest::Client` pre-loaded with the client certificate and CA bundle for that profile. These clients are not configured through the `[http]` section — they use only the certificates from the mTLS profile. See [tls.md](/nexus/configuration/tls) for mTLS profile configuration.
+
+## Quick Reference
+
+```toml
+[http]
+connect_timeout_ms      = 5000    # env: GATEWAY_HTTP__CONNECT_TIMEOUT_MS
+request_timeout_ms      = 30000   # env: GATEWAY_HTTP__REQUEST_TIMEOUT_MS
+pool_idle_timeout_secs  = 90      # env: GATEWAY_HTTP__POOL_IDLE_TIMEOUT_SECS
+pool_max_idle_per_host  = 32      # env: GATEWAY_HTTP__POOL_MAX_IDLE_PER_HOST
+```
+
+## Key Reference
+
+### `http.connect_timeout_ms`
+
+| | |
+|---|---|
+| Type | Integer (milliseconds) |
+| Default | `5000` (5 seconds) |
+| Env var | `GATEWAY_HTTP__CONNECT_TIMEOUT_MS` |
+| Runtime reload | No — requires restart |
+
+Maximum time allowed to establish a TCP connection (including DNS resolution and TLS handshake) to an upstream host. If the connection cannot be established within this duration the request fails immediately.
+
+This setting is particularly relevant for backends that are slow to accept connections or where DNS lookups are slow. It does not limit the time to send the request or receive the response — that is controlled by `request_timeout_ms`.
+
+---
+
+### `http.request_timeout_ms`
+
+| | |
+|---|---|
+| Type | Integer (milliseconds) |
+| Default | `30000` (30 seconds) |
+| Env var | `GATEWAY_HTTP__REQUEST_TIMEOUT_MS` |
+| Runtime reload | No — requires restart |
+
+Total timeout for a single HTTP request from the moment the connection is established until the complete response body is received. This is a timeout on the reqwest client itself.
+
+**Relationship with `server.proxy_timeout_ms`:**
+
+These two settings are different and complementary:
+
+| Setting | Scope | Enforcement point |
+|---|---|---|
+| `http.request_timeout_ms` | Per outbound HTTP request on the shared client | reqwest client |
+| `server.proxy_timeout_ms` | Entire handler execution (middleware deadline) | Tower middleware |
+
+`proxy_timeout_ms` wraps the entire handler — including database lookups, cache operations, and the upstream call. `request_timeout_ms` applies only to the HTTP call itself, and only for the shared client. In practice, `proxy_timeout_ms` should be set equal to or slightly less than `request_timeout_ms` to ensure the middleware deadline fires before the client timeout.
+
+If both fire, the middleware deadline fires first (since it starts earlier and wraps more work), and the client returns 504 to the caller.
+
+---
+
+### `http.pool_idle_timeout_secs`
+
+| | |
+|---|---|
+| Type | Integer (seconds) |
+| Default | `90` |
+| Env var | `GATEWAY_HTTP__POOL_IDLE_TIMEOUT_SECS` |
+| Runtime reload | No — requires restart |
+
+How long an idle keep-alive connection to an upstream host may remain in the connection pool before being closed. Reducing this value frees connections to backends that have infrequent traffic. Setting it too low causes more TCP handshakes and degrades latency under bursty traffic.
+
+The default of 90 seconds is a good balance for most deployments. If your upstream load balancers have a shorter idle timeout (e.g., AWS ALB defaults to 60 seconds), set this value to be a few seconds lower to avoid sending requests on connections that the load balancer has already closed.
+
+---
+
+### `http.pool_max_idle_per_host`
+
+| | |
+|---|---|
+| Type | Integer |
+| Default | `32` |
+| Env var | `GATEWAY_HTTP__POOL_MAX_IDLE_PER_HOST` |
+| Runtime reload | No — requires restart |
+
+Maximum number of idle keep-alive connections the shared client maintains per upstream host. Under high concurrency, more idle connections mean faster request dispatch (fewer TCP handshakes). Under low concurrency, idle connections consume file descriptors unnecessarily.
+
+For a gateway proxying to a small number of high-traffic backends, increase this value. For a gateway proxying to many backends with low individual traffic, reduce it to limit file descriptor usage.
+
+---
+
+## Configuration Examples
+
+### Low-latency upstream services
+
+```toml
+[http]
+connect_timeout_ms     = 2000   # fast internal network
+request_timeout_ms     = 10000  # tight SLA
+pool_idle_timeout_secs = 120
+pool_max_idle_per_host = 64     # high concurrency per backend
+```
+
+### External third-party APIs
+
+```toml
+[http]
+connect_timeout_ms     = 10000  # external DNS + TLS can be slow
+request_timeout_ms     = 60000  # generous timeout for slow external APIs
+pool_idle_timeout_secs = 60     # stay below typical external load balancer idle timeout
+pool_max_idle_per_host = 8      # fewer connections to external services
+```
+
+### High fan-out (many backends, low per-backend traffic)
+
+```toml
+[http]
+connect_timeout_ms     = 5000
+request_timeout_ms     = 30000
+pool_idle_timeout_secs = 30     # reclaim connections faster
+pool_max_idle_per_host = 4      # limit file descriptor usage
+```
+
+---
+
+## TLS for Upstream Connections
+
+The shared client uses rustls for outbound TLS connections. System CA certificates are loaded at startup for upstream certificate validation. To trust a private CA for an upstream service, use an mTLS profile (see [tls.md](/nexus/configuration/tls)) — this gives you full control over the CA bundle for that specific backend.
+
+The shared client always validates upstream TLS certificates. Certificate validation cannot be disabled globally (this would be a security vulnerability). For development against a backend with a self-signed certificate, use an mTLS profile and provide the self-signed CA certificate as the `CA_PATH`.
+
+---
+
+## Environment Variable Reference
+
+| Variable | Default | Description |
+|---|---|---|
+| `GATEWAY_HTTP__CONNECT_TIMEOUT_MS` | `5000` | TCP connection + TLS handshake timeout |
+| `GATEWAY_HTTP__REQUEST_TIMEOUT_MS` | `30000` | Total request timeout on the shared client |
+| `GATEWAY_HTTP__POOL_IDLE_TIMEOUT_SECS` | `90` | Idle keep-alive connection expiry |
+| `GATEWAY_HTTP__POOL_MAX_IDLE_PER_HOST` | `32` | Max idle connections per upstream host |

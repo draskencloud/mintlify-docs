@@ -1,0 +1,270 @@
+---
+title: "Per-Token Rate Limiting"
+description: "Post-auth quota enforcement per authenticated token; supports fixed_window, sliding_window, and token_bucket."
+---
+
+Per-token rate limiting enforces API quotas on authenticated clients. Unlike IP rate limiting (which runs pre-auth and uses source IP), token rate limiting identifies clients by their authenticated token or app, allowing precise per-client quota management.
+
+---
+
+## How It Works
+
+After the Auth middleware validates a token, the Rate Limit middleware reads the effective policy's `rate_limit` configuration and checks whether the authenticated client has exceeded its quota for the current window. If the quota is exceeded, the request is rejected immediately with `429 Too Many Requests` — the backend is never called.
+
+```
+[IP Rate Limit]
+      │
+   [Trace]
+      │
+   [Auth]        ← token validated; token_id extracted
+      │
+[Rate Limit]     ← quota checked against token_id  ← HERE
+      │
+[Header Validation]
+...
+```
+
+---
+
+## Configuration
+
+Rate limiting is configured in the `rate_limit` field of the policy document. It can be set at any level of the hierarchy (app, version, revision, endpoint) with the most specific level taking precedence.
+
+```json
+{
+  "rate_limit": {
+    "enabled": true,
+    "requests": 1000,
+    "window_seconds": 60,
+    "algorithm": "sliding_window"
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `false` | Enable or disable rate limiting for this policy level |
+| `requests` | integer | `1000` | Maximum number of requests allowed per window |
+| `window_seconds` | integer | `60` | Window duration in seconds |
+| `algorithm` | string | `fixed_window` | Rate limiting algorithm: `fixed_window`, `sliding_window`, or `token_bucket` |
+
+> **Default is disabled.** Setting `enabled: false` (or omitting `rate_limit` from the policy) disables per-token rate limiting at that level.
+
+---
+
+## Rate Limiting Algorithms
+
+### `fixed_window` (default)
+
+A simple counter that resets at the start of each window boundary (e.g., every 60 seconds on the minute).
+
+**Behaviour:**
+- Counter starts at 0 at the window start.
+- Each request increments the counter.
+- When counter reaches `requests`, all subsequent requests in that window are rejected.
+- Counter resets to 0 when the window boundary is crossed.
+
+**Trade-off:** At a window boundary, a client can make `requests` at the end of window N and `requests` at the start of window N+1, effectively making `2×requests` in a short period. This "boundary burst" is the primary weakness of fixed windows.
+
+**Best for:** High-volume APIs where simplicity and Redis efficiency matter more than perfect burst control.
+
+```
+Window 1 (0–60s):  ████████████████ 1000/1000  → window resets
+Window 2 (60–120s): ████ 400/1000
+```
+
+---
+
+### `sliding_window`
+
+A time-based window that tracks request timestamps. At any point in time, the count of requests in the last `window_seconds` is checked.
+
+**Behaviour:**
+- Requests are timestamped and stored in a sorted set (Redis ZSet).
+- On each request, entries older than `now - window_seconds` are removed.
+- The remaining count is compared to `requests`.
+- No boundary burst — the window slides continuously.
+
+**Trade-off:** Higher Redis overhead (ZSet operations) than fixed window. For most workloads this is negligible.
+
+**Best for:** APIs where strict burst control matters (e.g., SMS sending, email APIs, webhook delivery).
+
+```
+t=0:   100 requests → accepted (100 in last 60s)
+t=30:  900 more requests → accepted (1000 in last 60s, at limit)
+t=35:  1 more request → rejected (1000 in last 60s)
+t=65:  requests from t=0..4 have expired → some capacity freed
+```
+
+---
+
+### `token_bucket`
+
+A bucket starts with `requests` tokens. Each request consumes one token. Tokens refill at a rate of `requests / window_seconds` tokens per second. Requests are rejected when the bucket is empty.
+
+**Behaviour:**
+- Bucket capacity: `requests` (maximum burst).
+- Refill rate: `requests / window_seconds` tokens/second.
+- Bursting up to `requests` in rapid succession is allowed if the bucket is full.
+- After a burst, the client must wait for the bucket to refill before sending more.
+
+**Trade-off:** Allows controlled bursting while enforcing a sustained throughput limit. More complex state to maintain in Redis.
+
+**Best for:** Bursty workloads where clients need to send many requests quickly but average throughput is low (e.g., batch job initiation, mobile sync).
+
+```
+requests=100, window_seconds=60 → refill rate: ~1.67 tokens/second
+Empty bucket: client must wait ~0.6s between requests
+Full bucket:  client can burst 100 requests instantly, then wait
+```
+
+---
+
+## Rate Limit Key
+
+Rate limits are tracked per token per revision (or per app if no token is present):
+
+```
+rate_limit:<revision_id>:<token_id>
+```
+
+Examples:
+```
+rate_limit:b2c3d4e5-...-0001:c3d4e5f6-...-0001
+rate_limit:b2c3d4e5-...-0001:anonymous
+```
+
+Revisions are used as the scope (not versions or apps) so that rate limits are isolated between revisions. A client using the same token against two different revisions gets two independent counters.
+
+---
+
+## Storage Backend
+
+| Backend | Behaviour |
+|---------|-----------|
+| **Redis** | Atomic operations; counters shared across all gateway replicas |
+| **In-process DashMap** | Per-instance fallback; counters not shared across replicas |
+
+For production multi-replica deployments, Redis is required to enforce rate limits correctly. Without Redis, clients can spread requests across instances to bypass per-instance limits.
+
+The gateway automatically falls back to DashMap when Redis is unreachable, emitting a log warning.
+
+---
+
+## Rate Limit Response
+
+**HTTP Status:** `429 Too Many Requests`
+
+**Headers:**
+```
+Retry-After: 45
+```
+(`Retry-After` value is the number of seconds until the current window resets or the bucket refills enough for one request.)
+
+**Body:**
+```json
+{
+  "status": 429,
+  "message": "rate limit exceeded",
+  "data": null
+}
+```
+
+---
+
+## Multi-Level Rate Limiting
+
+Rate limits can be configured at multiple levels simultaneously. The most specific level that is enabled takes precedence.
+
+**Example:**
+
+App policy:
+```json
+{"rate_limit": {"enabled": true, "requests": 1000, "window_seconds": 60}}
+```
+
+Revision policy:
+```json
+{"rate_limit": {"enabled": true, "requests": 500, "window_seconds": 60}}
+```
+
+Endpoint `POST /orders/bulk-import` policy_override:
+```json
+{"rate_limit": {"enabled": true, "requests": 10, "window_seconds": 60}}
+```
+
+Effective limits:
+- `GET /orders` → 500 requests/min (revision overrides app)
+- `POST /orders/bulk-import` → 10 requests/min (endpoint overrides revision)
+
+---
+
+## Metrics
+
+```
+gateway_rate_limit_decisions_total{algorithm="sliding_window", decision="allowed"}
+gateway_rate_limit_decisions_total{algorithm="sliding_window", decision="denied"}
+```
+
+Labels:
+- `algorithm` — the algorithm used (`fixed_window`, `sliding_window`, `token_bucket`)
+- `decision` — `allowed` or `denied`
+
+Use these metrics to track quota utilisation and identify clients approaching their limits before they start seeing `429` errors.
+
+---
+
+## Complete Policy Example
+
+```bash
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "policy": {
+      "rate_limit": {
+        "enabled": true,
+        "requests": 500,
+        "window_seconds": 60,
+        "algorithm": "sliding_window"
+      }
+    }
+  }' | jq
+```
+
+To set a tighter limit on a specific expensive endpoint (managed_endpoint mode):
+
+```bash
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID/endpoints/$ENDPOINT_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "policy_override": {
+      "rate_limit": {
+        "enabled": true,
+        "requests": 5,
+        "window_seconds": 60,
+        "algorithm": "token_bucket"
+      }
+    }
+  }' | jq
+```
+
+---
+
+## Choosing an Algorithm
+
+| Scenario | Recommended algorithm |
+|----------|-----------------------|
+| Simple quota enforcement, high throughput, Redis efficiency matters | `fixed_window` |
+| Strict per-second smoothing, no boundary burst acceptable | `sliding_window` |
+| Clients need to burst but sustained throughput is limited | `token_bucket` |
+| You are not sure | `sliding_window` (safest default) |
+
+---
+
+## Related Topics
+
+- [IP Rate Limiting](/nexus/policies/ip-rate-limiting) — pre-auth per-IP protection (not in policy document)
+- [Policy Overview](/nexus/policies/overview) — full policy field reference and inheritance rules
+- [Routing Overview](/nexus/routing/overview) — middleware stack execution order

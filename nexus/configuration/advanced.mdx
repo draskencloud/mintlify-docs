@@ -1,0 +1,282 @@
+---
+title: "Advanced Configuration Reference"
+description: "Swagger UI, file watcher, crash log, update checker, JWKS validation, and OpenTelemetry export."
+---
+
+This page covers advanced configuration features that do not fit neatly into the other reference pages: Swagger UI, file watching, crash logging, the update checker, JWKS validation, and OpenTelemetry.
+
+## Swagger UI and OpenAPI Specification
+
+The gateway ships with an embedded [Swagger UI](https://swagger.io/tools/swagger-ui/) for interactive API exploration and an auto-generated OpenAPI 3.0 specification.
+
+### Configuration
+
+| Key | Default | Env var | Description |
+|---|---|---|---|
+| `server.swagger_enabled` | `true` | `GATEWAY_SERVER__SWAGGER_ENABLED` | Toggle Swagger UI and OpenAPI spec endpoints |
+
+```toml
+[server]
+swagger_enabled = true
+```
+
+### Endpoints
+
+| URL | Description |
+|---|---|
+| `http://localhost:9090/swagger-ui` | Interactive Swagger UI |
+| `http://localhost:9090/api-docs/openapi.json` | OpenAPI 3.0 specification (JSON) |
+
+Both endpoints are served on the **management port** (9090), not the proxy port.
+
+### Disabling in Production
+
+Set `swagger_enabled = false` (or `GATEWAY_SERVER__SWAGGER_ENABLED=false`) in production environments where you do not want the API schema discoverable:
+
+```bash
+GATEWAY_SERVER__SWAGGER_ENABLED=false
+```
+
+When disabled, requests to `/swagger-ui` and `/api-docs/openapi.json` return 404.
+
+---
+
+## Hot-Reload File Watcher
+
+The gateway can watch the `apps_dir` directory for TOML file changes and automatically reload app definitions without a restart.
+
+### Configuration
+
+| Key | Default | Env var | Description |
+|---|---|---|---|
+| `file_watch_enabled` | `false` | `GATEWAY_FILE_WATCH_ENABLED` | Enable file system watcher |
+| `file_watch_debounce_ms` | `500` | `GATEWAY_FILE_WATCH_DEBOUNCE_MS` | Debounce delay before triggering reload |
+| `apps_dir` | `config/apps` | `GATEWAY_APPS_DIR` | Directory containing app TOML files |
+
+```toml
+file_watch_enabled   = true
+file_watch_debounce_ms = 500
+apps_dir             = "config/apps"
+```
+
+### Behaviour
+
+When `file_watch_enabled = true`:
+
+1. The gateway registers a recursive file system watcher on `apps_dir` using the [notify](https://docs.rs/notify) crate.
+2. Any `CREATE`, `MODIFY`, or `DELETE` event on a `.toml` file in the directory (or any subdirectory) starts the debounce timer.
+3. After `file_watch_debounce_ms` of inactivity, the full `apps_dir` is re-read and the app registry is updated atomically.
+4. In-flight requests are not disrupted — the update is applied to the routing table atomically so new requests immediately see the new configuration.
+
+### Multi-Instance Usage
+
+When all instances mount the same `apps_dir` from shared storage (e.g., a Kubernetes `ConfigMap`, NFS, or a shared EFS volume), file-watch reloads propagate to all instances when the shared files are updated. Each instance picks up the change independently within `file_watch_debounce_ms`.
+
+### Manual Reload Alternative
+
+File watching is optional. To trigger a reload manually without file watching:
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer $GATEWAY_ADMIN_TOKEN" \
+  http://localhost:9090/api/v1/config/reload
+```
+
+---
+
+## Crash Log
+
+The gateway installs a custom panic hook at startup that writes a structured JSON crash entry to the crash log file before the process terminates.
+
+### Configuration
+
+| Key | Default | Env var | Description |
+|---|---|---|---|
+| `crash_log_path` | `./crash.log` | `GATEWAY_SERVER__CRASH_LOG_PATH` | Path to the crash log file |
+
+```toml
+crash_log_path = "./crash.log"
+```
+
+### Crash Log Entry Format
+
+```json
+{
+  "timestamp": "2026-05-09T12:34:56.789Z",
+  "version": "0.1.0",
+  "build_hash": "abc123def456",
+  "thread": "tokio-runtime-worker",
+  "message": "panicked at 'attempt to subtract with overflow', src/proxy/handler.rs:142:18"
+}
+```
+
+| Field | Description |
+|---|---|
+| `timestamp` | ISO 8601 UTC timestamp of the panic |
+| `version` | Binary version from `Cargo.toml` |
+| `build_hash` | Short git commit hash embedded at build time |
+| `thread` | Name of the thread that panicked |
+| `message` | Full panic message including file and line number |
+
+### Notes
+
+- The crash log is **not** the main log stream. It captures only unrecoverable panics.
+- If the crash log file cannot be written (e.g., permission error), the panic hook falls back to stderr.
+- The process exits with a non-zero code after writing the crash entry. Your process supervisor (systemd, Docker, Kubernetes) should be configured with `restart: on-failure` or equivalent.
+- For Docker deployments, mount the directory containing the crash log to persist it across container restarts:
+  ```bash
+  docker run -v ./logs:/app/logs \
+    -e GATEWAY_SERVER__CRASH_LOG_PATH=/app/logs/crash.log \
+    draskencloud/gateway
+  ```
+
+---
+
+## Update Checker
+
+At startup the gateway spawns an asynchronous background task that checks for a newer release on GitHub. The check is non-blocking — it never delays startup.
+
+### Configuration
+
+| Key | Default | Env var | Description |
+|---|---|---|---|
+| `update_check.enabled` | `true` | `GATEWAY_UPDATE_CHECK__ENABLED` | Enable background version check |
+| `update_check.url` | GitHub Releases API | `GATEWAY_UPDATE_CHECK__URL` | Version check endpoint URL |
+
+```toml
+[update_check]
+enabled = true
+url     = "https://api.github.com/repos/draskencloud/draskencloud.gateway.service/releases/latest"
+```
+
+### Behaviour
+
+1. On startup, if `update_check.enabled = true`, the gateway spawns a background task.
+2. The task issues a `GET` request to `update_check.url`.
+3. If the response indicates a version newer than the running binary, a `WARN`-level log message is emitted:
+   ```
+   WARN nexus: new version available: v1.2.3 (running v0.1.0) — https://github.com/draskencloud/...
+   ```
+4. **No automatic upgrade occurs.** The check is informational only.
+5. If the request fails (network error, timeout, non-2xx response), the failure is logged at `DEBUG` level and ignored. Startup is not affected.
+
+### Disabling in Air-Gapped Environments
+
+```toml
+[update_check]
+enabled = false
+```
+
+Or:
+
+```bash
+GATEWAY_UPDATE_CHECK__ENABLED=false
+```
+
+For air-gapped deployments where outbound internet access is restricted, point the URL at an internal mirror:
+
+```bash
+GATEWAY_UPDATE_CHECK__URL=https://internal-registry.example.com/gateway/releases/latest
+```
+
+---
+
+## JWKS Validation Settings
+
+These settings control startup and reload-time validation of JWKS URLs declared in authentication policies.
+
+### Configuration
+
+```toml
+[jwks]
+validate_on_reload = true    # env: GATEWAY_JWKS__VALIDATE_ON_RELOAD
+fetch_timeout_ms   = 5000    # env: GATEWAY_JWKS__FETCH_TIMEOUT_MS
+cache_ttl_secs     = 300     # env: GATEWAY_JWKS__CACHE_TTL_SECS
+```
+
+### `jwks.validate_on_reload`
+
+| Key | Default | Env var |
+|---|---|---|
+| `jwks.validate_on_reload` | `true` | `GATEWAY_JWKS__VALIDATE_ON_RELOAD` |
+
+When `true`, every JWKS URL declared in active `AuthPolicy` records is probed at startup and on every `POST /api/v1/config/reload` call. The probe:
+
+1. Validates the URL format (must be `https://` for production).
+2. Sends a `GET` request with a `fetch_timeout_ms` timeout.
+3. Parses the response as a valid JWKS (checks for the `keys` array).
+
+If any JWKS URL fails validation, the config reload is rejected and the previous config is retained. A detailed error is returned in the reload response and logged at `ERROR` level.
+
+Set to `false` to skip reachability checks — useful during cold start when the identity provider comes up in parallel with the gateway:
+
+```bash
+GATEWAY_JWKS__VALIDATE_ON_RELOAD=false
+```
+
+### `jwks.fetch_timeout_ms`
+
+| Key | Default | Env var |
+|---|---|---|
+| `jwks.fetch_timeout_ms` | `5000` | `GATEWAY_JWKS__FETCH_TIMEOUT_MS` |
+
+Timeout for all JWKS HTTP fetches — both validation probes (at startup/reload) and runtime key fetches (during JWT verification). If the identity provider is on a slow network link, increase this value.
+
+---
+
+## OpenTelemetry (OTLP Export)
+
+The gateway can export traces and metrics via OpenTelemetry Protocol (OTLP) to any compatible backend (Jaeger, Tempo, Honeycomb, Datadog, etc.).
+
+### Build Requirement
+
+OTLP support is an **optional Cargo feature** and must be compiled in:
+
+```bash
+cargo build --release --features otlp
+```
+
+The standard Docker image includes the `otlp` feature.
+
+### Activation
+
+OTLP export is activated by setting `GATEWAY_OTLP_ENDPOINT`:
+
+```bash
+export GATEWAY_OTLP_ENDPOINT=http://otel-collector:4318
+```
+
+No TOML key is required — the presence of this environment variable activates the feature. If the binary was not built with `--features otlp`, setting this variable has no effect and a warning is logged.
+
+### OTLP Endpoint Formats
+
+| Format | Description |
+|---|---|
+| `http://host:4318` | OTLP/HTTP (protobuf) — most common |
+| `http://host:4317` | OTLP/gRPC |
+| `https://host:4318` | OTLP/HTTP over TLS |
+
+The gateway uses `opentelemetry-otlp` with the `http-proto` transport (reqwest-backed).
+
+### Docker Compose with OpenTelemetry Collector
+
+```yaml
+services:
+  gateway:
+    image: draskencloud/gateway:latest
+    environment:
+      GATEWAY_OTLP_ENDPOINT: "http://otel-collector:4318"
+    # ...
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    ports:
+      - "4318:4318"   # OTLP/HTTP
+      - "4317:4317"   # OTLP/gRPC
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
+```
+
+### License Requirement
+
+OTLP export requires a **Pro** license or higher. On Community tier, setting `GATEWAY_OTLP_ENDPOINT` has no effect and a license warning is logged.

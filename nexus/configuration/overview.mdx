@@ -1,45 +1,177 @@
 ---
-title: Configuration Overview
-description: How Nexus loads and applies configuration.
+title: "Configuration Overview"
+description: "Three-layer config: TOML file, .env, then shell env vars; nested dotted keys map to GATEWAY_*__*."
 ---
 
-## Sources
+The Nexus API Gateway by Drasken Cloud uses a three-layer configuration system. Each layer can override values from the layer below it.
 
-Nexus loads configuration in this order (later sources win):
+## Configuration Layers
 
-1. `config/default.toml` — bundled defaults
-2. Environment variables prefixed with `GATEWAY_`
-
-## Environment Variable Format
-
-Nested TOML sections map to double-underscore `__` separators:
-
-| TOML | Environment Variable |
-|------|---------------------|
-| `[server] proxy_port` | `GATEWAY_SERVER__PROXY_PORT` |
-| `[server] admin_token` | `GATEWAY_SERVER__ADMIN_TOKEN` |
-| `[cache] enabled` | `GATEWAY_CACHE__ENABLED` |
-| `[cache.redis] url` | `GATEWAY_CACHE__REDIS__URL` |
-
-## Hot Reload
-
-Some runtime tunables can be patched without restart via:
-
-```bash
-PATCH http://localhost:9090/api/v1/config
+```
+┌─────────────────────────────────────────────────────────┐
+│  Layer 3 — Shell environment variables  (highest priority) │
+│  GATEWAY_SERVER__PROXY_PORT=9999                          │
+├─────────────────────────────────────────────────────────┤
+│  Layer 2 — .env file (loaded via dotenvy at startup)      │
+│  Loaded from the working directory; overridden by shell   │
+├─────────────────────────────────────────────────────────┤
+│  Layer 1 — config/default.toml  (base config)             │
+│  Auto-loaded from working directory                       │
+└─────────────────────────────────────────────────────────┘
 ```
 
-Static values (ports, TLS paths, DB driver) require a restart.
+Values at a higher layer always win. A key set in the shell environment always overrides the same key in `.env` or `config/default.toml`.
 
-## Database Drivers
+## TOML Configuration File
 
-| Driver | Value | Notes |
-|--------|-------|-------|
-| SQLite | `sqlite` | Default, zero-dependency, single instance |
-| PostgreSQL | `postgres` | Recommended for production / multi-instance |
-| MySQL | `mysql` | Full support |
-| CockroachDB | `cockroach` | Uses PostgreSQL wire protocol |
+The primary configuration file is `config/default.toml`, resolved relative to the working directory at startup. The file uses standard TOML syntax with sectioned blocks for each subsystem:
 
-<Note>
-  Migrations are embedded in the binary. Set `GATEWAY_AUTO_MIGRATE=true` to apply them on startup.
-</Note>
+```toml
+[server]
+proxy_port  = 8080
+mgmt_port   = 9090
+admin_token = "change-me"
+log_level   = "info"
+log_format  = "text"
+
+[cache]
+enabled = true
+backend = "redis"
+
+[cache.redis]
+url = "redis://localhost:6379"
+```
+
+See the individual reference pages for a full list of keys per section.
+
+## Environment Variables
+
+Every configuration key can be set via environment variable. The naming convention is:
+
+```
+GATEWAY_<SECTION>__<KEY>
+```
+
+- Prefix: `GATEWAY_`
+- Section separator: double underscore `__`
+- Keys are **uppercase**
+- Nested sections use additional `__` separators
+
+### Examples
+
+| TOML path | Environment variable |
+|---|---|
+| `server.proxy_port` | `GATEWAY_SERVER__PROXY_PORT` |
+| `server.admin_token` | `GATEWAY_SERVER__ADMIN_TOKEN` |
+| `cache.enabled` | `GATEWAY_CACHE__ENABLED` |
+| `cache.backend` | `GATEWAY_CACHE__BACKEND` |
+| `cache.redis.url` | `GATEWAY_CACHE__REDIS__URL` |
+| `cache.redis.pool_max_size` | `GATEWAY_CACHE__REDIS__POOL_MAX_SIZE` |
+| `circuit_breaker.threshold` | `GATEWAY_CIRCUIT_BREAKER__THRESHOLD` |
+| `health.interval_secs` | `GATEWAY_HEALTH__INTERVAL_SECS` |
+| `http.connect_timeout_ms` | `GATEWAY_HTTP__CONNECT_TIMEOUT_MS` |
+| `jwks.fetch_timeout_ms` | `GATEWAY_JWKS__FETCH_TIMEOUT_MS` |
+
+### Special Environment Variables
+
+Some environment variables have special behaviour and do not follow the standard naming convention:
+
+| Variable | Description |
+|---|---|
+| `RUST_LOG` | Overrides `server.log_level`. Accepts standard `tracing` filter directives (e.g., `nexus=debug,tower_http=warn`). Takes precedence over the TOML value. |
+| `GATEWAY_LICENSE_FILE` | Path to the license file. Shorthand for `GATEWAY_LICENSE__LICENSE_FILE`. |
+| `GATEWAY_LICENSE_KEY` | Inline license key value (the key itself, not a path). |
+| `GATEWAY_OTLP_ENDPOINT` | Activates OpenTelemetry OTLP export. Requires the binary to be built with `--features otlp`. |
+| `GATEWAY_MTLS_PROFILE_<NAME>_CERT_PATH` | mTLS client certificate path for a named profile. |
+| `GATEWAY_MTLS_PROFILE_<NAME>_KEY_PATH` | mTLS client key path for a named profile. |
+| `GATEWAY_MTLS_PROFILE_<NAME>_CA_PATH` | mTLS CA certificate path for a named profile. |
+
+For JWT secrets, `AuthPolicy.jwt_secret_env` and `AuthPolicy.jwt_public_key_env` are the **names** of environment variables (e.g., `MY_APP_JWT_SECRET`) that contain the actual secret value. Do not put the secret itself in the policy field.
+
+## .env File
+
+The gateway calls [dotenvy](https://docs.rs/dotenvy) at startup and loads a `.env` file from the current working directory if one is present. This is a development convenience — you should **not** use `.env` files in production containers.
+
+```bash
+# .env (development only)
+GATEWAY_SERVER__ADMIN_TOKEN=dev-token
+GATEWAY_DATABASE_URL=sqlite://./dev.db?mode=rwc
+GATEWAY_SERVER__LOG_FORMAT=text
+RUST_LOG=nexus=debug
+```
+
+Actual shell environment variables override `.env` values. The `.env` file is silently ignored if it does not exist.
+
+## Legacy Flat Configuration Keys
+
+Previous versions of the gateway used a flat (non-sectioned) layout for some keys. These legacy keys are still honoured for **one release** to allow smooth migration:
+
+| Legacy key | Canonical nested form |
+|---|---|
+| `redis_url` | `cache.redis.url` |
+| `redis_enabled` | `cache.enabled` (backend = redis) |
+| `circuit_breaker_threshold` | `circuit_breaker.threshold` |
+| `circuit_breaker_timeout_secs` | `circuit_breaker.timeout_secs` |
+| `health_interval_secs` | `health.interval_secs` |
+| `jwks_cache_ttl_secs` | `jwks.cache_ttl_secs` |
+| `jwks_validate_on_reload` | `jwks.validate_on_reload` |
+| `proxy_retry_attempts` | `proxy.retry_attempts` |
+| `rate_limit_requests` | _(top-level, unchanged)_ |
+| `rate_limit_window_secs` | _(top-level, unchanged)_ |
+
+**When both the legacy and nested forms are set, the nested section wins** after `Config::canonicalize()` runs at startup. Migrate to the nested form as soon as practical; legacy keys will be removed in a future release.
+
+## Runtime Config Reload
+
+Configuration can be reloaded without restarting the process via the management API:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/v1/config/reload` | `POST` | Re-reads `config/default.toml` and all environment variables. Applies the new config to running services. |
+| `/api/v1/config/history` | `GET` | Returns a list of past configuration states with timestamps. |
+| `/api/v1/config/reset` | `POST` | Reverts to the last known-good configuration (the most recent config that passed validation). |
+
+All management endpoints require the `Authorization: Bearer <admin_token>` header when `admin_token` is set.
+
+```bash
+# Trigger a live reload
+curl -X POST \
+  -H "Authorization: Bearer $GATEWAY_ADMIN_TOKEN" \
+  http://localhost:9090/api/v1/config/reload
+```
+
+**Note:** Some values cannot be changed at runtime without a restart (listening ports, TLS certificates, database driver). The reload endpoint applies all safely reloadable values and logs which keys required a restart to take effect.
+
+## Configuration Sections
+
+| Section | Reference page | Description |
+|---|---|---|
+| `[server]` | [server.md](/nexus/configuration/server) | Ports, timeouts, TLS, logging, admin token |
+| `[license]` | [License Tiers](/nexus/deployment/license-tiers) | License validator, key/file paths |
+| `[update_check]` | [advanced.md](/nexus/configuration/advanced) | Background version check |
+| `[cache]` | [cache.md](/nexus/configuration/cache) | Response cache backend, TTLs, Redis/Memcached |
+| `[cache.redis]` | [cache.md](/nexus/configuration/cache) | Redis connection and pool settings |
+| `[cache.memcached]` | [cache.md](/nexus/configuration/cache) | Memcached connection (requires `memcached` feature) |
+| `[http]` | [http-client.md](/nexus/configuration/http-client) | Shared outbound HTTP client tunables |
+| `[jwks]` | [advanced.md](/nexus/configuration/advanced) | JWKS fetch timeout, validation-on-reload |
+| `[circuit_breaker]` | [server.md](/nexus/configuration/server) | Circuit breaker threshold and timeout |
+| `[health]` | [server.md](/nexus/configuration/server) | Backend health probe interval |
+| `[proxy]` | [server.md](/nexus/configuration/server) | Proxy retry attempts |
+| `[analytics]` | _(analytics docs)_ | Analytics pipeline buffer, batch, forwarders |
+| `[logging]` | _(logging docs)_ | Log forwarding pipeline and log types |
+| `[audit]` | _(audit docs)_ | Audit pipeline buffer, batch, dead-letter |
+| `db_*` keys | [database.md](/nexus/configuration/database) | Database driver, connection string, pool |
+
+Top-level keys (not in a section) include: `db_driver`, `database_url`, `auto_migrate`, `db_*`, `rate_limit_*`, `per_ip_rate_limit_*`, `token_cache_ttl_secs`, `revision_cache_ttl_secs`, `endpoint_cache_ttl_secs`, `apps_dir`, `file_watch_enabled`, `file_watch_debounce_ms`, `crash_log_path`.
+
+## Security — Secrets in Config
+
+**Never put secrets in TOML files that are checked into version control.** The following values are secrets and should always be supplied via environment variables or a secrets manager:
+
+- `server.admin_token` — use `GATEWAY_SERVER__ADMIN_TOKEN`
+- `database_url` (when it contains a password) — use `GATEWAY_DATABASE_URL`
+- `cache.redis.url` (when using Redis AUTH) — use `GATEWAY_CACHE__REDIS__URL`
+- JWT secrets referenced by `AuthPolicy.jwt_secret_env` — put the actual value in the named environment variable
+- License keys — use `GATEWAY_LICENSE_KEY`
+
+See [Secrets Management](/nexus/security/secrets-management) for integration with external secret managers (HashiCorp Vault, AWS Secrets Manager, etc.).

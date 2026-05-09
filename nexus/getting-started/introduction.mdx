@@ -1,0 +1,125 @@
+---
+title: "Introduction to Nexus API Gateway by Drasken Cloud"
+description: "High-performance, open-core reverse-proxy API gateway in Rust handling auth, rate limiting, routing, and policy."
+---
+
+Nexus API Gateway by Drasken Cloud is a high-performance, open-core reverse-proxy API gateway written in **Rust** using [Tokio](https://tokio.rs/) and [Axum](https://github.com/tokio-rs/axum). It sits in front of your backend services, handling authentication, rate limiting, routing, and policy enforcement so your backends do not have to.
+
+---
+
+## Who Is It For?
+
+| Audience | How they use it |
+|----------|----------------|
+| **API teams** | Protect and version individual APIs without modifying backend code |
+| **Platform / infrastructure teams** | Centralise security policy, rate limits, CORS, and IP filtering across multiple services from a single control plane |
+| **Operators / SREs** | Deploy as a single statically linked binary; manage configuration through TOML files or a REST API; observe through Prometheus metrics and structured logs |
+
+---
+
+## Key Value Propositions
+
+### Single binary, zero runtime dependencies by default
+
+The gateway ships as a single statically linked Rust binary. In its default configuration it uses SQLite (embedded, no server required) and an in-process cache. No PostgreSQL, no Redis, no sidecar processes needed to get started. Add those components when your workload demands them.
+
+### Security without boilerplate
+
+Every API registered with the gateway gets authentication, rate limiting, IP filtering, header validation, and request body enforcement applied automatically — enforced in the middleware stack before a single byte reaches your backend.
+
+### Zero-copy streaming proxy
+
+The proxy engine forwards request and response bodies as byte streams using Hyper. Large payloads are not buffered in gateway memory; they are streamed from client to backend and back. The configurable `max_body_bytes` limit applies only to the enforce-before-forward check.
+
+### Multi-tenant API hierarchy
+
+APIs are organised as **App → Version → Revision → Endpoint**. This maps directly to real-world API lifecycle management: you can run `v1` and `v2` of the same API simultaneously, canary-deploy a new backend revision with configurable traffic weights, and roll back to the previous revision with a single API call — all without changing the URL your clients call.
+
+### Policy inheritance
+
+A policy document (auth rules, rate limits, CORS, IP filter, cache) can be set at the App level and automatically inherited by all Versions, Revisions, and Endpoints beneath it. Fine-grained overrides are applied at any level without repeating the full policy.
+
+### Control plane / data plane separation
+
+Traffic flows through port `8080` (the proxy / data plane). Configuration changes happen on port `9090` (the management API / control plane). The two ports share a process but have independent security postures: `9090` is network-firewalled from external traffic; `8080` is exposed to clients.
+
+---
+
+## Problems It Solves
+
+- **Scattered authentication logic** — implement auth once at the gateway; backends receive already-verified requests.
+- **Inconsistent rate limiting** — global and per-token rate limits enforced uniformly across all services.
+- **API versioning complexity** — run multiple simultaneous API versions under the same domain with stable client URLs.
+- **Risky backend migrations** — canary traffic splitting across revisions reduces blast radius of backend changes.
+- **Policy drift** — TOML-based configuration files let you version-control API policy alongside your infrastructure code.
+- **Operational overhead** — a single process to deploy, configure, and monitor instead of one sidecar per service.
+
+---
+
+## Feature Highlights
+
+**Authentication**
+- API key (Bearer token, SHA-256 hash comparison, constant-time)
+- JWT: HS256, RS256, RS384, RS512, ES256, ES384
+- JWKS endpoint support with background key refresh
+- HTTP Basic Auth
+- Per-app, per-version, per-revision, and per-endpoint auth overrides
+- JWT claim forwarding as upstream request headers
+
+**Routing**
+- `pass_through` mode: forward all paths to the backend
+- `managed_endpoint` mode: explicit method + path registry; unregistered routes return `404`/`405`
+- Longest-prefix path matching
+- Backend path rewriting with `strip_gateway_path` and `backend_base_path`
+- Canary traffic splitting via `traffic_weight` on revisions
+
+**Middleware stack (outer to inner)**
+- IP Rate Limit → Trace → Auth → Rate Limit → Header Validation → IP Filter → Body Limit → Timeout → CORS → Logger → Cache → Proxy Engine
+
+**Resilience**
+- Per-revision circuit breaker (configurable failure threshold and recovery timeout)
+- Automatic retry on idempotent methods (GET, HEAD, OPTIONS) for 502/503/504 responses
+- Background health probing with automatic exclusion of unhealthy revisions
+
+**Observability**
+- Prometheus metrics endpoint on the management port
+- Structured JSON or text access logs
+- Async audit log pipeline (never adds to proxy latency)
+- OpenAPI / Swagger UI at `GET :9090/swagger-ui`
+- Optional OpenTelemetry trace export (OTLP)
+
+**Configuration**
+- TOML file (`config/default.toml`) + environment variables (`GATEWAY_` prefix)
+- File-based app definitions (`config/apps/*.toml`) with optional hot reload via filesystem watcher
+- Runtime configuration API (`PATCH /config`, `POST /config/reload`) — no restart required for most changes
+
+**Storage**
+- SQLite (default, zero external deps) or PostgreSQL
+- Redis (optional; required only for multi-replica shared cache and distributed token revocation)
+- In-process `RuntimeStore` holds all routing data; proxy hot path performs zero database I/O
+
+---
+
+## Current Status
+
+Nexus API Gateway by Drasken Cloud v1 is built in phases:
+
+| Phase | Status |
+|-------|--------|
+| Phase 1 — Foundation (proxy, auth, rate limit, management API) | **Complete** |
+| Phase 2 — Hardening (circuit breaker, retry, JWKS, health probing, graceful shutdown) | **Complete** |
+| Phase 3 — Observability (metrics, structured logging, audit pipeline) | **Complete** |
+| Phase 3.5 — Auth & Policy (full policy hierarchy, IP filter, header validation, CORS) | **Complete** |
+| Phase 4 — Production Readiness (TLS, mTLS to backends, OTel export) | **In progress** |
+| Phase 5 — Productization | Planned |
+| Phase 6 — BFF Orchestration | Planned |
+
+The gateway is production-ready for single-instance and multi-replica deployments. Phase 4 items (TLS termination, mTLS to backends, OpenTelemetry) are under active development and tracked separately.
+
+---
+
+## Next Steps
+
+- **[Quick Start](/nexus/getting-started/quickstart)** — get the gateway running and route your first request in 5 minutes.
+- **[Architecture Overview](/nexus/getting-started/architecture)** — understand the dual-port design, middleware stack, and component interactions.
+- **[Core Concepts](/nexus/getting-started/core-concepts)** — learn the App → Version → Revision → Endpoint model and how policies work.

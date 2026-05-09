@@ -1,0 +1,202 @@
+---
+title: "Allowed Methods"
+description: "Restrict which HTTP methods are accepted; non-listed methods receive 405 with an Allow header."
+---
+
+The `allowed_methods` policy field restricts which HTTP methods are accepted for requests. Any request using a method not in the list is rejected before reaching the backend, with a `405 Method Not Allowed` response.
+
+---
+
+## Configuration
+
+Set `allowed_methods` in the policy document at any level of the hierarchy:
+
+```json
+{
+  "allowed_methods": ["GET", "HEAD", "OPTIONS"]
+}
+```
+
+| Behaviour | Description |
+|-----------|-------------|
+| Field absent or empty array (`[]`) | All HTTP methods are allowed (no enforcement) |
+| Non-empty array | Only the listed methods are accepted; others return `405` |
+
+Method matching is **case-insensitive** — `"get"`, `"GET"`, and `"Get"` are all equivalent.
+
+---
+
+## Response on Violation
+
+**HTTP Status:** `405 Method Not Allowed`
+
+**Headers:**
+```
+Allow: GET, HEAD, OPTIONS
+```
+
+**Body:**
+```json
+{
+  "status": 405,
+  "message": "method not allowed",
+  "data": null
+}
+```
+
+The `Allow` response header lists the methods configured in the policy, in the order they were specified. Clients can use this header to discover which methods are accepted.
+
+---
+
+## Metrics
+
+```
+gateway_policy_denials_total{reason="method"}
+```
+
+This counter increments each time a request is rejected by the allowed methods check. Use it to detect misconfigured clients or integration issues.
+
+---
+
+## Position in the Middleware Stack
+
+`allowed_methods` enforcement runs inside the policy validation phase, after authentication and rate limiting:
+
+```
+[IP Rate Limit]
+[Trace]
+[Auth]           ← token validated
+[Rate Limit]     ← quota checked
+[Header Validation]  ← includes allowed_methods check
+[IP Filter]
+...
+```
+
+This means an authenticated, rate-limited client that sends the wrong method still consumes a request from their quota (the request has passed auth and rate limiting). If you want to reject wrong-method requests before they consume quota, use `managed_endpoint` mode instead, where method enforcement happens at the routing layer before policy evaluation.
+
+---
+
+## Interaction with Managed Endpoint Mode
+
+In `managed_endpoint` mode, each registered endpoint specifies a single HTTP method. The routing layer rejects any request using an unregistered method with `405` before the policy middleware runs.
+
+`allowed_methods` in the policy is an **additional** check that runs after routing. Both checks can be active simultaneously:
+
+- The routing-layer check rejects unregistered methods early (before auth and rate limiting).
+- The policy `allowed_methods` check rejects methods at the policy enforcement stage.
+
+For most managed endpoint setups, you do not need to set `allowed_methods` in the policy because the endpoint registry already enforces method-level access. The policy field is more useful in pass-through mode.
+
+---
+
+## Use Cases
+
+### Read-only pass-through proxy
+
+Expose a backend service as read-only without registering every individual path:
+
+```json
+{
+  "allowed_methods": ["GET", "HEAD", "OPTIONS"]
+}
+```
+
+Apply this at the revision level. All requests using `POST`, `PUT`, `PATCH`, or `DELETE` are rejected with `405`.
+
+### API with a fixed method set
+
+Enforce that a REST API only accepts the expected methods, catching client bugs early:
+
+```json
+{
+  "allowed_methods": ["GET", "POST", "PATCH", "DELETE", "OPTIONS"]
+}
+```
+
+`PUT` requests (which are not part of this API's design) return `405` rather than being forwarded to the backend where they might have unexpected effects.
+
+### Public read, authenticated write
+
+Set a permissive policy at the app level and override at the revision level to create a read-only public revision and a full-access authenticated revision:
+
+**App default policy** (no method restriction):
+```json
+{}
+```
+
+**Public revision policy** (read-only):
+```json
+{
+  "allowed_methods": ["GET", "HEAD", "OPTIONS"],
+  "auth": {"auth_type": "none", "required": false}
+}
+```
+
+**Private revision policy** (full access):
+```json
+{
+  "allowed_methods": ["GET", "HEAD", "POST", "PATCH", "DELETE", "OPTIONS"],
+  "auth": {"auth_type": "api_key", "required": true}
+}
+```
+
+Use traffic weights to route public traffic to the public revision and authenticated clients (identified by their token) to the private revision.
+
+---
+
+## Examples
+
+### Set allowed methods on a revision
+
+```bash
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "policy": {
+      "allowed_methods": ["GET", "HEAD", "OPTIONS"]
+    }
+  }' | jq
+```
+
+### Test enforcement
+
+```bash
+API_TOKEN=gw_...
+
+# Allowed method → 200 (proxied)
+curl -s http://localhost:8080/api/v1/resource \
+  -H "Authorization: Bearer $API_TOKEN" | jq
+
+# Disallowed method → 405
+curl -s -X POST http://localhost:8080/api/v1/resource \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}' | jq
+
+# Check the Allow header
+curl -s -X POST http://localhost:8080/api/v1/resource \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -v 2>&1 | grep "Allow:"
+```
+
+Expected output for the disallowed method:
+
+```json
+{"status": 405, "message": "method not allowed", "data": null}
+```
+
+Expected `Allow` header:
+
+```
+Allow: GET, HEAD, OPTIONS
+```
+
+---
+
+## Related Topics
+
+- [Policy Overview](/nexus/policies/overview) — full policy field reference and inheritance rules
+- [Pass-Through Mode](/nexus/routing/pass-through-mode) — enforcing method restrictions without endpoint registration
+- [Managed Endpoint Mode](/nexus/routing/managed-endpoint-mode) — routing-layer method enforcement
+- [CORS](/nexus/policies/cors) — `allowed_methods` in CORS preflight responses (separate from policy enforcement)

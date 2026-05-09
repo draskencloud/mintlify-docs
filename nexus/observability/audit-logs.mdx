@@ -1,0 +1,211 @@
+---
+title: "Audit Logs"
+description: "Always-on, lossless record of every request and config change, written to Postgres audit_logs."
+---
+
+The audit pipeline provides a **lossless, always-on** record of every request that passes through the gateway and every configuration change made via the management API. It cannot be disabled. This page covers the pipeline guarantees, storage schema, configuration tuning, querying, and monitoring.
+
+For the pipeline internals and how it compares with the analytics and logging pipelines, see [pipelines/audit](/nexus/pipelines/audit).
+
+---
+
+## Guarantees
+
+| Property | Behaviour |
+|---|---|
+| **Always-on** | Cannot be disabled in config; the pipeline is started unconditionally at boot |
+| **Lossless** | Overflow policy is **Block** — the pipeline applies back-pressure rather than dropping events |
+| **Durable on shutdown** | The audit pipeline drains completely before the database pool closes; no records are lost during graceful shutdown |
+| **Dead-letter fallback** | When the forwarder (Postgres) is permanently unreachable after all retries, records are written to `audit.dead_letter_path` (see [dead-letter](/nexus/observability/dead-letter)) |
+
+> **Important:** The Block overflow policy means that if the audit pipeline falls behind (e.g., Postgres is slow), proxy request latency will increase as back-pressure propagates to the request path. Monitor `gateway_audit_buffer_size` and resolve audit forwarder bottlenecks promptly.
+
+---
+
+## What Gets Audited
+
+### Request access events
+
+Every proxied request generates one audit record containing:
+
+| Field | Description |
+|---|---|
+| `method` | HTTP method (`GET`, `POST`, etc.) |
+| `path` | Request path as received by the gateway |
+| `status` | HTTP status code returned to the client |
+| `token_id` | UUID of the API token used (null for unauthenticated requests) |
+| `app_id` | UUID of the matched application |
+| `timestamp` | RFC 3339 timestamp at request completion |
+| `client_ip` | Source IP address (respects `trusted_proxy_ips` for X-Forwarded-For) |
+| `user_agent` | `User-Agent` header value |
+| `latency_ms` | End-to-end request latency in milliseconds |
+| `request_body_hash` | SHA-256 of the request body (null if body empty or body hashing disabled) |
+| `response_body_hash` | SHA-256 of the response body (null if body empty or body hashing disabled) |
+
+### Configuration change events
+
+Every successful mutation on the management API (`POST`, `PATCH`, `DELETE`) generates an audit record with the endpoint path, admin identity (if token auth is configured), and a diff of the changed fields.
+
+### Policy denial events
+
+Requests rejected by the policy engine are audited with the denial reason before the 403/429 response is returned.
+
+---
+
+## Default Storage: Postgres `audit_logs` Table
+
+When no `[[audit.forwarders]]` are configured, the gateway automatically activates a Postgres forwarder that writes to the `audit_logs` table created by the migrations.
+
+### Schema
+
+```sql
+CREATE TABLE audit_logs (
+    id                  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    app_id              UUID        REFERENCES apps(id) ON DELETE SET NULL,
+    token_id            UUID        REFERENCES api_tokens(id) ON DELETE SET NULL,
+    method              TEXT        NOT NULL,
+    path                TEXT        NOT NULL,
+    status_code         INTEGER     NOT NULL,
+    latency_ms          BIGINT      NOT NULL,
+    timestamp           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    client_ip           TEXT,
+    user_agent          TEXT,
+    request_body_hash   TEXT,
+    response_body_hash  TEXT
+);
+
+CREATE INDEX idx_audit_logs_app_id    ON audit_logs(app_id);
+CREATE INDEX idx_audit_logs_token_id  ON audit_logs(token_id);
+CREATE INDEX idx_audit_logs_timestamp ON audit_logs(timestamp DESC);
+```
+
+---
+
+## Configuration
+
+```toml
+[audit]
+# Size of the in-memory ring buffer (events). When full, requests block.
+buffer_size        = 10000   # env: GATEWAY_AUDIT__BUFFER_SIZE
+
+# Number of audit records sent to the forwarder in a single batch.
+batch_size         = 500     # env: GATEWAY_AUDIT__BATCH_SIZE
+
+# Maximum time between flushes (milliseconds). Flush occurs when either
+# batch_size is reached or flush_interval_ms elapses, whichever comes first.
+flush_interval_ms  = 5000    # env: GATEWAY_AUDIT__FLUSH_INTERVAL_MS
+
+# Number of retry attempts on delivery failure before writing to dead-letter.
+retry_max_attempts = 3       # env: GATEWAY_AUDIT__RETRY_MAX_ATTEMPTS
+
+# Initial backoff between retries (milliseconds); doubles on each attempt.
+retry_backoff_ms   = 200     # env: GATEWAY_AUDIT__RETRY_BACKOFF_MS
+
+# Path for dead-letter records that could not be delivered after all retries.
+dead_letter_path   = "logs/audit_dead_letter.jsonl"  # env: GATEWAY_AUDIT__DEAD_LETTER_PATH
+```
+
+### Tuning for high-throughput deployments
+
+- Increase `buffer_size` to absorb traffic bursts without causing back-pressure (memory cost: ~2 KB per event × buffer_size).
+- Increase `batch_size` and decrease `flush_interval_ms` to improve write throughput at the cost of latency in the audit log.
+- Ensure the Postgres connection pool (`db_max_connections`) is large enough to handle both API traffic and audit writes concurrently.
+
+---
+
+## Querying Audit Logs
+
+Connect to Postgres directly. Join `audit_logs` with `api_tokens` for user attribution.
+
+### Requests per token in the last 24 hours
+
+```sql
+SELECT
+    t.name   AS token_name,
+    t.id     AS token_id,
+    COUNT(*) AS request_count
+FROM audit_logs al
+JOIN api_tokens t ON al.token_id = t.id
+WHERE al.timestamp > now() - INTERVAL '24 hours'
+GROUP BY t.name, t.id
+ORDER BY request_count DESC;
+```
+
+### Error spike detection (5xx per minute)
+
+```sql
+SELECT
+    date_trunc('minute', timestamp) AS minute,
+    COUNT(*)                         AS errors
+FROM audit_logs
+WHERE status_code >= 500
+  AND timestamp > now() - INTERVAL '1 hour'
+GROUP BY 1
+ORDER BY 1;
+```
+
+### Latency percentiles per application (last hour)
+
+```sql
+SELECT
+    a.slug,
+    percentile_cont(0.50) WITHIN GROUP (ORDER BY al.latency_ms) AS p50_ms,
+    percentile_cont(0.95) WITHIN GROUP (ORDER BY al.latency_ms) AS p95_ms,
+    percentile_cont(0.99) WITHIN GROUP (ORDER BY al.latency_ms) AS p99_ms,
+    COUNT(*)                                                      AS total_requests
+FROM audit_logs al
+JOIN apps a ON al.app_id = a.id
+WHERE al.timestamp > now() - INTERVAL '1 hour'
+GROUP BY a.slug
+ORDER BY p99_ms DESC;
+```
+
+### Recent activity for a specific token
+
+```sql
+SELECT timestamp, method, path, status_code, latency_ms, client_ip
+FROM audit_logs
+WHERE token_id = '<token-uuid>'
+ORDER BY timestamp DESC
+LIMIT 100;
+```
+
+---
+
+## Graceful Shutdown Behaviour
+
+On SIGTERM or SIGINT, the gateway:
+
+1. Stops accepting new connections on both ports.
+2. Waits for in-flight proxy requests to complete (up to `server.shutdown_timeout_secs`).
+3. **Drains the audit pipeline** — all buffered events are flushed to the forwarder before continuing.
+4. Closes the database connection pool.
+5. Exits.
+
+This ordering guarantees that no audit records are lost during a rolling deploy or controlled restart. If the Postgres forwarder is unreachable during drain, events are written to the dead-letter file.
+
+---
+
+## Monitoring
+
+| Metric | Type | Labels | Alert condition |
+|---|---|---|---|
+| `gateway_audit_buffer_size` | Gauge | `forwarder` | Alert if sustained above 80% of `buffer_size` |
+| `gateway_audit_delivery_failures_total` | Counter | `forwarder`, `reason` | Alert on any non-zero rate |
+
+```yaml
+# Example alert
+- alert: AuditPipelineBackpressure
+  expr: gateway_audit_buffer_size > 8000
+  for: 30s
+  annotations:
+    summary: "Audit buffer at {{ $value }}/10000 — request latency will increase"
+```
+
+Check the dead-letter file for undelivered records:
+
+```bash
+wc -l logs/audit_dead_letter.jsonl
+```
+
+A non-empty dead-letter file indicates audit records that need manual review and replay.

@@ -17,63 +17,136 @@
           {
             "group": "Getting Started",
             "pages": [
-              "nexus/introduction",
-              "nexus/quickstart"
+              "nexus/getting-started/introduction",
+              "nexus/getting-started/quickstart",
+              "nexus/getting-started/architecture",
+              "nexus/getting-started/core-concepts"
             ]
           },
           {
-            "group": "Deployment",
+            "group": "Concepts",
             "pages": [
-              "nexus/deployment/docker",
-              "nexus/deployment/kubernetes"
-            ]
-          },
-          {
-            "group": "Configuration",
-            "pages": [
-              "nexus/configuration/overview",
-              "nexus/configuration/environment-variables"
-            ]
-          },
-          {
-            "group": "Apps & Routing",
-            "pages": [
-              "nexus/apps/creating-apps",
-              "nexus/apps/routing-modes"
-            ]
-          },
-          {
-            "group": "Backends",
-            "pages": [
-              "nexus/backends/versions-revisions",
-              "nexus/backends/endpoints"
+              "nexus/concepts/app-version-revision",
+              "nexus/concepts/routing-modes",
+              "nexus/concepts/policy-inheritance",
+              "nexus/concepts/canary-deployments",
+              "nexus/concepts/file-based-config"
             ]
           },
           {
             "group": "Authentication",
             "pages": [
               "nexus/auth/overview",
-              "nexus/auth/sso-jwt",
-              "nexus/auth/api-keys"
+              "nexus/auth/api-key-tokens",
+              "nexus/auth/jwt",
+              "nexus/auth/basic-auth",
+              "nexus/auth/scopes",
+              "nexus/auth/token-lifecycle"
+            ]
+          },
+          {
+            "group": "Routing",
+            "pages": [
+              "nexus/routing/overview",
+              "nexus/routing/pass-through-mode",
+              "nexus/routing/managed-endpoint-mode",
+              "nexus/routing/path-rewriting",
+              "nexus/routing/header-filtering"
             ]
           },
           {
             "group": "Policies",
             "pages": [
-              "nexus/policies/rate-limiting",
-              "nexus/policies/cors",
+              "nexus/policies/overview",
+              "nexus/policies/allowed-methods",
+              "nexus/policies/ip-rate-limiting",
+              "nexus/policies/per-token-rate-limiting",
               "nexus/policies/ip-filtering",
-              "nexus/policies/circuit-breaker",
-              "nexus/policies/response-caching",
-              "nexus/policies/header-injection",
-              "nexus/policies/mtls"
+              "nexus/policies/header-validation",
+              "nexus/policies/cors",
+              "nexus/policies/body-size-limit",
+              "nexus/policies/timeout"
+            ]
+          },
+          {
+            "group": "Backends",
+            "pages": [
+              "nexus/backends/configuration",
+              "nexus/backends/health-probing",
+              "nexus/backends/circuit-breaker",
+              "nexus/backends/retry-logic",
+              "nexus/backends/mtls"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "nexus/configuration/overview",
+              "nexus/configuration/server",
+              "nexus/configuration/database",
+              "nexus/configuration/tls",
+              "nexus/configuration/cache",
+              "nexus/configuration/http-client",
+              "nexus/configuration/feature-flags",
+              "nexus/configuration/env-vars",
+              "nexus/configuration/advanced"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "nexus/deployment/docker",
+              "nexus/deployment/kubernetes",
+              "nexus/deployment/bare-metal",
+              "nexus/deployment/horizontal-scaling",
+              "nexus/deployment/tls-termination",
+              "nexus/deployment/graceful-shutdown",
+              "nexus/deployment/license-tiers"
             ]
           },
           {
             "group": "Observability",
             "pages": [
+              "nexus/observability/logging",
               "nexus/observability/metrics",
-              "nexus/observability/audit-logging"
+              "nexus/observability/health-endpoints",
+              "nexus/observability/distributed-tracing",
+              "nexus/observability/audit-logs",
+              "nexus/observability/dead-letter"
+            ]
+          },
+          {
+            "group": "Pipelines",
+            "pages": [
+              "nexus/pipelines/logging",
+              "nexus/pipelines/audit",
+              "nexus/pipelines/analytics"
+            ]
+          },
+          {
+            "group": "Security",
+            "pages": [
+              "nexus/security/model",
+              "nexus/security/network-security",
+              "nexus/security/token-best-practices",
+              "nexus/security/secrets-management"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "nexus/operations/production-checklist",
+              "nexus/operations/troubleshooting",
+              "nexus/operations/runbooks",
+              "nexus/operations/error-catalog"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "nexus/reference/policy-schema",
+              "nexus/reference/glossary",
+              "nexus/reference/changelog"
             ]
           }
         ]

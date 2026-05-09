@@ -1,0 +1,190 @@
+---
+title: "Graceful Shutdown"
+description: "Ordered shutdown phases on SIGTERM/SIGINT, lossless audit drain, and zero-downtime deploy patterns."
+---
+
+The Nexus API Gateway by Drasken Cloud shuts down gracefully when it receives `SIGTERM` or `SIGINT` (Ctrl-C). The shutdown sequence is ordered and lossless for audit data.
+
+## Triggering a Shutdown
+
+| Method | Signal / Command |
+|---|---|
+| Keyboard interrupt (foreground process) | `Ctrl-C` → `SIGINT` |
+| systemd stop | `systemctl stop gateway` → `SIGTERM` |
+| Docker stop | `docker stop <container>` → `SIGTERM` (Docker sends `SIGTERM`, waits `--stop-timeout`, then `SIGKILL`) |
+| Kubernetes pod deletion | `SIGTERM` sent to PID 1 |
+| Manual | `kill -SIGTERM <pid>` |
+
+> `SIGHUP` is **not** interpreted as a reload or shutdown signal. Use `POST /api/v1/config/reload` for live config reloads.
+
+## Shutdown Sequence
+
+The shutdown proceeds through the following ordered phases. Each phase completes (or times out) before the next begins.
+
+### Phase 1 — Stop Accepting New Connections
+
+Both the proxy listener (default port 8080) and the management API listener (default port 9090) immediately stop accepting new TCP connections. Any connections already established in the OS listen backlog are not processed.
+
+Clients connecting after this point receive a TCP connection-refused error. If a load balancer is probing `/api/v1/health` it will receive no response and should mark the instance out of rotation.
+
+### Phase 2 — Drain In-Flight Proxy Requests
+
+The gateway waits for all currently active proxy requests to complete. Each request is allowed to run to its natural conclusion (response sent or upstream timeout). No new proxy requests are accepted.
+
+**Timeout:** `shutdown_timeout_secs` (default: 30 seconds). If all requests complete before the timeout the gateway proceeds immediately. If the timeout elapses and requests are still in flight the gateway logs a warning and force-moves to the next phase.
+
+```toml
+[server]
+shutdown_timeout_secs = 30  # env: GATEWAY_SERVER__SHUTDOWN_TIMEOUT_SECS
+```
+
+### Phase 3 — Drain Audit Pipeline (Lossless)
+
+The audit pipeline is the only pipeline with a **lossless guarantee**. The gateway maintains an internal in-flight counter for pending audit writes. The shutdown waits for this counter to reach zero before continuing.
+
+- Pending audit events in the channel are flushed to Postgres in batches.
+- If the Postgres write fails, events are retried up to `audit.retry_max_attempts` times with exponential backoff starting at `audit.retry_backoff_ms`.
+- If retries are exhausted, events fall to the dead-letter file at `audit.dead_letter_path`.
+- Once the in-flight counter reaches zero the audit pipeline is confirmed drained.
+
+This phase does **not** have a separate timeout — it runs until all audit writes succeed or exhaust retries. For most deployments this completes in well under one second.
+
+### Phase 4 — Drain Analytics and Logging Pipelines (Best-Effort)
+
+The analytics and log-forwarding pipelines are flushed on a best-effort basis. The gateway attempts to flush remaining items in their respective channels but does not block indefinitely. Any items still pending after the phase completes are written to the respective dead-letter files (`analytics.dead_letter_path`, `logging.dead_letter_path`) if configured.
+
+### Phase 5 — Close Connection Pools
+
+The database connection pool (SQLx) and the Redis connection pool (deadpool-redis) are gracefully closed. In-flight pool operations from earlier phases have already completed by this point.
+
+### Phase 6 — Exit
+
+The process exits with code **0**. A non-zero exit code indicates an unrecoverable error during startup or a panic (which is additionally written to `crash_log_path`).
+
+## Shutdown Timeline Diagram
+
+```
+t=0   SIGTERM received
+      │
+      ├─── Phase 1: Stop listeners (instant)
+      │
+      ├─── Phase 2: Drain proxy requests
+      │    └── waits up to shutdown_timeout_secs (default 30s)
+      │
+      ├─── Phase 3: Drain audit pipeline (lossless — waits until complete)
+      │
+      ├─── Phase 4: Drain analytics + logging pipelines (best-effort)
+      │
+      ├─── Phase 5: Close DB + Redis pools
+      │
+      └─── Phase 6: exit(0)
+```
+
+## What Happens to In-Flight Requests
+
+| Request state | Behaviour |
+|---|---|
+| Proxy request in progress before shutdown signal | Completes normally |
+| New request arriving after shutdown signal | TCP connection refused (listener closed) |
+| Request accepted but not started before listener closed | Connection closed without response |
+| Management API request in progress | Completes normally (same drain as proxy) |
+
+During Phase 2, responses sent to clients are indistinguishable from normal responses. The only observable difference to a correctly-behaving client is that no new connections are accepted.
+
+## Configuring the Shutdown Timeout
+
+If your upstream services are slow and 30 seconds is insufficient:
+
+```toml
+[server]
+shutdown_timeout_secs = 60
+```
+
+Or via environment variable:
+
+```bash
+GATEWAY_SERVER__SHUTDOWN_TIMEOUT_SECS=60
+```
+
+For Docker, ensure `--stop-timeout` (or `stop_grace_period` in Compose) is set to at least `shutdown_timeout_secs + 5` seconds to prevent Docker from sending `SIGKILL` before the drain completes:
+
+```yaml
+# docker-compose.yml
+services:
+  gateway:
+    stop_grace_period: 40s   # shutdown_timeout_secs (30) + buffer (10)
+```
+
+For Kubernetes, set `terminationGracePeriodSeconds` in the Pod spec:
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 40
+  containers:
+    - name: gateway
+      # ...
+```
+
+## Zero-Downtime Deploys
+
+To upgrade the gateway without dropping traffic use a rolling restart behind a load balancer:
+
+1. **Start the new instance.** Wait for it to pass health checks (`GET /api/v1/health` on port 9090 returns 200).
+2. **Add the new instance to the load balancer.**
+3. **Send `SIGTERM` to the old instance.** The load balancer health probe will fail once the listener closes and the LB will stop routing to it.
+4. **Old instance drains and exits cleanly.**
+
+With two or more instances, at step 3 all traffic has already shifted to instances that are still healthy. No requests are dropped.
+
+### systemd Rolling Restart
+
+```bash
+# Start new instance (if using socket activation or a second unit file)
+sudo systemctl start gateway-new
+
+# Wait for the new instance to be healthy, then stop the old one
+sleep 15
+sudo systemctl stop gateway
+```
+
+### Kubernetes Rolling Update
+
+Set `strategy.type: RollingUpdate` with appropriate `maxUnavailable: 0` to guarantee zero downtime:
+
+```yaml
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    spec:
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: gateway
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 9090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+```
+
+Kubernetes will bring up the new Pod, wait for it to pass `readinessProbe`, then send `SIGTERM` to the old Pod and wait up to `terminationGracePeriodSeconds` for it to exit.
+
+## Crash Log
+
+If the gateway process panics, the panic hook writes a structured JSON entry to `crash_log_path` (default: `./crash.log`) before the process terminates. The entry includes:
+
+```json
+{
+  "timestamp": "2026-05-09T12:34:56Z",
+  "version": "0.1.0",
+  "build_hash": "abc123",
+  "thread": "main",
+  "message": "panicked at 'index out of bounds: ...'"
+}
+```
+
+This file is **not** the regular log; it captures only unrecoverable panics. The exit code on a panic is non-zero. Your process supervisor (systemd, Docker, Kubernetes) should be configured to restart on non-zero exit codes.

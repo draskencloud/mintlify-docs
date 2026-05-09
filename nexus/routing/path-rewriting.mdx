@@ -1,0 +1,256 @@
+---
+title: "Path Rewriting"
+description: "How strip_gateway_path, backend_base_path, and endpoint backend_path combine to build the forwarded URL."
+---
+
+The gateway rewrites every incoming request path before forwarding it to the backend. This document explains exactly how the rewriting works, what controls it, and how the final backend URL is constructed.
+
+---
+
+## The Two Controls
+
+| Control | Where set | Default | Effect |
+|---------|-----------|---------|--------|
+| `strip_gateway_path` | Revision | `true` | Removes the app + version `gateway_path` prefix from the request path |
+| `backend_base_path` | Revision | `/` | Prepended to the rewritten path before forwarding |
+
+Both controls are set on the revision object at creation time.
+
+---
+
+## Final URL Construction
+
+The gateway constructs the backend URL using the following formula:
+
+```
+backend_scheme://backend_host:backend_port
+  + backend_base_path
+  + rewritten_path
+  + ?query_string
+```
+
+Where `rewritten_path` is:
+
+```
+if strip_gateway_path == true:
+    rewritten_path = request_path.strip_prefix(gateway_path_prefix)
+else:
+    rewritten_path = request_path
+```
+
+The `gateway_path_prefix` is the longest-prefix-matched value from the app's registered paths (which typically corresponds to the version's `gateway_path`).
+
+---
+
+## Example 1: Standard Pass-Through
+
+**Setup:**
+
+| Field | Value |
+|-------|-------|
+| App `gateway_path` | `/api` |
+| Version `gateway_path` | `/api/v1` |
+| `strip_gateway_path` | `true` |
+| `backend_base_path` | `/` |
+| Backend | `http://users-svc:8000` |
+
+**Request:**
+
+```
+GET http://gateway:8080/api/v1/users/123?format=json
+```
+
+**Rewriting steps:**
+
+1. Strip prefix `/api/v1`: `/api/v1/users/123` → `/users/123`
+2. Prepend `backend_base_path` `/`: `/users/123` (no change since base is `/`)
+3. Append query string: `/users/123?format=json`
+
+**Forwarded URL:**
+
+```
+GET http://users-svc:8000/users/123?format=json
+```
+
+---
+
+## Example 2: Backend Base Path
+
+**Setup:**
+
+| Field | Value |
+|-------|-------|
+| Version `gateway_path` | `/api/v1` |
+| `strip_gateway_path` | `true` |
+| `backend_base_path` | `/internal/api` |
+| Backend | `http://legacy-svc:9000` |
+
+**Request:**
+
+```
+GET http://gateway:8080/api/v1/users/123
+```
+
+**Rewriting steps:**
+
+1. Strip prefix `/api/v1`: `/api/v1/users/123` → `/users/123`
+2. Prepend `backend_base_path` `/internal/api`: `/internal/api/users/123`
+
+**Forwarded URL:**
+
+```
+GET http://legacy-svc:9000/internal/api/users/123
+```
+
+This is useful when the backend exposes its API under a sub-path but clients should see a clean public URL.
+
+---
+
+## Example 3: No Strip (Forwarding Full Path)
+
+**Setup:**
+
+| Field | Value |
+|-------|-------|
+| Version `gateway_path` | `/proxy` |
+| `strip_gateway_path` | `false` |
+| `backend_base_path` | `/` |
+| Backend | `http://mirror-svc:8080` |
+
+**Request:**
+
+```
+GET http://gateway:8080/proxy/external/resource
+```
+
+**Rewriting steps:**
+
+1. `strip_gateway_path` is false — path unchanged: `/proxy/external/resource`
+2. Prepend `backend_base_path` `/`: `/proxy/external/resource` (no change)
+
+**Forwarded URL:**
+
+```
+GET http://mirror-svc:8080/proxy/external/resource
+```
+
+Use `strip_gateway_path = false` when the backend needs to see the full original path, such as when it is itself a proxy or when path-based routing is handled inside the backend.
+
+---
+
+## Example 4: Managed Endpoint `backend_path`
+
+When an endpoint has `backend_path` set, the gateway uses that value directly as the forwarded path, bypassing the normal strip + base path calculation entirely.
+
+**Setup:**
+
+| Field | Value |
+|-------|-------|
+| Version `gateway_path` | `/orders/v1` |
+| `strip_gateway_path` | `true` |
+| `backend_base_path` | `/` |
+| Backend | `http://orders-svc:8080` |
+| Endpoint `path` | `/orders` |
+| Endpoint `backend_path` | `/internal/order-create` |
+
+**Request:**
+
+```
+POST http://gateway:8080/orders/v1/orders
+```
+
+**Rewriting steps:**
+
+1. Endpoint `backend_path` is set → skip strip + base path logic.
+2. Use `backend_path` directly: `/internal/order-create`
+
+**Forwarded URL:**
+
+```
+POST http://orders-svc:8080/internal/order-create
+```
+
+The query string is still appended verbatim even when `backend_path` is used.
+
+---
+
+## Query String Handling
+
+The query string is always forwarded verbatim. It is appended as-is to the constructed backend URL after the path:
+
+```
+https://backend:443/path?q=1&sort=asc&page=2
+```
+
+The gateway does not parse, filter, or modify query parameters unless a `headers.inject` rule sources from `request.query.<param>`.
+
+---
+
+## Hop-by-Hop Header Stripping
+
+Before forwarding the request, the gateway strips the following headers from the outbound request per [RFC 7230 §6.1](https://datatracker.ietf.org/doc/html/rfc7230#section-6.1):
+
+| Header | Reason |
+|--------|--------|
+| `connection` | Connection-specific; must not be forwarded |
+| `keep-alive` | Connection-specific |
+| `proxy-authenticate` | Proxy-layer only |
+| `proxy-authorization` | Proxy-layer only |
+| `te` | Hop-by-hop transfer encoding negotiation |
+| `trailers` | Chunked trailer negotiation |
+| `transfer-encoding` | Determined per-hop; gateway uses its own encoding |
+| `upgrade` | Protocol upgrade is hop-specific |
+
+These headers are silently removed — no error is returned. Backend services will not see them.
+
+---
+
+## `x-request-id` Propagation
+
+Every forwarded request includes an `x-request-id` header:
+
+- If the inbound request from the client already contains `x-request-id`, the gateway forwards it unchanged.
+- If the inbound request does not contain `x-request-id`, the gateway generates a new UUID v4 and adds it.
+
+The same `x-request-id` value is echoed back to the client in the response headers, allowing end-to-end tracing across client, gateway, and backend logs.
+
+---
+
+## Path Rewriting Decision Tree
+
+```
+Incoming request path: /api/v1/users/123
+                │
+  ┌─────────────▼──────────────┐
+  │ strip_gateway_path = true? │
+  └──────┬──────────────┬──────┘
+        YES             NO
+         │               │
+   Strip prefix       Keep full path
+   /api/v1            /api/v1/users/123
+   → /users/123
+         │
+  ┌──────▼──────────────────────────────┐
+  │ Is endpoint.backend_path set?       │
+  │ (managed_endpoint mode only)        │
+  └──────┬──────────────┬───────────────┘
+        YES             NO
+         │               │
+   Use backend_path   Prepend backend_base_path
+   directly          + rewritten_path
+         │               │
+         └───────┬────────┘
+                 ▼
+   Append ?query_string
+                 ▼
+   Forward to backend_scheme://backend_host:backend_port/<result>
+```
+
+---
+
+## Related Topics
+
+- [Routing Overview](/nexus/routing/overview) — full request resolution flow
+- [Pass-Through Mode](/nexus/routing/pass-through-mode) — forwarding without endpoint registration
+- [Managed Endpoint Mode](/nexus/routing/managed-endpoint-mode) — `backend_path` and per-endpoint configuration
+- [Header Filtering](/nexus/routing/header-filtering) — which headers are stripped and which are injected

@@ -1,24 +1,188 @@
 ---
-title: IP Filtering
-description: Restrict access by IP address using allowlists or denylists.
+title: "IP Filtering"
+description: "CIDR-based allow/deny enforcement post-auth, with the same trusted-proxy IP extraction as IP rate limiting."
 ---
 
-IP filtering is applied before rate limiting. Configure it via the `ip_filter` field in any policy.
+IP filtering enforces CIDR-based allowlists or denylists on incoming requests. It runs after authentication in the middleware stack, which means you have access to the authenticated client's identity and can combine IP filtering with token-level policy overrides for fine-grained access control.
 
-## Allowlist (only listed CIDRs pass)
+---
+
+## Configuration
+
+IP filtering is configured in the `ip_filter` field of the policy document. It can be set at any level of the hierarchy (app, version, revision, endpoint).
 
 ```json
 {
   "ip_filter": {
     "mode": "allow",
-    "cidrs": ["10.0.0.0/8", "192.168.1.50/32"]
+    "cidrs": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
   }
 }
 ```
 
-All requests from IPs not in the list receive `403 Forbidden`.
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `mode` | string | Yes | `"allow"` — only listed CIDRs are permitted; all others blocked. `"deny"` — listed CIDRs are blocked; all others permitted. |
+| `cidrs` | string[] | Yes | Array of CIDR notation strings. Supports both IPv4 and IPv6. |
 
-## Denylist (listed CIDRs are blocked)
+---
+
+## `allow` Mode
+
+When mode is `allow`, the gateway checks whether the source IP matches **any** CIDR in the list:
+
+- **Match found** → request is permitted; continues to next middleware.
+- **No match** → request is rejected with `403 Forbidden`.
+
+Use `allow` mode to restrict access to known, trusted IP ranges — for example, a corporate VPN, office network, or specific cloud provider IP ranges.
+
+```json
+{
+  "ip_filter": {
+    "mode": "allow",
+    "cidrs": [
+      "10.0.0.0/8",
+      "172.16.0.0/12",
+      "192.168.0.0/16",
+      "203.0.113.0/24"
+    ]
+  }
+}
+```
+
+Any IP not in these ranges receives:
+
+```json
+{"status": 403, "message": "ip not allowed", "data": null}
+```
+
+---
+
+## `deny` Mode
+
+When mode is `deny`, the gateway checks whether the source IP matches **any** CIDR in the list:
+
+- **Match found** → request is rejected with `403 Forbidden`.
+- **No match** → request is permitted; continues to next middleware.
+
+Use `deny` mode to block known malicious IP ranges, Tor exit nodes, or specific cloud providers' outbound IPs without blocking all other traffic.
+
+```json
+{
+  "ip_filter": {
+    "mode": "deny",
+    "cidrs": [
+      "198.51.100.0/24",
+      "192.0.2.0/24"
+    ]
+  }
+}
+```
+
+---
+
+## CIDR Support
+
+Both IPv4 and IPv6 CIDR ranges are supported:
+
+```json
+{
+  "ip_filter": {
+    "mode": "allow",
+    "cidrs": [
+      "10.0.0.0/8",
+      "192.168.1.100/32",
+      "2001:db8::/32",
+      "::1/128"
+    ]
+  }
+}
+```
+
+- `/32` (IPv4) or `/128` (IPv6) denotes a single host.
+- Mixed IPv4 and IPv6 CIDRs in the same list are supported.
+- CIDR strings are validated at write time; invalid CIDRs cause the policy update to fail.
+
+---
+
+## Source IP Extraction
+
+The same source IP extraction logic used by [IP Rate Limiting](/nexus/policies/ip-rate-limiting) applies here:
+
+1. If the direct connection's IP is in `trusted_proxy_ips` (server config), the rightmost non-trusted IP in `X-Forwarded-For` is used.
+2. Otherwise, the TCP peer address is used.
+
+This means IP filtering honours the same proxy trust chain, ensuring it evaluates the real client IP — not the load balancer's IP.
+
+---
+
+## Position in the Middleware Stack
+
+IP filtering runs **after** authentication:
+
+```
+[IP Rate Limit]   ← pre-auth
+[Trace]
+[Auth]            ← token validated
+[Rate Limit]
+[Header Validation]
+[IP Filter]       ← IP filtering runs HERE (post-auth)
+[Body Limit]
+...
+```
+
+This position is intentional: it allows you to differentiate IP filtering rules per-token or per-revision using policy inheritance. An unauthenticated request that reaches IP filtering has already passed auth (which means `auth.required = false` is set, or auth passed).
+
+---
+
+## Inheritance and Use Cases
+
+Because IP filtering is part of the policy document, it inherits and overrides normally through the hierarchy. This enables nuanced access control patterns:
+
+### Pattern 1: Internal revision, public revision
+
+Run two revisions of the same version: one for internal use (IP-restricted), one for public use (no IP filter).
+
+**Internal revision policy:**
+```json
+{
+  "ip_filter": {
+    "mode": "allow",
+    "cidrs": ["10.0.0.0/8"]
+  },
+  "rate_limit": {"enabled": true, "requests": 10000, "window_seconds": 60}
+}
+```
+
+**Public revision policy:**
+```json
+{
+  "rate_limit": {"enabled": true, "requests": 1000, "window_seconds": 60}
+}
+```
+
+Route 100% of traffic to the public revision. Use traffic weights to route internal callers to the internal revision, or keep them on separate gateway paths.
+
+### Pattern 2: Admin endpoint restricted to office IP
+
+Using managed endpoint mode, add an IP filter override on a sensitive admin endpoint:
+
+```json
+{
+  "method": "DELETE",
+  "path": "/users/purge",
+  "policy_override": {
+    "ip_filter": {
+      "mode": "allow",
+      "cidrs": ["203.0.113.0/24"]
+    }
+  }
+}
+```
+
+All other endpoints on the revision are not IP-restricted. Only `DELETE /users/purge` requires the client to be in the office IP range.
+
+### Pattern 3: Block a known abusive range
 
 ```json
 {
@@ -29,30 +193,74 @@ All requests from IPs not in the list receive `403 Forbidden`.
 }
 ```
 
-## Fields
+Applied at the app level, this blocks the range for all versions, revisions, and endpoints.
 
-| Field | Description |
-|-------|-------------|
-| `mode` | `allow` — only listed CIDRs pass. `deny` — listed CIDRs are blocked |
-| `cidrs` | List of CIDR ranges (IPv4 or IPv6) |
+---
 
-## Apply to an App
+## Response on Violation
+
+**HTTP Status:** `403 Forbidden`
+
+**Body:**
+```json
+{
+  "status": 403,
+  "message": "ip not allowed",
+  "data": null
+}
+```
+
+---
+
+## Metrics
+
+```
+gateway_policy_denials_total{reason="ip_filter"}
+```
+
+This counter increments each time a request is rejected by IP filtering. Use it to monitor for anomalous access patterns or to confirm that blocking rules are working as intended.
+
+---
+
+## API Example
+
+### Set IP filter on a revision
 
 ```bash
-curl -X POST http://localhost:9090/api/v1/apps \
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID" \
+  -H "Content-Type: application/json" \
   -d '{
-    "name": "Internal API",
-    "slug": "internal-api",
-    "gateway_path": "/internal",
-    "default_policy": {
+    "policy": {
       "ip_filter": {
         "mode": "allow",
         "cidrs": ["10.0.0.0/8", "172.16.0.0/12"]
       }
     }
-  }'
+  }' | jq
 ```
 
-<Note>
-  When Nexus is behind a load balancer or Kubernetes ingress, set `GATEWAY_TRUSTED_PROXY_IPS` so the real client IP is extracted from `X-Forwarded-For` rather than the proxy IP.
-</Note>
+### Test the filter
+
+```bash
+API_TOKEN=gw_...
+
+# From an allowed IP → expect 200 (proxied)
+curl -s http://localhost:8080/api/v1/resource \
+  -H "Authorization: Bearer $API_TOKEN" | jq
+
+# Simulate blocked IP via X-Forwarded-For (requires trusted proxy config)
+# From a non-allowed IP → expect 403
+curl -s http://localhost:8080/api/v1/resource \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "X-Forwarded-For: 198.51.100.42" | jq
+```
+
+---
+
+## Related Topics
+
+- [IP Rate Limiting](/nexus/policies/ip-rate-limiting) — pre-auth per-IP quota enforcement
+- [Policy Overview](/nexus/policies/overview) — policy inheritance and field reference
+- [Header Filtering](/nexus/routing/header-filtering) — trusted proxy IP and `X-Forwarded-For` trust chain
+- [Allowed Methods](/nexus/policies/allowed-methods) — additional request filtering by HTTP method

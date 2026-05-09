@@ -1,0 +1,321 @@
+---
+title: "Managed Endpoint Mode"
+description: "Strict API contracts: every method+path must be explicitly registered; unregistered routes return 404/405."
+---
+
+In **managed endpoint mode**, every HTTP method and path combination that the gateway accepts must be explicitly registered. Unregistered paths return `404 Not Found`; unregistered methods on a registered path return `405 Method Not Allowed`. This gives you a strict API contract enforced at the gateway layer.
+
+---
+
+## Setting the Routing Mode
+
+Routing mode is set at **app creation** and is **immutable** thereafter. Once an app is created as `managed_endpoint`, it cannot be changed to `pass_through`. Create a new app to change routing modes.
+
+```bash
+curl -s -X POST http://localhost:9090/api/v1/apps \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Orders API",
+    "slug": "orders-api",
+    "gateway_path": "/orders",
+    "routing_mode": "managed_endpoint"
+  }' | jq
+```
+
+---
+
+## Endpoint Registration
+
+Endpoints are registered per revision. Each endpoint describes one HTTP method + path combination, with optional path translation and policy overrides.
+
+### Endpoint API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/apps/:app_id/versions/:version_id/revisions/:revision_id/endpoints` | Create an endpoint |
+| `GET` | `/api/v1/apps/:app_id/versions/:version_id/revisions/:revision_id/endpoints` | List endpoints |
+| `GET` | `/api/v1/apps/:app_id/versions/:version_id/revisions/:revision_id/endpoints/:endpoint_id` | Get an endpoint |
+| `PATCH` | `/api/v1/apps/:app_id/versions/:version_id/revisions/:revision_id/endpoints/:endpoint_id` | Update an endpoint |
+| `DELETE` | `/api/v1/apps/:app_id/versions/:version_id/revisions/:revision_id/endpoints/:endpoint_id` | Delete an endpoint |
+
+### Creating an endpoint
+
+```bash
+APP_ID=<app-uuid>
+VERSION_ID=<version-uuid>
+REVISION_ID=<revision-uuid>
+
+curl -s -X POST \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID/endpoints" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "method": "GET",
+    "path": "/orders",
+    "backend_path": "/internal/list-orders",
+    "policy_override": {
+      "rate_limit": {
+        "enabled": true,
+        "requests": 200,
+        "window_seconds": 60
+      }
+    }
+  }' | jq
+```
+
+**Response:**
+
+```json
+{
+  "status": 201,
+  "message": "created",
+  "data": {
+    "id": "d4e5f6a7-0000-0000-0000-000000000001",
+    "app_revision_id": "<revision-uuid>",
+    "method": "GET",
+    "path": "/orders",
+    "backend_path": "/internal/list-orders",
+    "policy_override": {
+      "rate_limit": {
+        "enabled": true,
+        "requests": 200,
+        "window_seconds": 60
+      }
+    },
+    "created_at": "2026-01-15T12:00:00Z"
+  }
+}
+```
+
+---
+
+## Endpoint Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `method` | string | Yes | HTTP method (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`). Case-insensitive at registration; normalised to uppercase internally. |
+| `path` | string | Yes | Exact path to match (after gateway prefix stripping). Must begin with `/`. |
+| `backend_path` | string | No | When set, replaces the request path when forwarding to backend. Enables path translation. |
+| `policy_override` | object | No | Partial policy document merged with the revision policy. Fields present override inherited values; absent fields continue to inherit. |
+
+---
+
+## Path Matching
+
+Endpoint paths are matched using **exact match** against the request path after the gateway prefix has been stripped.
+
+- `GET /orders` matches only `GET /orders` — not `/orders/` or `/orders/42`.
+- Path parameters (e.g., `/orders/:id`) are **not** supported in the current version; register each parameterised path or use pass-through mode for dynamic paths.
+
+> **Note on path parameters**: If your API has many dynamic segments (e.g., `/orders/{id}/items/{item_id}`), pass-through mode may be more practical. Managed endpoint mode is best suited for APIs with a known, finite set of routes.
+
+---
+
+## Unregistered Routes
+
+| Condition | Response |
+|-----------|----------|
+| Request path not registered in this revision | `404 Not Found` |
+| Request path registered, but not for this method | `405 Method Not Allowed` (includes `Allow` header) |
+
+```json
+{"status": 404, "message": "endpoint not found", "data": null}
+{"status": 405, "message": "method not allowed", "data": null}
+```
+
+---
+
+## Backend Path Translation (`backend_path`)
+
+When `backend_path` is set on an endpoint, the gateway uses it as the forwarded path instead of the rewritten request path. This enables you to expose a clean public API path while forwarding to a different internal path.
+
+**Example:**
+
+```
+Public:   POST /orders/v1/orders
+Endpoint: backend_path = /internal/order-create
+
+Forwarded: POST http://orders-svc:8080/internal/order-create
+```
+
+When `backend_path` is absent, the normal path rewriting rules apply (`strip_gateway_path` + `backend_base_path`).
+
+See [Path Rewriting](/nexus/routing/path-rewriting) for the complete URL construction rules.
+
+---
+
+## Per-Endpoint Policy Override (`policy_override`)
+
+The `policy_override` field on an endpoint is a **partial** policy document. It is **merged** with the revision's inherited policy — it does not replace it. Fields present in `policy_override` take precedence; fields absent continue to inherit from the revision → version → app hierarchy.
+
+This means you can change rate limits for a specific endpoint without re-specifying auth, CORS, IP filter, or any other policy field.
+
+**Example: tighter rate limit on an expensive endpoint**
+
+```json
+{
+  "method": "POST",
+  "path": "/orders/bulk-import",
+  "policy_override": {
+    "rate_limit": {
+      "enabled": true,
+      "requests": 10,
+      "window_seconds": 60
+    }
+  }
+}
+```
+
+**Example: different auth type on an endpoint**
+
+```json
+{
+  "method": "GET",
+  "path": "/orders/public-status",
+  "policy_override": {
+    "auth": {
+      "auth_type": "none",
+      "required": false
+    }
+  }
+}
+```
+
+**Example: additional required headers on a webhook endpoint**
+
+```json
+{
+  "method": "POST",
+  "path": "/orders/webhook",
+  "policy_override": {
+    "headers": {
+      "required": ["x-webhook-signature", "x-webhook-timestamp"]
+    }
+  }
+}
+```
+
+---
+
+## Complete Example: Orders API with Managed Endpoints
+
+### 1. Create the app
+
+```bash
+curl -s -X POST http://localhost:9090/api/v1/apps \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Orders API",
+    "slug": "orders-api",
+    "gateway_path": "/orders",
+    "routing_mode": "managed_endpoint",
+    "default_policy": {
+      "auth": {
+        "auth_type": "api_key",
+        "required": true
+      },
+      "rate_limit": {
+        "enabled": true,
+        "requests": 1000,
+        "window_seconds": 60
+      }
+    }
+  }' | jq
+```
+
+### 2. Create a version and revision
+
+```bash
+APP_ID=<app-uuid>
+
+curl -s -X POST "http://localhost:9090/api/v1/apps/$APP_ID/versions" \
+  -H "Content-Type: application/json" \
+  -d '{"version": "v1", "gateway_path": "/orders/v1"}' | jq
+
+VERSION_ID=<version-uuid>
+
+curl -s -X POST "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "revision": "prod-1",
+    "backend_scheme": "http",
+    "backend_host": "orders-svc",
+    "backend_port": 8080,
+    "backend_base_path": "/",
+    "strip_gateway_path": true
+  }' | jq
+
+REVISION_ID=<revision-uuid>
+```
+
+### 3. Register endpoints
+
+```bash
+BASE="http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID/endpoints"
+
+# List orders — standard rate limit from revision
+curl -s -X POST "$BASE" -H "Content-Type: application/json" \
+  -d '{"method": "GET", "path": "/orders"}' | jq
+
+# Create order — standard rate limit
+curl -s -X POST "$BASE" -H "Content-Type: application/json" \
+  -d '{"method": "POST", "path": "/orders"}' | jq
+
+# Get a single order
+curl -s -X POST "$BASE" -H "Content-Type: application/json" \
+  -d '{"method": "GET", "path": "/orders/detail"}' | jq
+
+# Bulk import — stricter rate limit via policy_override
+curl -s -X POST "$BASE" -H "Content-Type: application/json" \
+  -d '{
+    "method": "POST",
+    "path": "/orders/bulk-import",
+    "backend_path": "/internal/bulk",
+    "policy_override": {
+      "rate_limit": {"enabled": true, "requests": 5, "window_seconds": 60}
+    }
+  }' | jq
+```
+
+### 4. Activate and test
+
+```bash
+curl -s -X POST \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID/activate" \
+  | jq
+
+API_TOKEN=gw_...
+
+# Registered — 200 (proxied to backend)
+curl -s http://localhost:8080/orders/v1/orders \
+  -H "Authorization: Bearer $API_TOKEN" | jq
+
+# Unregistered path — 404
+curl -s http://localhost:8080/orders/v1/unknown \
+  -H "Authorization: Bearer $API_TOKEN" | jq
+
+# Registered path, wrong method — 405
+curl -s -X DELETE http://localhost:8080/orders/v1/orders \
+  -H "Authorization: Bearer $API_TOKEN" | jq
+```
+
+---
+
+## Suitable Use Cases
+
+Managed endpoint mode is the right choice when:
+
+- **You have a strict API contract** that should be enforced at the infrastructure layer (unregistered paths must not reach the backend).
+- **You need per-endpoint rate limits** — e.g., an expensive search endpoint needs a lower limit than a cheap read endpoint.
+- **You need per-endpoint auth** — e.g., one endpoint is public, another requires JWT with a specific scope.
+- **You are building an API gateway for external consumers** and want to make the allowed surface explicit and auditable.
+- **You want path translation** to decouple public API paths from internal service paths.
+
+---
+
+## Related Topics
+
+- [Pass-Through Mode](/nexus/routing/pass-through-mode) — forward all paths without endpoint registration
+- [Path Rewriting](/nexus/routing/path-rewriting) — how `backend_path` and `backend_base_path` interact
+- [Policy Overview](/nexus/policies/overview) — full policy field reference
+- [Per-Token Rate Limiting](/nexus/policies/per-token-rate-limiting) — per-endpoint rate limit configuration
+- [Header Validation](/nexus/policies/header-validation) — per-endpoint required headers

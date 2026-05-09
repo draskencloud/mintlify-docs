@@ -1,24 +1,113 @@
 ---
-title: CORS
-description: Configure Cross-Origin Resource Sharing per app or endpoint.
+title: "CORS"
+description: "Cross-origin resource sharing handled at the policy layer with preflight interception and response headers."
 ---
 
-CORS policy is applied to all responses from the matched revision or endpoint. Configure it via the `cors` field in any policy.
+Cross-Origin Resource Sharing (CORS) allows browsers to make requests from one origin (e.g., `https://app.example.com`) to a different origin (e.g., `https://api.example.com`). The gateway handles CORS at the policy layer, including preflight request handling, without forwarding these requests to your backend.
 
-## Basic Configuration
+---
+
+## Configuration
+
+CORS is configured in the `cors` field of the policy document:
 
 ```json
 {
   "cors": {
-    "allowed_origins": ["https://app.example.com"],
-    "allowed_methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    "allowed_headers": ["Authorization", "Content-Type"],
+    "allowed_origins": ["https://app.example.com", "https://admin.example.com"],
+    "allowed_methods": ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    "allowed_headers": ["Authorization", "Content-Type", "x-request-id", "x-api-version"],
     "max_age_secs": 86400
   }
 }
 ```
 
-## Allow All Origins
+| Field | Type | Description |
+|-------|------|-------------|
+| `allowed_origins` | string[] | Origins permitted to make cross-origin requests. Use `["*"]` to allow all origins. |
+| `allowed_methods` | string[] | HTTP methods allowed in cross-origin requests. |
+| `allowed_headers` | string[] | Request headers clients are allowed to send in cross-origin requests. |
+| `max_age_secs` | integer | How long (in seconds) browsers may cache the preflight response. |
+
+When the `cors` field is absent from the effective policy, CORS headers are not added to any response and all preflight requests return a plain `200` (or are forwarded to the backend in pass-through mode).
+
+---
+
+## Preflight Request Handling
+
+When a browser sends a CORS preflight request (`OPTIONS` method with an `Origin` header), the gateway intercepts it and responds directly — **the backend is never called**.
+
+### Preflight response
+
+```
+Request:
+  OPTIONS /api/v1/resource HTTP/1.1
+  Origin: https://app.example.com
+  Access-Control-Request-Method: POST
+  Access-Control-Request-Headers: authorization, content-type
+
+Response:
+  HTTP/1.1 204 No Content
+  Access-Control-Allow-Origin: https://app.example.com
+  Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS
+  Access-Control-Allow-Headers: Authorization, Content-Type, x-request-id, x-api-version
+  Access-Control-Max-Age: 86400
+  Vary: Origin
+```
+
+The gateway returns `204 No Content` (no body) for successful preflight responses.
+
+---
+
+## Actual Request Handling
+
+For non-preflight cross-origin requests (requests with an `Origin` header that are not `OPTIONS`), the gateway forwards the request to the backend normally and adds CORS response headers to the backend's response before returning it to the client.
+
+```
+Request:
+  GET /api/v1/resource HTTP/1.1
+  Origin: https://app.example.com
+  Authorization: Bearer gw_...
+
+Response (from backend, with CORS headers added by gateway):
+  HTTP/1.1 200 OK
+  Content-Type: application/json
+  Access-Control-Allow-Origin: https://app.example.com
+  Vary: Origin
+  x-request-id: 7f3a2b1c-4d5e-6f7a-8b9c-0d1e2f3a4b5c
+  ...body...
+```
+
+---
+
+## `allowed_origins`
+
+### Specific origins
+
+List each origin exactly (scheme + hostname + port, no trailing slash):
+
+```json
+{
+  "cors": {
+    "allowed_origins": [
+      "https://app.example.com",
+      "https://admin.example.com",
+      "http://localhost:3000"
+    ]
+  }
+}
+```
+
+When the request's `Origin` header matches one of the listed origins exactly, the gateway sets:
+
+```
+Access-Control-Allow-Origin: <matching-origin>
+Vary: Origin
+```
+
+The `Vary: Origin` header is critical for CDN and browser cache correctness — it tells caches that the response varies by origin and prevents a cached CORS-specific response from being served to the wrong origin.
+
+### Wildcard
 
 ```json
 {
@@ -28,48 +117,150 @@ CORS policy is applied to all responses from the matched revision or endpoint. C
 }
 ```
 
-<Warning>
-  Using `["*"]` with credentials is not permitted by the browser CORS spec. Use specific origins when `Authorization` headers are involved.
-</Warning>
+When `allowed_origins` is `["*"]`, the gateway sets:
 
-## Fields
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `allowed_origins` | Yes | List of allowed origins. Use `["*"]` for any origin |
-| `allowed_methods` | No | Allowed HTTP methods. Defaults to all methods if omitted |
-| `allowed_headers` | No | Allowed request headers |
-| `max_age_secs` | No | How long the browser caches the preflight response |
-
-## Apply to an App
-
-```bash
-curl -X POST http://localhost:9090/api/v1/apps \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "My API",
-    "slug": "my-api",
-    "gateway_path": "/my-api",
-    "default_policy": {
-      "cors": {
-        "allowed_origins": ["https://dashboard.example.com", "https://app.example.com"],
-        "allowed_methods": ["GET", "POST", "OPTIONS"],
-        "allowed_headers": ["Authorization", "Content-Type", "X-Request-ID"],
-        "max_age_secs": 3600
-      }
-    }
-  }'
+```
+Access-Control-Allow-Origin: *
 ```
 
-## Override at Endpoint Level
+> **Wildcard CORS and credentials cannot be combined.** Browsers reject responses with `Access-Control-Allow-Origin: *` when the request includes credentials (cookies, `Authorization` header with `credentials: include`). For credentialed requests, list specific origins.
+
+### Origin mismatch
+
+If the request's `Origin` does not match any listed origin (and the list is not `["*"]`), no `Access-Control-Allow-Origin` header is added to the response. The browser will block the response due to CORS policy. No error is returned by the gateway.
+
+---
+
+## `max_age_secs`
+
+Controls how long browsers cache preflight responses:
+
+```json
+{"max_age_secs": 86400}
+```
+
+Sets `Access-Control-Max-Age: 86400` (24 hours) in preflight responses. During this period, the browser does not send a new preflight for the same origin + method + headers combination.
+
+Common values:
+- `600` (10 minutes) — good for development (changes take effect quickly)
+- `3600` (1 hour) — balanced
+- `86400` (24 hours) — maximum practical value (some browsers cap at 7200)
+
+---
+
+## CORS Is Not a Security Feature
+
+CORS is enforced by **browsers**. It does not prevent:
+- Server-to-server requests (curl, Postman, backend services)
+- Mobile app requests
+- Malicious JavaScript running in a browser that bypasses the same-origin policy via its own means
+
+CORS only adds headers that tell compliant browsers whether to allow cross-origin access. All actual security enforcement (auth, rate limiting, IP filtering) must be done regardless of CORS.
+
+> Never rely on CORS alone to protect sensitive endpoints. Always enforce authentication.
+
+---
+
+## Example Policies
+
+### SPA frontend (React, Vue, Angular)
 
 ```json
 {
-  "policy_override": {
-    "cors": {
-      "allowed_origins": ["https://internal-tool.example.com"],
-      "allowed_methods": ["GET"]
-    }
+  "cors": {
+    "allowed_origins": [
+      "https://app.example.com",
+      "https://staging.example.com",
+      "http://localhost:3000"
+    ],
+    "allowed_methods": ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    "allowed_headers": [
+      "Authorization",
+      "Content-Type",
+      "x-request-id",
+      "x-api-version"
+    ],
+    "max_age_secs": 86400
   }
 }
 ```
+
+### Public API (open to all origins)
+
+```json
+{
+  "cors": {
+    "allowed_origins": ["*"],
+    "allowed_methods": ["GET", "HEAD", "OPTIONS"],
+    "allowed_headers": ["Authorization", "Content-Type"],
+    "max_age_secs": 3600
+  }
+}
+```
+
+### Partner API (restricted to specific partner domains)
+
+```json
+{
+  "cors": {
+    "allowed_origins": [
+      "https://partner-a.com",
+      "https://partner-b.io",
+      "https://partner-c.co.uk"
+    ],
+    "allowed_methods": ["GET", "POST"],
+    "allowed_headers": ["Authorization", "Content-Type", "x-partner-id"],
+    "max_age_secs": 7200
+  }
+}
+```
+
+---
+
+## Setting CORS via the Management API
+
+```bash
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "policy": {
+      "cors": {
+        "allowed_origins": ["https://app.example.com"],
+        "allowed_methods": ["GET", "POST", "OPTIONS"],
+        "allowed_headers": ["Authorization", "Content-Type"],
+        "max_age_secs": 86400
+      }
+    }
+  }' | jq
+```
+
+### Test preflight
+
+```bash
+curl -s -X OPTIONS http://localhost:8080/api/v1/resource \
+  -H "Origin: https://app.example.com" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: authorization, content-type" \
+  -v 2>&1 | grep -E "< (HTTP|Access-Control|Vary)"
+```
+
+Expected output:
+
+```
+< HTTP/1.1 204 No Content
+< Access-Control-Allow-Origin: https://app.example.com
+< Access-Control-Allow-Methods: GET, POST, OPTIONS
+< Access-Control-Allow-Headers: Authorization, Content-Type
+< Access-Control-Max-Age: 86400
+< Vary: Origin
+```
+
+---
+
+## Related Topics
+
+- [Policy Overview](/nexus/policies/overview) — full policy field reference and inheritance
+- [Header Validation](/nexus/policies/header-validation) — `response_add` for custom security headers
+- [Allowed Methods](/nexus/policies/allowed-methods) — HTTP method enforcement at the policy layer
+- [Header Filtering](/nexus/routing/header-filtering) — gateway-added response headers

@@ -1,0 +1,230 @@
+---
+title: "Horizontal Scaling"
+description: "Stateless multi-instance gateway with shared Postgres + Redis behind any load balancer; no sticky sessions."
+---
+
+The Nexus API Gateway by Drasken Cloud is designed as a stateless proxy layer. Multiple instances can run behind any standard load balancer — no sticky sessions, no inter-instance coordination protocol.
+
+## Architecture Overview
+
+```
+                        ┌─────────────────────────────────────┐
+                        │         Load Balancer                │
+                        │  (nginx / HAProxy / AWS ALB / etc.)  │
+                        └──────────┬───────┬──────────────────┘
+                                   │       │
+                 ┌─────────────────┘       └───────────────────┐
+                 ▼                                             ▼
+        ┌────────────────┐                          ┌────────────────┐
+        │  Gateway :8080 │                          │  Gateway :8080 │
+        │  Mgmt    :9090 │                          │  Mgmt    :9090 │
+        └────────┬───────┘                          └────────┬───────┘
+                 │                                           │
+        ┌────────▼──────────────────────────────────────────▼───────┐
+        │                      PostgreSQL                             │
+        │           (auth_policies, apps, audit_logs, …)             │
+        └────────────────────────────────────────────────────────────┘
+                 │                                           │
+        ┌────────▼──────────────────────────────────────────▼───────┐
+        │                        Redis                                │
+        │          (rate-limit counters, token cache, response cache) │
+        └────────────────────────────────────────────────────────────┘
+```
+
+## Requirements for Multi-Instance Deployment
+
+### PostgreSQL (Required)
+
+SQLite uses file-level locking and cannot safely serve concurrent writers from separate processes. **SQLite must not be used for multi-instance deployments.** Any attempt to point two gateway instances at the same SQLite file will result in write serialization errors or database corruption.
+
+Switch to PostgreSQL (or CockroachDB):
+
+```bash
+# Build with Postgres support
+cargo build --release --features store-postgres
+
+# Configure all instances identically
+GATEWAY_DB_DRIVER=postgres
+GATEWAY_DATABASE_URL=postgres://gateway:pass@db-primary:5432/gateway
+```
+
+All instances connect to the same Postgres database. Embedded migrations run on startup and are idempotent — only one instance will apply any given migration; the others see it already applied and continue.
+
+### Redis (Required for Consistency)
+
+Redis is required for two categories of shared state:
+
+| State | Without Redis | With Redis |
+|---|---|---|
+| Rate-limit counters | Per-instance (over-permits at N × limit) | Shared; accurate across all instances |
+| Token cache | Per-instance in-process LRU | Shared; consistent token revocation |
+| Response cache | Per-instance in-process map | Shared; avoids redundant upstream calls |
+
+In-process fallbacks exist for all three, but they are per-instance. For example, with N instances and memory-backed rate limiting, a client can send N × `rate_limit_requests` requests per window and bypass the limit.
+
+Enable Redis:
+
+```toml
+[cache]
+enabled  = true
+backend  = "redis"
+
+[cache.redis]
+url            = "redis://redis-primary:6379"
+pool_max_size  = 20
+wait_timeout_ms = 1000
+```
+
+Or via environment variables:
+
+```bash
+GATEWAY_CACHE__ENABLED=true
+GATEWAY_CACHE__BACKEND=redis
+GATEWAY_CACHE__REDIS__URL=redis://redis-primary:6379
+```
+
+## Why SQLite Does Not Work for Multi-Instance
+
+SQLite is a file-based database. Its write serialization is enforced at the OS file-lock level and works correctly only when a single process owns the file. Across two instances on the same host:
+
+- Both processes compete for the write lock; one will fail or block.
+- On network file systems (NFS, EFS) file locking is unreliable and can lead to database corruption.
+- SQLite's WAL mode improves concurrent reads but does not support concurrent writers across process boundaries.
+
+**Use SQLite only for single-instance deployments and local development.**
+
+## Load Balancer Configuration
+
+The gateway is stateless from the load balancer's perspective. Any L4 or L7 load balancer works:
+
+| Load balancer | Notes |
+|---|---|
+| nginx | Use `upstream` block with `least_conn` or `round_robin` |
+| HAProxy | `balance roundrobin` or `balance leastconn` in the backend block |
+| AWS Application Load Balancer | Register gateway EC2 instances or ECS tasks as targets; use HTTP health check on port 9090 |
+| AWS Network Load Balancer | Register instances; use TCP health check on port 8080 |
+| Kubernetes Ingress | Standard `ClusterIP` service; use `readinessProbe` on port 9090 |
+
+**No sticky sessions are required.** All routing state is stored in Postgres and cached in Redis, so any instance can serve any request.
+
+### nginx Example
+
+```nginx
+upstream gateway_proxy {
+    least_conn;
+    server 10.0.0.1:8080;
+    server 10.0.0.2:8080;
+    server 10.0.0.3:8080;
+    keepalive 32;
+}
+
+upstream gateway_mgmt {
+    least_conn;
+    server 10.0.0.1:9090;
+    server 10.0.0.2:9090;
+    server 10.0.0.3:9090;
+}
+
+server {
+    listen 80;
+    location / {
+        proxy_pass         http://gateway_proxy;
+        proxy_http_version 1.1;
+        proxy_set_header   Connection "";
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+    }
+}
+```
+
+### HAProxy Example
+
+```
+backend gateway_proxy
+    balance leastconn
+    option http-server-close
+    option forwardfor
+    server gw1 10.0.0.1:8080 check fall 3 rise 2
+    server gw2 10.0.0.2:8080 check fall 3 rise 2
+    server gw3 10.0.0.3:8080 check fall 3 rise 2
+```
+
+## Health Check Endpoint
+
+Load balancers should probe the management port health endpoint:
+
+```
+GET http://<instance>:9090/api/v1/health
+```
+
+A healthy instance returns HTTP **200** with a JSON body describing the status of the database pool, cache backend, and circuit breakers. An unhealthy instance returns a non-2xx status (503 when degraded) which signals the load balancer to remove it from rotation.
+
+Configure the health check interval conservatively — 10-30 seconds — to avoid overloading the management port under high instance counts.
+
+## Config Consistency
+
+All instances must load the same effective configuration. The recommended approach:
+
+1. Mount the same `config/default.toml` and `config/apps/` directory from shared storage (or bake them into the image).
+2. Pass secrets via environment variables or a secrets manager — never in TOML files committed to the image.
+
+### Hot Config Reload
+
+When `file_watch_enabled = true`, each instance individually watches its mounted `apps_dir` for changes and reloads app TOML files. If the directory is on shared storage (NFS mount, Kubernetes `ConfigMap`), all instances pick up the same changes within `file_watch_debounce_ms` of the file being updated.
+
+Alternatively, trigger reload via the management API on each instance:
+
+```bash
+for host in 10.0.0.1 10.0.0.2 10.0.0.3; do
+  curl -s -X POST \
+    -H "Authorization: Bearer $GATEWAY_ADMIN_TOKEN" \
+    "http://$host:9090/api/v1/config/reload"
+done
+```
+
+## Prometheus Metrics
+
+Each gateway instance maintains its own in-process Prometheus registry. There is no global registry shared between instances — this avoids metric collision and counter duplication at the library level.
+
+Scrape each instance independently with your Prometheus server:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: "gateway"
+    static_configs:
+      - targets:
+          - "10.0.0.1:9090"
+          - "10.0.0.2:9090"
+          - "10.0.0.3:9090"
+    metrics_path: "/api/v1/metrics"
+    scheme: "http"
+```
+
+Aggregate across instances in Grafana using `sum by (job)` or `avg by (job)` as appropriate for each metric type.
+
+## Audit Pipeline
+
+Each gateway instance writes audit events independently to the shared `audit_logs` table in Postgres. There is no deduplication — every instance records only the requests it handled. The audit records include an instance identifier in the metadata so you can filter by instance if needed.
+
+During shutdown, each instance drains its audit pipeline to zero before exiting. See [Graceful Shutdown](/nexus/deployment/graceful-shutdown) for the complete shutdown sequence.
+
+## Rate Limit Accuracy
+
+| Mode | Accuracy | Use case |
+|---|---|---|
+| Redis-backed (`GATEWAY_CACHE__BACKEND=redis`) | Exact — counters shared across all instances | Production multi-instance deployments |
+| Memory-backed (default) | Per-instance — each instance has its own limit window | Single-instance or development only |
+
+With Redis, the distributed INCR + EXPIRE pattern ensures that the aggregate request count across all instances is accurately gated. With the memory fallback each instance independently tracks its own window, so N instances effectively multiply the allowed rate by N.
+
+## Scaling Recommendations
+
+| Deployment size | Database | Cache | Instances |
+|---|---|---|---|
+| Development / single-node | SQLite | memory | 1 |
+| Small production | Postgres | Redis | 2–4 |
+| Medium production | Postgres (primary + read replica) | Redis Sentinel or Cluster | 4–16 |
+| Large / high-availability | CockroachDB or Postgres + PgBouncer | Redis Cluster | 16+ |
+
+All instances in a multi-node deployment should build with `--features store-postgres` and point to the same Postgres primary for write operations.

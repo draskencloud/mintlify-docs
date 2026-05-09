@@ -1,0 +1,180 @@
+---
+title: "Runbooks"
+description: "Step-by-step procedures for common operational tasks."
+---
+
+This page collects step-by-step procedures for common operational tasks. Each runbook is self-contained and links back to the relevant feature documentation.
+
+---
+
+## Roll back a bad Revision
+
+Symptoms: a freshly activated Revision is producing errors, latency, or incorrect responses.
+
+1. Identify the previous good Revision: `GET /api/v1/apps/:app_id/versions/:version_id/revisions`. The previous Revision is still listed; only its `is_current` is `false`.
+2. Reactivate it:
+   ```bash
+   curl -X POST .../revisions/<good_revision_id>/activate \
+     -H "Authorization: Bearer $ADMIN_TOKEN"
+   ```
+3. Traffic immediately shifts to the previous Revision (RuntimeStore updates in-process; multi-replica installs propagate via Redis pub/sub or polling interval).
+4. (Optional) Set `traffic_weight: 0` on the bad Revision so it does not receive any canary traffic in the meantime, then investigate.
+
+---
+
+## Canary a new Revision
+
+1. Create the new Revision with a low `traffic_weight`:
+   ```bash
+   curl -X POST .../revisions \
+     -d '{
+       "revision": "rev-2",
+       "backend_host": "payments-v2.internal",
+       "traffic_weight": 5
+     }'
+   ```
+2. Activate it (`is_current = true`). Both Revisions are now eligible for traffic; the new one receives ~5%.
+3. Monitor the canary. The metrics `gateway_proxy_requests_total{revision="rev-2"}` and `gateway_proxy_request_duration_seconds_bucket{revision="rev-2"}` are labelled per Revision.
+4. Increase the weight in steps:
+   ```bash
+   curl -X PATCH .../revisions/<rev-2> -d '{"traffic_weight": 25}'
+   curl -X PATCH .../revisions/<rev-2> -d '{"traffic_weight": 50}'
+   curl -X PATCH .../revisions/<rev-2> -d '{"traffic_weight": 100}'
+   ```
+5. Once at 100%, set the old Revision's `traffic_weight: 0` and eventually delete it.
+
+**See also:** [Canary Deployments](/nexus/concepts/canary-deployments).
+
+---
+
+## Rotate a leaked API token
+
+A token's raw value has been logged, committed, or otherwise exposed.
+
+1. **Revoke immediately** to invalidate it across all caches:
+   ```bash
+   curl -X DELETE .../tokens/<token_id> \
+     -H "Authorization: Bearer $ADMIN_TOKEN"
+   ```
+2. Issue a replacement (`POST .../tokens`); store the new `raw_value` in your secret manager (Vault, AWS Secrets Manager, k8s Secret, etc.).
+3. Update the consumer to use the new token; verify success.
+4. **Audit usage** of the leaked token: query the audit log for usage between leak time and revocation time.
+5. Document in the security incident log.
+
+---
+
+## Rotate the admin token
+
+The bootstrap token grants full management API access — treat it like a root password.
+
+1. Set a new admin token in the deployment environment alongside the old one (the gateway accepts both during overlap if you stage carefully).
+2. Update all operator tooling (CI scripts, dashboards, kubectl secrets) to use the new token.
+3. Restart the gateway with only the new `GATEWAY_SERVER__ADMIN_TOKEN` set.
+4. Confirm operations still succeed.
+5. Audit log: the rotation itself is recorded as a deployment event.
+
+The admin token cannot be rotated through the management API — it must be set in the environment.
+
+---
+
+## Drain and retire a Version
+
+Migrate clients off `v1` toward `v2` cleanly.
+
+1. Mark `v1` as `deprecated`:
+   ```bash
+   curl -X PATCH .../versions/<v1_id> -d '{"status": "deprecated"}'
+   ```
+   Clients now receive a `Deprecation: true` response header — a signal to migrate.
+2. (Optional) Set a `Sunset` date in the future via configuration.
+3. Monitor traffic on `v1` over time; outreach to remaining clients.
+4. When traffic is acceptably low, retire it:
+   ```bash
+   curl -X PATCH .../versions/<v1_id> -d '{"status": "retired"}'
+   ```
+   All `v1` traffic now receives `404`.
+5. After a quarantine period, delete the Version and its Revisions/Endpoints.
+
+---
+
+## Recover a stuck open circuit breaker
+
+The breaker auto-recovers via the configured recovery timeout, but you can force it.
+
+1. Confirm the backend is actually healthy: `curl <backend>/<health_check_path>`.
+2. Toggle the Revision off and on:
+   ```bash
+   curl -X PATCH .../revisions/<id> -d '{"is_active": false}'
+   curl -X PATCH .../revisions/<id> -d '{"is_active": true}'
+   ```
+   This resets the circuit breaker state.
+3. Monitor `gateway_circuit_breaker_state{revision="..."}` in Prometheus.
+
+---
+
+## Recover from a bad config reload
+
+A `POST /api/v1/config/reload` returned `422` and the new file is invalid.
+
+The previous in-memory config is still active. To recover:
+
+1. Identify what failed: the `422` body's `message` field names the failing field.
+2. Fix the file on disk.
+3. Either:
+   - `POST /api/v1/config/reload` (re-reads and applies), or
+   - Revert the file from version control and reload.
+
+If the gateway was restarted during this window with a bad file, it would have failed to start. In that case fix the file, then start.
+
+---
+
+## Migrate from SQLite to PostgreSQL
+
+1. Stand up the gateway in a staging environment with `GATEWAY_DATABASE__DRIVER=postgres` and a fresh database. Confirm migrations run cleanly.
+2. Export current state from the SQLite-backed environment via the management API:
+   ```bash
+   curl http://localhost:9090/api/v1/apps -H "Authorization: Bearer $TOKEN" > apps.json
+   # repeat for versions, revisions, endpoints, tokens
+   ```
+3. Replay onto the Postgres-backed instance via `POST` to the same endpoints.
+4. Cut over: stop the SQLite instance, point clients to the Postgres instance.
+
+There is no automatic backend migration tool. The management API is the canonical state interface.
+
+---
+
+## Restore from backup
+
+For SQLite:
+
+1. Stop the gateway.
+2. Restore the database file from backup (it sits at `GATEWAY_DATABASE__SQLITE_PATH`, default `data/gateway.db`).
+3. Start the gateway.
+
+For PostgreSQL: standard `pg_restore` against a fresh database, then point `GATEWAY_DATABASE__POSTGRES__URL` at it.
+
+Audit logs from the backup will be visible immediately. Activity between the backup snapshot and the recovery point is unrecoverable.
+
+---
+
+## Investigate a suspicious management API call
+
+The audit pipeline records every management mutation.
+
+1. Tail or query the audit log destination (file path or HTTP endpoint, depending on configuration).
+2. Filter by `actor` (the admin token identity), `action` (e.g. `app.create`, `token.revoke`), and time window.
+3. The log includes the full request and response payloads.
+
+**See also:** [Audit Logs](/nexus/observability/audit-logs).
+
+---
+
+## Plan a zero-downtime upgrade
+
+1. Run two replicas behind a load balancer. Both connect to the same database (and Redis if configured).
+2. Drain replica A (`SIGTERM`); the load balancer marks it unhealthy via the `/api/v1/health` readiness probe. Graceful shutdown waits for in-flight requests to finish.
+3. Replace replica A's image / binary and start it; it warms RuntimeStore from the database and rejoins the pool.
+4. Repeat for replica B.
+5. Migrations run automatically on startup. Migrations must be backwards-compatible with the previous version's runtime — Nexus follows the expand–migrate–contract pattern; check the changelog before each upgrade.
+
+**See also:** [Graceful Shutdown](/nexus/deployment/graceful-shutdown), [Horizontal Scaling](/nexus/deployment/horizontal-scaling).

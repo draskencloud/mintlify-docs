@@ -1,0 +1,344 @@
+---
+title: "Policy Overview"
+description: "The central policy document: auth, rate limit, IP filter, headers, CORS, cache, body limit, and timeout, inherited per level."
+---
+
+The **policy document** is the central configuration object in the Nexus API Gateway by Drasken Cloud. It controls authentication, rate limiting, IP filtering, header enforcement, CORS, caching, body size limits, timeouts, and allowed methods. A policy can be attached at every level of the API hierarchy and is inherited downward with fine-grained overrides at any level.
+
+---
+
+## What Is a Policy?
+
+A policy is a JSONB document stored alongside each API object. When a request arrives, the gateway assembles the effective policy for that request by merging policies from the most general (app) to the most specific (endpoint) level. The merged result is the policy that the middleware stack enforces.
+
+Policies are evaluated at **request time** — not at write time. You can add new policy fields to the schema and they take effect immediately on the next request without database migrations or service restarts.
+
+---
+
+## Where Policies Are Stored
+
+| Level | Object | Column |
+|-------|--------|--------|
+| App | `apps` | `default_policy` (JSONB) |
+| Version | `app_versions` | `policy` (JSONB) |
+| Revision | `app_revisions` | `policy` (JSONB) |
+| Endpoint | `endpoints` | `policy_override` (JSONB) |
+
+The App-level policy is named `default_policy` to make its role explicit — it is the baseline that all children inherit from.
+
+---
+
+## Policy Inheritance and Merging
+
+The gateway applies a **per-field override** merge across the four levels:
+
+```
+App.default_policy
+       │
+       ▼  (overridden by fields present in Version.policy)
+Version.policy
+       │
+       ▼  (overridden by fields present in Revision.policy)
+Revision.policy
+       │
+       ▼  (overridden by fields present in Endpoint.policy_override)
+Endpoint.policy_override
+       │
+       ▼
+Effective policy for this request
+```
+
+Rules:
+- **Absent fields inherit** from the parent level — you never need to repeat unchanged fields.
+- **Explicitly set fields win** over inherited values — the most specific level takes precedence.
+- **Merging is per-top-level field** — setting `rate_limit` at the endpoint level replaces the entire `rate_limit` object from the revision, not just individual sub-fields.
+- A field explicitly set to `null` at a child level clears the inherited value.
+
+### Example
+
+App policy:
+```json
+{"auth": {"auth_type": "api_key", "required": true}, "rate_limit": {"enabled": true, "requests": 1000, "window_seconds": 60}}
+```
+
+Revision policy:
+```json
+{"rate_limit": {"enabled": true, "requests": 500, "window_seconds": 60}}
+```
+
+Endpoint policy_override:
+```json
+{"auth": {"auth_type": "none", "required": false}}
+```
+
+Effective policy for a request to this endpoint:
+```json
+{
+  "auth": {"auth_type": "none", "required": false},
+  "rate_limit": {"enabled": true, "requests": 500, "window_seconds": 60}
+}
+```
+
+The revision's `rate_limit` overrode the app's; the endpoint's `auth` overrode the revision's inherited auth.
+
+---
+
+## Policy Fields Reference
+
+The following top-level fields are defined in the policy schema:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `auth` | `AuthPolicy` | Authentication configuration (type, required, JWT options, etc.) |
+| `rate_limit` | `RateLimitPolicy` | Per-token rate limiting (enabled, requests, window, algorithm) |
+| `allowed_methods` | `string[]` | HTTP methods allowed; others return `405` |
+| `required_scopes` | `string[]` | Token scopes required to access this resource |
+| `headers` | `HeadersPolicy` | Required headers, validation rules, inject/add/remove rules |
+| `cors` | `CorsPolicy` | CORS configuration (origins, methods, headers, max_age) |
+| `ip_filter` | `IpFilterPolicy` | CIDR allowlist or denylist |
+| `path_denylist` | `string[]` | Path prefixes rejected with `403` (pass-through mode only) |
+| `cache` | `CachePolicy` | Response caching configuration |
+| `max_body_bytes` | `integer` | Per-request body size limit in bytes |
+| `timeout_ms` | `integer` | Upstream response timeout in milliseconds |
+
+---
+
+## AuthPolicy
+
+Controls how requests are authenticated:
+
+```json
+{
+  "auth": {
+    "auth_type": "jwt",
+    "required": true,
+    "jwt_secret": "shared-secret",
+    "jwt_algorithm": "HS256",
+    "jwks_url": null,
+    "jwks_refresh_interval_secs": 3600,
+    "forward_claims_as_headers": {
+      "sub": "x-user-id",
+      "email": "x-user-email"
+    },
+    "backend_mtls_profile": null
+  }
+}
+```
+
+| Sub-field | Values | Description |
+|-----------|--------|-------------|
+| `auth_type` | `api_key` \| `jwt` \| `basic` \| `none` | Authentication method |
+| `required` | `true` \| `false` | If `false`, missing credentials are allowed (anonymous access) |
+| `jwt_algorithm` | `HS256` \| `RS256` \| `RS384` \| `RS512` \| `ES256` \| `ES384` | JWT signing algorithm |
+| `jwks_url` | URL string | JWKS endpoint for RS/ES algorithms; keys refreshed in background |
+| `jwks_refresh_interval_secs` | integer | How often to refresh JWKS keys (default `3600`) |
+| `forward_claims_as_headers` | object | Map of JWT claim name → forwarded header name |
+| `backend_mtls_profile` | string | Named mTLS client certificate profile for backend connections |
+
+---
+
+## RateLimitPolicy
+
+Controls per-token rate limiting (runs after auth):
+
+```json
+{
+  "rate_limit": {
+    "enabled": true,
+    "requests": 1000,
+    "window_seconds": 60,
+    "algorithm": "sliding_window"
+  }
+}
+```
+
+| Sub-field | Values | Description |
+|-----------|--------|-------------|
+| `enabled` | `true` \| `false` | Enable/disable rate limiting |
+| `requests` | integer | Maximum requests allowed per window |
+| `window_seconds` | integer | Duration of the rate limit window |
+| `algorithm` | `fixed_window` \| `sliding_window` \| `token_bucket` | Rate limiting algorithm (default `fixed_window`) |
+
+---
+
+## HeadersPolicy
+
+```json
+{
+  "headers": {
+    "required": ["x-api-version", "x-request-source"],
+    "validate": {
+      "x-api-version": {"oneof": ["v1", "v2"]},
+      "x-request-source": {"regex": "^[a-z-]+$"}
+    },
+    "add": {"x-gateway-env": "production"},
+    "remove": ["x-internal-debug"],
+    "response_add": {"x-frame-options": "DENY"},
+    "response_remove": ["x-powered-by"],
+    "inject": [
+      {"source": "metadata.tenant_id", "target": "x-tenant-id", "fallback": "default"}
+    ]
+  }
+}
+```
+
+---
+
+## CorsPolicy
+
+```json
+{
+  "cors": {
+    "allowed_origins": ["https://app.example.com", "https://admin.example.com"],
+    "allowed_methods": ["GET", "POST", "OPTIONS"],
+    "allowed_headers": ["Authorization", "Content-Type", "x-request-id"],
+    "max_age_secs": 86400
+  }
+}
+```
+
+---
+
+## IpFilterPolicy
+
+```json
+{
+  "ip_filter": {
+    "mode": "allow",
+    "cidrs": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+  }
+}
+```
+
+---
+
+## Minimal Policy Example
+
+The smallest useful policy — API key auth with a rate limit:
+
+```json
+{
+  "auth": {
+    "auth_type": "api_key",
+    "required": true
+  },
+  "rate_limit": {
+    "enabled": true,
+    "requests": 1000,
+    "window_seconds": 60
+  }
+}
+```
+
+---
+
+## Full Enterprise Policy Example
+
+```json
+{
+  "auth": {
+    "auth_type": "jwt",
+    "required": true,
+    "jwt_algorithm": "RS256",
+    "jwks_url": "https://auth.example.com/.well-known/jwks.json",
+    "jwks_refresh_interval_secs": 3600,
+    "forward_claims_as_headers": {
+      "sub": "x-user-id",
+      "org_id": "x-org-id",
+      "plan": "x-plan"
+    }
+  },
+  "rate_limit": {
+    "enabled": true,
+    "requests": 5000,
+    "window_seconds": 60,
+    "algorithm": "sliding_window"
+  },
+  "required_scopes": ["api:read", "api:write"],
+  "allowed_methods": ["GET", "POST", "PATCH", "DELETE"],
+  "headers": {
+    "required": ["x-api-version"],
+    "validate": {
+      "x-api-version": {"oneof": ["v1", "v2"]}
+    },
+    "add": {"x-gateway-env": "production"},
+    "remove": ["x-internal-debug", "x-forwarded-for-original"],
+    "response_add": {
+      "strict-transport-security": "max-age=31536000; includeSubDomains",
+      "x-frame-options": "DENY",
+      "x-content-type-options": "nosniff"
+    },
+    "response_remove": ["x-powered-by", "server"]
+  },
+  "cors": {
+    "allowed_origins": ["https://app.example.com"],
+    "allowed_methods": ["GET", "POST", "OPTIONS"],
+    "allowed_headers": ["Authorization", "Content-Type"],
+    "max_age_secs": 86400
+  },
+  "ip_filter": {
+    "mode": "allow",
+    "cidrs": ["10.0.0.0/8", "203.0.113.0/24"]
+  },
+  "max_body_bytes": 5242880,
+  "timeout_ms": 5000
+}
+```
+
+---
+
+## Applying Policies via the Management API
+
+Policies are submitted as part of app, version, revision, and endpoint creation or update calls.
+
+### Set app-level default policy
+
+```bash
+curl -s -X PATCH "http://localhost:9090/api/v1/apps/$APP_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "default_policy": {
+      "auth": {"auth_type": "api_key", "required": true},
+      "rate_limit": {"enabled": true, "requests": 1000, "window_seconds": 60}
+    }
+  }' | jq
+```
+
+### Set revision-level policy (overrides app)
+
+```bash
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "policy": {
+      "rate_limit": {"enabled": true, "requests": 500, "window_seconds": 60}
+    }
+  }' | jq
+```
+
+### Set endpoint-level policy override
+
+```bash
+curl -s -X PATCH \
+  "http://localhost:9090/api/v1/apps/$APP_ID/versions/$VERSION_ID/revisions/$REVISION_ID/endpoints/$ENDPOINT_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "policy_override": {
+      "auth": {"auth_type": "none", "required": false}
+    }
+  }' | jq
+```
+
+---
+
+## Related Topics
+
+- [IP Rate Limiting](/nexus/policies/ip-rate-limiting) — pre-auth per-IP rate limiting (not in policy document; set in server config)
+- [Per-Token Rate Limiting](/nexus/policies/per-token-rate-limiting) — `rate_limit` policy field
+- [IP Filtering](/nexus/policies/ip-filtering) — `ip_filter` policy field
+- [Header Validation](/nexus/policies/header-validation) — `headers` policy field
+- [Body Size Limit](/nexus/policies/body-size-limit) — `max_body_bytes` policy field
+- [Timeout](/nexus/policies/timeout) — `timeout_ms` policy field
+- [CORS](/nexus/policies/cors) — `cors` policy field
+- [Allowed Methods](/nexus/policies/allowed-methods) — `allowed_methods` policy field

@@ -1,48 +1,219 @@
 ---
-title: Authentication Overview
-description: How Nexus authenticates incoming requests.
+title: "Authentication Overview"
+description: "Per-policy auth configuration, middleware position, AuthIdentity, scope enforcement, and unauthenticated pass-through."
 ---
 
-Nexus supports three authentication types, configured per app via the `default_policy.auth` field.
+Nexus API Gateway by Drasken Cloud enforces authentication at the policy level. Every request that enters the proxy port (`:8080`) passes through the authentication middleware before it reaches a backend. This document explains how authentication is configured, where it sits in the middleware stack, what it produces, and how access control is enforced downstream.
 
-## Auth Types
+---
 
-| Type | Description |
-|------|-------------|
-| `api_key` | Validates a bearer token against stored API keys |
-| `jwt` | Validates a signed JWT — supports HS256, RS256, and JWKS |
-| `basic` | HTTP Basic auth against stored credentials |
-| `none` | No authentication required |
+## Table of Contents
 
-## Policy Inheritance
+- [Policy-Level Configuration](#policy-level-configuration)
+- [AuthPolicy Reference](#authpolicy-reference)
+- [Middleware Stack Position](#middleware-stack-position)
+- [What Auth Produces: AuthIdentity](#what-auth-produces-authidentity)
+- [Scope Enforcement](#scope-enforcement)
+- [Unauthenticated Pass-Through (`required = false`)](#unauthenticated-pass-through-required--false)
+- [Auth Methods Summary](#auth-methods-summary)
 
-Auth policy is resolved in this order, with more specific levels overriding broader ones:
+---
+
+## Policy-Level Configuration
+
+Authentication is not a global on/off switch. It is configured per **policy**, and policies are attached at any level of the App → Version → Revision → Endpoint hierarchy. The most specific policy wins.
 
 ```
-App → Version → Revision → Endpoint
+App
+└── Version
+    └── Revision          ← policy here applies to all endpoints in this revision
+        └── Endpoint      ← policy here overrides the revision-level policy for this path
 ```
 
-If an endpoint has no auth policy, it inherits from the revision, which inherits from the app.
+This means you can:
 
-## Requiring Auth
+- Require JWT auth for an entire revision, but disable auth for a single public health-check endpoint.
+- Use API key auth for most endpoints but require JWT with specific claims for an admin endpoint.
+- Allow unauthenticated read traffic while requiring write auth only for `POST`/`PUT`/`DELETE` endpoints.
 
-By default `required: true` — unauthenticated requests return `401`. Set `required: false` to allow anonymous access while still extracting identity when a token is present.
+---
 
-## Forwarding Claims as Headers
+## AuthPolicy Reference
 
-JWT claims can be forwarded to the backend as request headers:
+The `AuthPolicy` object is embedded in the policy JSONB column. All fields are optional; omitting a field inherits from the parent level.
+
+| Field | Type | Description |
+|---|---|---|
+| `auth_type` | `"api_key"` \| `"jwt"` \| `"basic"` \| `"none"` | Selects the authentication backend. Required when auth is enabled. |
+| `required` | `bool` | If `true` (default), unauthenticated requests receive `401`. If `false`, unauthenticated requests are allowed through with a generic identity. |
+| `jwt_secret_env` | `string` | **HS256 only.** Name of the environment variable that holds the plaintext JWT secret. The secret is never placed in the config file. |
+| `jwt_public_key_env` | `string` | **RS256/RS384/RS512/ES256/ES384.** Name of the environment variable containing the PEM-encoded public key. |
+| `jwks_url` | `string` | **RS256/RS384/RS512/ES256/ES384.** URL of a JWKS endpoint. Used instead of `jwt_public_key_env` when keys are served remotely (e.g., Auth0, Keycloak). |
+| `issuer` | `string` | Expected `iss` claim. If set, the gateway validates that the token's `iss` matches exactly. |
+| `audience` | `string` | Expected `aud` claim. If set, the gateway validates that the token's `aud` contains this value. |
+| `required_claims` | `string[]` | List of claim names that must be present in the JWT payload. Any missing claim results in `401`. |
+| `forward_claims_as_headers` | `map<string, string>` | Maps JWT claim names to request header names. Matching claims are forwarded to the backend as HTTP headers after successful validation. |
+| `backend_mtls_profile` | `string` | Name of the mTLS profile to use when connecting to the backend after auth. Profiles are configured via environment variables at startup. |
+
+### Example Policy (JSON)
 
 ```json
 {
-  "auth": {
-    "auth_type": "jwt",
-    "forward_claims_as_headers": {
-      "sub": "X-User-Id",
-      "email": "X-User-Email",
-      "role": "X-User-Role"
-    }
+  "auth_type": "jwt",
+  "required": true,
+  "jwks_url": "https://auth.example.com/.well-known/jwks.json",
+  "issuer": "https://auth.example.com/",
+  "audience": "my-api",
+  "required_claims": ["sub", "org_id"],
+  "forward_claims_as_headers": {
+    "sub": "X-User-Id",
+    "org_id": "X-Org-Id"
   }
 }
 ```
 
-The backend receives these headers on every authenticated request.
+---
+
+## Middleware Stack Position
+
+The full Tower middleware stack, from outermost to innermost, is:
+
+```
+IpRateLimitLayer
+  → TraceLayer
+    → AuthLayer              ← authentication happens here
+      → RateLimitLayer       ← token-based rate limiting uses AuthIdentity
+        → HeaderValidationLayer
+          → IpFilterLayer
+            → BodyLimitLayer
+              → TimeoutLayer
+                → CorsLayer
+                  → LoggerLayer
+                    → ProxyEngine
+```
+
+**Before auth:**
+
+- `IpRateLimitLayer` — enforces IP-level request rate limits. Runs before auth so that unauthenticated flood attacks are dropped cheaply before credential validation.
+- `TraceLayer` — attaches a trace context (request ID, span) to every request, regardless of auth outcome.
+
+**Auth layer responsibilities:**
+
+1. Extract the credential from the request (Bearer token, JWT, Basic header).
+2. Validate the credential against the configured `auth_type`.
+3. Produce an `AuthIdentity` on success.
+4. Return `401 Unauthorized` or `403 Forbidden` on failure.
+5. Attach `AuthIdentity` to request extensions so downstream layers and the proxy engine can read it.
+
+**After auth:**
+
+- `RateLimitLayer` — uses `AuthIdentity.token_id` (or username for basic auth) as the rate limit key, enabling per-token quota enforcement.
+- All other middleware and the proxy engine assume a valid `AuthIdentity` is present when `required = true`.
+
+---
+
+## What Auth Produces: AuthIdentity
+
+On successful authentication, the auth layer produces an `AuthIdentity` struct and attaches it to the request extensions:
+
+```rust
+pub struct AuthIdentity {
+    /// ID of the app this credential belongs to.
+    pub app_id: Uuid,
+
+    /// For API key and JWT auth: the token's database ID.
+    /// For basic auth: the credential's database ID.
+    /// None when required = false and no credential was presented.
+    pub token_id: Option<Uuid>,
+
+    /// For basic auth: the authenticated username.
+    pub username: Option<String>,
+
+    /// Scopes granted by this credential.
+    pub scopes: Vec<String>,
+}
+```
+
+The proxy engine uses `AuthIdentity` to:
+
+- Log the `token_id` in the audit log for every proxied request.
+- Enforce scope rules before forwarding.
+- Pass `token_id` as the rate limit key.
+
+---
+
+## Scope Enforcement
+
+After authentication succeeds, the gateway enforces **method-based scope rules**:
+
+| HTTP Method | Required Scope |
+|---|---|
+| `GET` | `proxy:read` |
+| `HEAD` | `proxy:read` |
+| `OPTIONS` | `proxy:read` |
+| `POST` | `proxy:write` |
+| `PUT` | `proxy:write` |
+| `PATCH` | `proxy:write` |
+| `DELETE` | `proxy:write` |
+
+If the authenticated credential does not carry the required scope, the gateway returns:
+
+```http
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{"status":403,"message":"insufficient scope","data":null}
+```
+
+**JWT scope extraction:** For JWT auth, scopes are read from a configurable claim (default: `scope` or `scopes`). The claim value may be a space-delimited string or a JSON array.
+
+**Override with `required_scopes`:** A policy may set `required_scopes` to an explicit list. An empty array (`[]`) disables scope enforcement entirely for that policy level — useful for endpoints where any authenticated caller is acceptable regardless of scope.
+
+---
+
+## Unauthenticated Pass-Through (`required = false`)
+
+Setting `required = false` in an `AuthPolicy` allows requests with no credential (or an invalid credential) to proceed:
+
+```json
+{
+  "auth_type": "api_key",
+  "required": false
+}
+```
+
+When a request arrives without a credential and `required = false`:
+
+- The gateway does **not** attempt credential validation.
+- A **generic `AuthIdentity`** is produced with no `token_id`, no `username`, and an empty `scopes` array.
+- The request proceeds through the rest of the middleware stack and is forwarded to the backend.
+- Scope enforcement is also relaxed: if `AuthIdentity.scopes` is empty and `required = false`, the 403 scope check is skipped.
+
+When a credential **is** presented but fails validation, and `required = false`:
+
+- The gateway still returns `401`. A malformed or expired credential is always rejected; `required = false` only permits the absence of any credential.
+
+**Use cases for `required = false`:**
+
+- Public read APIs where anonymous access is allowed but authenticated users get additional capabilities.
+- Gradual auth rollout: enable `required = false` first to measure traffic before enforcing auth.
+- Webhook receivers where the caller is identified by payload signature rather than HTTP auth.
+
+---
+
+## Auth Methods Summary
+
+| Method | Header | Credential Storage | Caching | Best For |
+|---|---|---|---|---|
+| `api_key` | `Authorization: Bearer <token>` | SHA-256 hash in PostgreSQL | Redis with configurable TTL | Machine-to-machine, third-party integrations |
+| `jwt` | `Authorization: Bearer <jwt>` | Not stored (stateless) | JWKS key set only; no per-token cache | User-facing APIs, federated identity providers |
+| `basic` | `Authorization: Basic <base64>` | bcrypt hash in PostgreSQL | Redis with configurable TTL | Legacy clients, simple service-to-service |
+| `none` | — | — | — | Public endpoints, internal health checks |
+
+See the individual auth method pages for full configuration and validation details:
+
+- [API Key Tokens](/nexus/auth/api-key-tokens)
+- [JWT Authentication](/nexus/auth/jwt)
+- [HTTP Basic Authentication](/nexus/auth/basic-auth)
+- [Scopes and Access Control](/nexus/auth/scopes)
+- [Token Lifecycle](/nexus/auth/token-lifecycle)

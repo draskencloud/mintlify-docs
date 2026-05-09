@@ -1,0 +1,177 @@
+---
+title: "License Tiers"
+description: "Community/Pro/Enterprise tiers with offline JWT validation; tier-gated features return 402 when blocked."
+---
+
+Nexus API Gateway by Drasken Cloud uses a tiered licensing model to gate advanced features. The Community tier is the default and requires no license file.
+
+## Tier Overview
+
+| Tier | Intended use | License required |
+|---|---|---|
+| **Community** | Development, small deployments, evaluation | None — default |
+| **Pro** | Production deployments with advanced caching, mTLS, and observability | License file or inline key |
+| **Enterprise** | Large-scale, compliance-driven, or multi-tenant deployments | License file or inline key |
+
+All core proxy, authentication, and routing functionality is available in the Community tier. Tier-gated features return `402 Payment Required` when accessed without the required license.
+
+## Configuring the License
+
+### Option 1 — Inline License Key (Recommended for Cloud/Container)
+
+Set the license key as an environment variable. The gateway reads it from the variable named by `license_key_env` (default: `GATEWAY_LICENSE_KEY`):
+
+```bash
+export GATEWAY_LICENSE_KEY=your-license-key-here
+```
+
+### Option 2 — License File
+
+Provide the path to the license file:
+
+```bash
+export GATEWAY_LICENSE_FILE=/etc/gateway/license.lic
+```
+
+Or in TOML:
+
+```toml
+# At the top level (legacy key)
+license_file = "/etc/gateway/license.lic"
+
+# Or in the [license] section (preferred)
+[license]
+license_file = "/etc/gateway/license.lic"
+```
+
+### Priority
+
+When both the license file and inline key are provided, the gateway uses whichever is found first according to the configured validator. If neither is found the tier defaults to **Community**.
+
+## License Configuration Reference
+
+```toml
+[license]
+# Validator strategy: none | offline_jwt | online_api | dual
+validator = "offline_jwt"
+
+# Path to the license file on disk
+# license_file = "/etc/gateway/license.lic"   # env: GATEWAY_LICENSE_FILE
+                                               # (also: GATEWAY_LICENSE__LICENSE_FILE)
+
+# Name of the environment variable that holds the inline license key.
+# The variable *named* here contains the actual key value, not the key itself.
+license_key_env = "GATEWAY_LICENSE_KEY"        # env: GATEWAY_LICENSE__LICENSE_KEY_ENV
+
+# URL for online validation (required when validator = "online_api" or "dual")
+# online_api_url = "https://license.example.com/validate"
+```
+
+### Validator Strategies
+
+| Strategy | Description |
+|---|---|
+| `none` | No license validation. All features behave as Community tier regardless of any license file. |
+| `offline_jwt` | Default. Reads the license file or inline key and validates a signed JWT locally. No network call required. Falls back to Community tier if neither is found. |
+| `online_api` | Validates the license key against a remote API on startup and at configured intervals. Requires network access to `online_api_url`. |
+| `dual` | Attempts offline JWT validation first; falls back to online API if local validation fails. |
+
+## Environment Variables
+
+| Variable | Description |
+|---|---|
+| `GATEWAY_LICENSE_FILE` | Path to the license file. Equivalent to `license_file` top-level key or `[license].license_file`. |
+| `GATEWAY_LICENSE_KEY` | Inline license key value. The variable name here is the default; it is configurable via `license_key_env`. |
+| `GATEWAY_LICENSE__VALIDATOR` | Override the validator strategy at runtime. |
+| `GATEWAY_LICENSE__ONLINE_API_URL` | Override the online validation URL at runtime. |
+
+## Tier-Gated Features
+
+Features that require a Pro or Enterprise license return `402 Payment Required` when called without the required tier. The response body follows the standard error envelope with additional fields identifying the feature and required tier:
+
+```json
+{
+  "status": 402,
+  "message": "feature requires Pro license or higher",
+  "data": null
+}
+```
+
+> **Note:** The exact body format for feature-gate violations is:
+> `{"feature": "<name>", "current_tier": "<tier>", "required_tier": "<tier>", "upgrade_url": "<url>"}`
+> wrapped in the standard `{"status": 402, "message": "...", "data": ...}` envelope.
+
+### Feature Gate Matrix
+
+| Feature | Community | Pro | Enterprise |
+|---|---|---|---|
+| Reverse proxy (all auth modes) | Yes | Yes | Yes |
+| JWT / API key authentication | Yes | Yes | Yes |
+| Path routing and rate limiting | Yes | Yes | Yes |
+| Response caching (Redis backend) | No | Yes | Yes |
+| mTLS to backend services | No | Yes | Yes |
+| OTLP / OpenTelemetry export | No | Yes | Yes |
+| Audit pipeline (Postgres) | Yes | Yes | Yes |
+| Advanced analytics forwarding | Limited | Yes | Yes |
+| Enterprise SSO integrations | No | No | Yes |
+
+> The exact feature gate list is authoritative in the source and may expand. Consult the management API at `GET /api/v1/license` for the current tier and a live list of gated features.
+
+## Metrics
+
+The gateway exposes two Prometheus metrics related to license enforcement:
+
+| Metric | Type | Description |
+|---|---|---|
+| `gateway_license_tier_info{tier}` | Gauge | Set to `1` for the currently active tier, `0` for all others. Labels: `community`, `pro`, `enterprise`. |
+| `gateway_feature_gate_blocks_total{feature, tier}` | Counter | Incremented each time a tier-gated feature access is blocked. Labels: `feature` (feature name), `tier` (required tier). |
+
+### Querying Active Tier (Prometheus/PromQL)
+
+```promql
+# Which tier is active?
+gateway_license_tier_info == 1
+
+# Rate of feature-gate blocks in the last 5 minutes
+rate(gateway_feature_gate_blocks_total[5m])
+
+# Most blocked features
+topk(5, sum by (feature) (rate(gateway_feature_gate_blocks_total[5m])))
+```
+
+## Checking License Status
+
+```bash
+curl -H "Authorization: Bearer $GATEWAY_ADMIN_TOKEN" \
+  http://localhost:9090/api/v1/license
+```
+
+Example response:
+
+```json
+{
+  "tier": "community",
+  "validator": "offline_jwt",
+  "expires_at": null,
+  "features_gated": ["response_cache_redis", "backend_mtls", "otlp_export"]
+}
+```
+
+## Community Tier Guidance
+
+The Community tier is fully supported for:
+
+- Local development and integration testing
+- Single-instance production deployments with SQLite
+- Deployments that do not require Redis-backed caching, backend mTLS, or OTLP export
+
+Core capabilities included in Community:
+
+- Full reverse-proxy with configurable upstream routing
+- JWT authentication (HS256, RS256, JWKS URL)
+- API key authentication (hashed, with per-app policies)
+- Rate limiting (memory-backed per-instance)
+- Circuit breaker and retry middleware
+- Audit pipeline to Postgres
+- Management API (health, config, metrics, Swagger UI)
+- Analytics and log forwarding (file / stdout forwarders)
