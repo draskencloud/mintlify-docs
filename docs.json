@@ -8,6 +8,7 @@
     "dark": "#4F46E5"
   },
   "favicon": "/favicon.svg",
+  "openapi": "openapi.json",
   "navigation": {
     "tabs": [
       {
@@ -89,22 +90,59 @@
           {
             "group": "Apps",
             "pages": [
-              "nexus/api-reference/apps",
-              "nexus/api-reference/tokens"
+              "nexus/api-reference/list-apps",
+              "nexus/api-reference/create-app",
+              "nexus/api-reference/get-app",
+              "nexus/api-reference/update-app",
+              "nexus/api-reference/delete-app"
             ]
           },
           {
-            "group": "Versions & Revisions",
+            "group": "Tokens",
             "pages": [
-              "nexus/api-reference/versions",
-              "nexus/api-reference/revisions",
-              "nexus/api-reference/endpoints"
+              "nexus/api-reference/list-tokens",
+              "nexus/api-reference/issue-token",
+              "nexus/api-reference/revoke-token"
+            ]
+          },
+          {
+            "group": "Versions",
+            "pages": [
+              "nexus/api-reference/list-versions",
+              "nexus/api-reference/create-version",
+              "nexus/api-reference/get-version",
+              "nexus/api-reference/update-version",
+              "nexus/api-reference/delete-version"
+            ]
+          },
+          {
+            "group": "Revisions",
+            "pages": [
+              "nexus/api-reference/list-revisions",
+              "nexus/api-reference/create-revision",
+              "nexus/api-reference/get-revision",
+              "nexus/api-reference/update-revision",
+              "nexus/api-reference/delete-revision",
+              "nexus/api-reference/activate-revision"
+            ]
+          },
+          {
+            "group": "Endpoints",
+            "pages": [
+              "nexus/api-reference/list-endpoints",
+              "nexus/api-reference/create-endpoint",
+              "nexus/api-reference/get-endpoint",
+              "nexus/api-reference/update-endpoint",
+              "nexus/api-reference/delete-endpoint"
             ]
           },
           {
             "group": "System",
             "pages": [
-              "nexus/api-reference/system"
+              "nexus/api-reference/health-check",
+              "nexus/api-reference/version-info",
+              "nexus/api-reference/get-config",
+              "nexus/api-reference/reload-config"
             ]
           }
         ]
