@@ -7,11 +7,18 @@ The management API runs on port `9090` and is used to configure apps, tokens, en
 
 ## Base URL
 
-```
-http://localhost:9090/api/v1
-```
+Each operation page on this reference has a **server selector** at the top of the request panel. Pick one of the presets or choose **Custom** to enter your own host:
 
-In production, access it via port-forward — it should never be exposed publicly.
+| Server | When to use |
+|--------|-------------|
+| `http://localhost:9090` | Local development; or via `kubectl port-forward svc/nexus 9090:9090` |
+| `{scheme}://{host}` (Custom) | Any other deployment — set `scheme` (`http` / `https`) and `host` (e.g. `nexus.internal.acme.com`) |
+
+The selected server is used for all **Try It** requests on that page. Your selection persists across pages within the session.
+
+<Note>
+The management API runs on port `9090` and should never be exposed to the public internet. Reach it through a VPN, jump host, internal load balancer, or `kubectl port-forward`.
+</Note>
 
 ## Authentication
 
