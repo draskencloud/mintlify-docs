@@ -53,7 +53,10 @@ http://localhost:9090/swagger-ui/
 | `POST` | `/api/v1/apps/{id}/versions/{vid}/revisions` | Create a revision |
 | `GET` | `/api/v1/apps/{id}/versions/{vid}/revisions` | List revisions |
 | `POST` | `/api/v1/apps/{id}/versions/{vid}/revisions/{rid}/activate` | Activate a revision |
-| `DELETE` | `/api/v1/apps/{id}/versions/{vid}/revisions/{rid}` | Returns 405 — revisions are immutable |
+| `GET` | `/api/v1/apps/{id}/versions/{vid}/endpoints` | List endpoints (current revision) |
+| `POST` | `/api/v1/apps/{id}/versions/{vid}/endpoints` | Create endpoint (current revision) |
+| `PATCH` | `/api/v1/apps/{id}/versions/{vid}/endpoints/{eid}` | Update an endpoint |
+| `DELETE` | `/api/v1/apps/{id}/versions/{vid}/endpoints/{eid}` | Delete an endpoint |
 | `GET` | `/api/v1/apps/{id}/tokens` | List API tokens |
 | `POST` | `/api/v1/apps/{id}/tokens` | Issue an API token |
 | `DELETE` | `/api/v1/apps/{id}/tokens/{tid}` | Revoke a token |

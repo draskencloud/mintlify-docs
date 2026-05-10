@@ -1,4 +1,6 @@
 ---
 title: "List Endpoints"
-openapi: "GET /api/v1/apps/{app_id}/versions/{version_id}/revisions/{revision_id}/endpoints"
+openapi: "GET /api/v1/apps/{app_id}/versions/{version_id}/endpoints"
 ---
+
+Returns the endpoint rules for the **current** (active) revision of the version. When a new revision is activated the list will reflect that revision's rules.

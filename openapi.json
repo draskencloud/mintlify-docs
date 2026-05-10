@@ -575,58 +575,6 @@
           }
         }
       },
-      "delete": {
-        "tags": [
-          "Revisions"
-        ],
-        "operationId": "delete_revision",
-        "parameters": [
-          {
-            "name": "app_id",
-            "in": "path",
-            "description": "App ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "version_id",
-            "in": "path",
-            "description": "Version ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "revision_id",
-            "in": "path",
-            "description": "Revision ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "responses": {
-          "405": {
-            "description": "Method Not Allowed \u2014 revisions are immutable and cannot be deleted.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BaseResponse"
-                }
-              }
-            }
-          }
-        },
-        "summary": "Delete Revision (not allowed)",
-        "description": "Revisions are append-only and cannot be deleted. This endpoint always returns 405. To stop routing traffic, activate a different revision via POST \u2026/activate."
-      },
       "patch": {
         "tags": [
           "Revisions"
@@ -743,325 +691,6 @@
           },
           "404": {
             "description": "Revision not found"
-          }
-        }
-      }
-    },
-    "/api/v1/apps/{app_id}/versions/{version_id}/revisions/{revision_id}/endpoints": {
-      "get": {
-        "tags": [
-          "Endpoints"
-        ],
-        "operationId": "list_endpoints",
-        "parameters": [
-          {
-            "name": "app_id",
-            "in": "path",
-            "description": "App ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "version_id",
-            "in": "path",
-            "description": "Version ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "revision_id",
-            "in": "path",
-            "description": "Revision ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "List of endpoints",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BaseResponse"
-                }
-              }
-            }
-          }
-        }
-      },
-      "post": {
-        "tags": [
-          "Endpoints"
-        ],
-        "operationId": "create_endpoint",
-        "parameters": [
-          {
-            "name": "app_id",
-            "in": "path",
-            "description": "App ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "version_id",
-            "in": "path",
-            "description": "Version ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "revision_id",
-            "in": "path",
-            "description": "Revision ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CreateEndpoint"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "description": "Endpoint created",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BaseResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Revision not found"
-          },
-          "409": {
-            "description": "Method+path combination already exists"
-          }
-        }
-      }
-    },
-    "/api/v1/apps/{app_id}/versions/{version_id}/revisions/{revision_id}/endpoints/{endpoint_id}": {
-      "get": {
-        "tags": [
-          "Endpoints"
-        ],
-        "operationId": "get_endpoint",
-        "parameters": [
-          {
-            "name": "app_id",
-            "in": "path",
-            "description": "App ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "version_id",
-            "in": "path",
-            "description": "Version ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "revision_id",
-            "in": "path",
-            "description": "Revision ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "endpoint_id",
-            "in": "path",
-            "description": "Endpoint ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Endpoint found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BaseResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Endpoint not found"
-          }
-        }
-      },
-      "delete": {
-        "tags": [
-          "Endpoints"
-        ],
-        "operationId": "delete_endpoint",
-        "parameters": [
-          {
-            "name": "app_id",
-            "in": "path",
-            "description": "App ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "version_id",
-            "in": "path",
-            "description": "Version ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "revision_id",
-            "in": "path",
-            "description": "Revision ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "endpoint_id",
-            "in": "path",
-            "description": "Endpoint ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Endpoint deleted",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BaseResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Endpoint not found"
-          }
-        }
-      },
-      "patch": {
-        "tags": [
-          "Endpoints"
-        ],
-        "operationId": "update_endpoint",
-        "parameters": [
-          {
-            "name": "app_id",
-            "in": "path",
-            "description": "App ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "version_id",
-            "in": "path",
-            "description": "Version ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "revision_id",
-            "in": "path",
-            "description": "Revision ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "endpoint_id",
-            "in": "path",
-            "description": "Endpoint ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UpdateEndpoint"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Endpoint updated",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BaseResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Endpoint not found"
           }
         }
       }
@@ -1285,6 +914,285 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/api/v1/apps/{app_id}/versions/{version_id}/endpoints": {
+      "post": {
+        "tags": [
+          "Endpoints"
+        ],
+        "summary": "Create Endpoint",
+        "description": "Create an endpoint rule on the **current** (active) revision of the version. Returns 404 when the version has no active revision.",
+        "operationId": "create_endpoint",
+        "parameters": [
+          {
+            "name": "app_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "App ID"
+          },
+          {
+            "name": "version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Version ID"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateEndpoint"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Endpoint created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BaseResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Version not found or no active revision"
+          },
+          "409": {
+            "description": "Method+path combination already exists on this revision"
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Endpoints"
+        ],
+        "summary": "List Endpoints",
+        "description": "List all endpoint rules on the **current** revision of the version.",
+        "operationId": "list_endpoints",
+        "parameters": [
+          {
+            "name": "app_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "App ID"
+          },
+          {
+            "name": "version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Version ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Endpoint list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BaseResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Version not found or no active revision"
+          }
+        }
+      }
+    },
+    "/api/v1/apps/{app_id}/versions/{version_id}/endpoints/{endpoint_id}": {
+      "get": {
+        "tags": [
+          "Endpoints"
+        ],
+        "summary": "Get Endpoint",
+        "operationId": "get_endpoint",
+        "parameters": [
+          {
+            "name": "app_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "App ID"
+          },
+          {
+            "name": "version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Version ID"
+          },
+          {
+            "name": "endpoint_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Endpoint ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Endpoint found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BaseResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Endpoint not found"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Endpoints"
+        ],
+        "summary": "Update Endpoint",
+        "operationId": "update_endpoint",
+        "parameters": [
+          {
+            "name": "app_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "App ID"
+          },
+          {
+            "name": "version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Version ID"
+          },
+          {
+            "name": "endpoint_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Endpoint ID"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateEndpoint"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Endpoint updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BaseResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Endpoint not found"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Endpoints"
+        ],
+        "summary": "Delete Endpoint",
+        "operationId": "delete_endpoint",
+        "parameters": [
+          {
+            "name": "app_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "App ID"
+          },
+          {
+            "name": "version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Version ID"
+          },
+          {
+            "name": "endpoint_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Endpoint ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Endpoint deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BaseResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Endpoint not found"
           }
         }
       }

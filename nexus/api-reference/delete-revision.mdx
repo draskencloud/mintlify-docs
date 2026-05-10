@@ -1,16 +1,20 @@
 ---
 title: "Delete Revision"
-openapi: "DELETE /api/v1/apps/{app_id}/versions/{version_id}/revisions/{revision_id}"
+description: "Revisions are append-only — this operation is intentionally not supported."
 ---
 
 <Warning>
-Revisions are **append-only** and cannot be deleted. This endpoint always returns `405 Method Not Allowed`.
+The **DELETE /revisions/:id** route has been removed. Revisions are append-only; deleting a revision is not supported by design.
 </Warning>
+
+## Why revisions cannot be deleted
+
+Each revision stores a complete snapshot of the backend configuration at a point in time. The history lets you audit changes and roll back instantly — deleting rows would destroy that audit trail.
 
 ## Alternatives
 
 | Goal | Action |
 |------|--------|
 | Stop routing traffic to a revision | [Activate](/nexus/api-reference/activate-revision) a different revision for the same version |
-| Roll back to a previous backend | Activate the previous revision — its configuration is preserved as a full snapshot |
-| Remove a revision entirely | Not supported by design; the history is intentional |
+| Roll back to a previous backend | Activate the previous revision — its full config snapshot is preserved |
+| Clean up a version entirely | [Delete the version](/nexus/api-reference/delete-version) — this cascades to all its revisions |
