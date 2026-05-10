@@ -44,11 +44,19 @@ http://localhost:9090/swagger-ui/
 | `GET` | `/api/v1/version` | Version and build info |
 | `GET` | `/api/v1/apps` | List all apps |
 | `POST` | `/api/v1/apps` | Create an app |
-| `PATCH` | `/api/v1/apps/{slug}` | Update an app |
-| `DELETE` | `/api/v1/apps/{slug}` | Delete an app |
-| `GET` | `/api/v1/apps/{slug}/tokens` | List API tokens |
-| `POST` | `/api/v1/apps/{slug}/tokens` | Create an API token |
-| `DELETE` | `/api/v1/apps/{slug}/tokens/{id}` | Revoke a token |
+| `PATCH` | `/api/v1/apps/{id}` | Update an app |
+| `DELETE` | `/api/v1/apps/{id}` | Delete an app |
+| `POST` | `/api/v1/apps/{id}/versions` | Create a version (optionally auto-creates rev-1) |
+| `GET` | `/api/v1/apps/{id}/versions` | List versions |
+| `PATCH` | `/api/v1/apps/{id}/versions/{vid}` | Update a version |
+| `DELETE` | `/api/v1/apps/{id}/versions/{vid}` | Delete a version |
+| `POST` | `/api/v1/apps/{id}/versions/{vid}/revisions` | Create a revision |
+| `GET` | `/api/v1/apps/{id}/versions/{vid}/revisions` | List revisions |
+| `POST` | `/api/v1/apps/{id}/versions/{vid}/revisions/{rid}/activate` | Activate a revision |
+| `DELETE` | `/api/v1/apps/{id}/versions/{vid}/revisions/{rid}` | Returns 405 — revisions are immutable |
+| `GET` | `/api/v1/apps/{id}/tokens` | List API tokens |
+| `POST` | `/api/v1/apps/{id}/tokens` | Issue an API token |
+| `DELETE` | `/api/v1/apps/{id}/tokens/{tid}` | Revoke a token |
 | `GET` | `/api/v1/metrics` | Prometheus metrics |
 | `GET` | `/api/v1/config` | Get runtime config |
-| `PATCH` | `/api/v1/config` | Update runtime config |
+| `POST` | `/api/v1/config/reload` | Reload config (Pro tier) |

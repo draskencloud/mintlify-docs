@@ -2,3 +2,32 @@
 title: "Create Version"
 openapi: "POST /api/v1/apps/{app_id}/versions"
 ---
+
+## Auto-creating rev-1
+
+Supply any of the optional backend fields (`backend_host`, `backend_scheme`, `backend_port`, `backend_base_path`, `strip_gateway_path`, `health_check_path`, `traffic_weight`) to have the gateway automatically create and activate **rev-1** in the same request.
+
+When `backend_host` is present the response body contains both objects:
+
+```json
+{
+  "status": 201,
+  "message": "created",
+  "data": {
+    "version": { ... },
+    "initial_revision": { ... }
+  }
+}
+```
+
+When `backend_host` is omitted, `data.initial_revision` is `null` — revisions must be created separately via [Create Revision](/nexus/api-reference/create-revision).
+
+## Field defaults (auto-revision)
+
+| Field | Default |
+|-------|---------|
+| `backend_scheme` | `"https"` |
+| `backend_port` | `443` |
+| `backend_base_path` | `"/"` |
+| `strip_gateway_path` | `true` |
+| `traffic_weight` | `100` |

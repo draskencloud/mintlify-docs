@@ -2,3 +2,15 @@
 title: "Delete Revision"
 openapi: "DELETE /api/v1/apps/{app_id}/versions/{version_id}/revisions/{revision_id}"
 ---
+
+<Warning>
+Revisions are **append-only** and cannot be deleted. This endpoint always returns `405 Method Not Allowed`.
+</Warning>
+
+## Alternatives
+
+| Goal | Action |
+|------|--------|
+| Stop routing traffic to a revision | [Activate](/nexus/api-reference/activate-revision) a different revision for the same version |
+| Roll back to a previous backend | Activate the previous revision — its configuration is preserved as a full snapshot |
+| Remove a revision entirely | Not supported by design; the history is intentional |
