@@ -105,7 +105,7 @@ Required request headers and validation rules. Enforced before forwarding.
 | `from_token_metadata` | string[] | Token metadata keys to forward as headers |
 | `from_jwt_claims` | `object<string,string>` | Map of JWT claim name → header name |
 
-See [Header Validation](/nexus/policies/header-validation), [Header Injection](/nexus/policies/header-injection).
+See [Header Validation](/nexus/policies/header-validation).
 
 ---
 
@@ -173,7 +173,7 @@ Per-policy response cache override. Caches successful upstream responses for `tt
 | `vary_headers` | string[] | Request headers that vary the cache key |
 | `cache_status_codes` | integer[] | HTTP status codes eligible for caching |
 
-See [Cache Configuration](/nexus/configuration/cache), [Response Caching](/nexus/policies/response-caching) (consumer guide).
+See [Cache Configuration](/nexus/configuration/cache).
 
 ---
 
