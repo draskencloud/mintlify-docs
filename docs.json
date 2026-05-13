@@ -175,6 +175,9 @@
             "pages": [
               "nexus/api-reference/list-tokens",
               "nexus/api-reference/issue-token",
+              "nexus/api-reference/get-token",
+              "nexus/api-reference/patch-token",
+              "nexus/api-reference/rotate-token",
               "nexus/api-reference/revoke-token"
             ]
           },

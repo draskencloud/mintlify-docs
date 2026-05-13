@@ -122,19 +122,19 @@ Full bucket:  client can burst 100 requests instantly, then wait
 
 ## Rate Limit Key
 
-Rate limits are tracked per token per revision (or per app if no token is present):
+Rate limits are tracked per authenticated token (or per app when no token is present):
 
 ```
-rate_limit:<revision_id>:<token_id>
+tok:<token_id>
 ```
 
 Examples:
 ```
-rate_limit:b2c3d4e5-...-0001:c3d4e5f6-...-0001
-rate_limit:b2c3d4e5-...-0001:anonymous
+tok:c3d4e5f6-5717-4562-b3fc-2c963f66afa6
+tok:1e4d6f8a-9b2c-4e7f-a012-3456789abcde
 ```
 
-Revisions are used as the scope (not versions or apps) so that rate limits are isolated between revisions. A client using the same token against two different revisions gets two independent counters.
+The counter is global across all revisions for that token. Each token gets a single bucket regardless of which revision or endpoint is matched.
 
 ---
 
@@ -196,6 +196,87 @@ Endpoint `POST /orders/bulk-import` policy_override:
 Effective limits:
 - `GET /orders` → 500 requests/min (revision overrides app)
 - `POST /orders/bulk-import` → 10 requests/min (endpoint overrides revision)
+
+---
+
+## Per-Token Rate Limit Override
+
+Individual API tokens can carry their own `rate_limit_policy` that **overrides the revision and endpoint policy hierarchy** for that specific token. This lets you give a partner integration a higher quota, or clamp a trial token to a lower quota, without touching the shared policy.
+
+### Priority order
+
+```
+Token rate_limit_policy  ← highest priority (wins if set)
+        │
+Endpoint policy_override
+        │
+Revision policy
+        │
+Global default           ← lowest priority
+```
+
+### Setting an override at issuance
+
+```bash
+curl -X POST http://localhost:9090/api/v1/apps/{app_id}/tokens \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "partner-integration",
+    "scopes": ["proxy:read", "proxy:write"],
+    "rate_limit_policy": {
+      "enabled": true,
+      "requests": 5000,
+      "window_seconds": 60,
+      "algorithm": "token_bucket"
+    }
+  }'
+```
+
+### Adding or changing an override on an existing token
+
+```bash
+curl -X PATCH http://localhost:9090/api/v1/apps/{app_id}/tokens/{token_id} \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "rate_limit_policy": {
+      "enabled": true,
+      "requests": 200,
+      "window_seconds": 60,
+      "algorithm": "sliding_window"
+    }
+  }'
+```
+
+The change takes effect on the next request from that token. If the token is cached in Redis, the stale cache entry will be evicted within `token_cache_ttl_secs` (default: 300 seconds). To force immediate enforcement, [rotate the token](/nexus/auth/token-lifecycle#rotating-a-token) — the new token record inherits the override, and the cache entry for the old hash is deleted immediately.
+
+### Clearing an override
+
+Omit the `rate_limit_policy` field from a PATCH (or set it to `null`) to fall back to the revision/endpoint policy:
+
+```bash
+curl -X PATCH http://localhost:9090/api/v1/apps/{app_id}/tokens/{token_id} \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+### Tier ceiling still applies
+
+The per-token override is still subject to the plan-level RPS ceiling:
+
+| Tier | Max sustained RPS |
+|------|-------------------|
+| Community | 100 req/s |
+| Pro | 5 000 req/s |
+| Enterprise | Unlimited |
+
+If a token override specifies `requests: 1000, window_seconds: 1` on a Community plan, the effective limit is clamped to 100 req/s.
+
+### Rotation preserves the override
+
+When you rotate a token, the new token record inherits the old token's `rate_limit_policy`. No manual update is needed after rotation.
 
 ---
 
@@ -268,3 +349,5 @@ curl -s -X PATCH \
 - [IP Rate Limiting](/nexus/policies/ip-rate-limiting) — pre-auth per-IP protection (not in policy document)
 - [Policy Overview](/nexus/policies/overview) — full policy field reference and inheritance rules
 - [Routing Overview](/nexus/routing/overview) — middleware stack execution order
+- [Token Lifecycle](/nexus/auth/token-lifecycle) — issuing, patching, rotating, and revoking tokens
+- [Update Token](/nexus/api-reference/patch-token) — PATCH endpoint for setting `rate_limit_policy` on a token

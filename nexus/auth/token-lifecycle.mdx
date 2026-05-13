@@ -16,6 +16,8 @@ This document covers the complete lifecycle of an API key token from issuance th
 - [Token Expiry](#token-expiry)
 - [Listing Tokens](#listing-tokens)
 - [Updating a Token](#updating-a-token)
+- [Enabling and Disabling a Token](#enabling-and-disabling-a-token)
+- [Per-Token Rate Limit Override](#per-token-rate-limit-override)
 - [Revoking a Token](#revoking-a-token)
 - [Rotating a Token](#rotating-a-token)
 - [Cache Invalidation on Revocation](#cache-invalidation-on-revocation)
@@ -53,6 +55,11 @@ curl -X POST http://localhost:9090/api/v1/apps/{app_id}/tokens \
       "service": "billing",
       "environment": "production",
       "owner": "platform-team"
+    },
+    "rate_limit_policy": {
+      "enabled": true,
+      "requests": 500,
+      "window_seconds": 60
     }
   }'
 ```
@@ -70,10 +77,16 @@ curl -X POST http://localhost:9090/api/v1/apps/{app_id}/tokens \
     "token": "pK3mXvQj8oLnR2sYwC5eFtBdNhA0uZGq7IyMxVD1JcP4kHWOlSbgE6TiUjFr",
     "scopes": ["proxy:read", "proxy:write"],
     "expires_at": "2027-01-01T00:00:00Z",
+    "is_active": true,
     "metadata": {
       "service": "billing",
       "environment": "production",
       "owner": "platform-team"
+    },
+    "rate_limit_policy": {
+      "enabled": true,
+      "requests": 500,
+      "window_seconds": 60
     },
     "revoked_at": null,
     "created_at": "2026-05-09T12:00:00Z"
@@ -95,8 +108,10 @@ curl -X POST http://localhost:9090/api/v1/apps/{app_id}/tokens \
 | `token` | string | **Issuance only.** The raw 64-character base64url token value. Never returned again after issuance. |
 | `scopes` | string[] | The scopes granted. Valid values: `proxy:read`, `proxy:write`. |
 | `expires_at` | ISO 8601 datetime \| null | When the token expires. Null means the token does not expire (use with caution). |
+| `is_active` | boolean | Whether the token is enabled. `false` disables the token without permanently revoking it — it can be re-enabled via PATCH. |
 | `metadata` | map\<string, string\> | Arbitrary key-value pairs. Each entry is injected as a header to the backend on successful auth. |
-| `revoked_at` | ISO 8601 datetime \| null | Set when the token is revoked. Null means the token is active. |
+| `rate_limit_policy` | `RateLimitPolicy` \| null | Optional per-token rate limit override. When set, takes precedence over the revision/endpoint policy. See [Per-Token Rate Limit Override](#per-token-rate-limit-override). |
+| `revoked_at` | ISO 8601 datetime \| null | Set when the token is revoked. Null means the token has not been permanently revoked. |
 | `created_at` | ISO 8601 datetime | When the token was created. |
 
 ---
@@ -173,7 +188,7 @@ The `token` field (raw value) is **never included** in list or get responses. On
 
 ## Updating a Token
 
-You can update a token's `name` or `expires_at` without reissuing it:
+You can update several token fields in-place via `PATCH`:
 
 ```bash
 curl -X PATCH http://localhost:9090/api/v1/apps/{app_id}/tokens/{token_id} \
@@ -181,20 +196,80 @@ curl -X PATCH http://localhost:9090/api/v1/apps/{app_id}/tokens/{token_id} \
   -H "Content-Type: application/json" \
   -d '{
     "name": "billing-service-prod-v2",
-    "expires_at": "2028-01-01T00:00:00Z"
+    "scopes": ["proxy:read"],
+    "is_active": false
   }'
 ```
 
-**What can be updated:**
+**What can be patched:**
 
-| Field | Updatable | Notes |
-|---|---|---|
-| `name` | Yes | Human label only; no auth effect |
-| `expires_at` | Yes | Can extend or shorten expiry |
-| `scopes` | No | Rotate the token to change scopes |
-| `metadata` | No | Rotate the token to change metadata |
+| Field | Patchable | Cache effect | Notes |
+|---|---|---|---|
+| `name` | Yes | None | Human label; no auth effect |
+| `scopes` | Yes | Immediate | Cache entry invalidated on update |
+| `metadata` | Yes | Immediate | Cache entry invalidated on update |
+| `is_active` | Yes | Immediate | Cache entry invalidated on update |
+| `rate_limit_policy` | Yes | Immediate | Cache entry invalidated on update |
 
-Updating `expires_at` does **not** invalidate the Redis cache. The updated expiry takes effect at the next cache miss (i.e., within `token_cache_ttl_secs` seconds). If immediate enforcement is needed — for example, shortening expiry to revoke in seconds — use the revocation endpoint instead.
+> **Scope, metadata, `is_active`, and `rate_limit_policy` changes take effect immediately** — the gateway invalidates the Redis cache entry as part of the PATCH call, so the next request sees the updated values.
+
+Updating `name` alone does **not** touch the cache (it has no auth effect).
+
+---
+
+## Enabling and Disabling a Token
+
+You can temporarily disable a token without permanently revoking it. Disabled tokens are rejected at auth time with `401 Unauthorized`. They can be re-enabled at any time.
+
+**Disable a token:**
+
+```bash
+curl -X PATCH http://localhost:9090/api/v1/apps/{app_id}/tokens/{token_id} \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"is_active": false}'
+```
+
+**Re-enable a token:**
+
+```bash
+curl -X PATCH http://localhost:9090/api/v1/apps/{app_id}/tokens/{token_id} \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"is_active": true}'
+```
+
+The cache entry is invalidated immediately on both calls, so the change takes effect on the next request. Use this for:
+
+- Temporarily suspending a customer's access without losing token history.
+- Maintenance windows where a service should stop making outbound calls.
+- Soft-disabling a token under investigation before deciding whether to revoke it permanently.
+
+---
+
+## Per-Token Rate Limit Override
+
+Individual tokens can carry a `rate_limit_policy` that overrides the revision/endpoint rate limit for that specific key:
+
+```bash
+curl -X PATCH http://localhost:9090/api/v1/apps/{app_id}/tokens/{token_id} \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "rate_limit_policy": {
+      "enabled": true,
+      "requests": 5000,
+      "window_seconds": 60,
+      "algorithm": "token_bucket"
+    }
+  }'
+```
+
+The token-level policy wins over the endpoint and revision policies. All other policy fields (CORS, headers, auth, etc.) continue to come from the revision/endpoint hierarchy. The override is also preserved when the token is rotated.
+
+To clear the override and fall back to the revision/endpoint policy, send `{}` or omit `rate_limit_policy` from the PATCH body.
+
+See [Per-Token Rate Limiting](/nexus/policies/per-token-rate-limiting#per-token-rate-limit-override) for the full reference.
 
 ---
 
