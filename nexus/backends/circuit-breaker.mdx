@@ -200,9 +200,9 @@ circuit_breaker_timeout_secs = 30 # try recovery after 30s
 
 | Scenario | Recommended threshold |
 |----------|-----------------------|
-| High-traffic API (>100 RPS per revision) | 10–20 |
+| High-traffic API (more than 100 RPS per revision) | 10–20 |
 | Moderate-traffic API (10–100 RPS) | 5–10 |
-| Low-traffic API (<10 RPS) | 3–5 |
+| Low-traffic API (less than 10 RPS) | 3–5 |
 | Critical service where fast isolation is essential | 3 |
 
 Lower thresholds open the circuit faster (better protection, more false positives). Higher thresholds require more failures before isolation (fewer false positives, slower protection).
@@ -211,7 +211,7 @@ Lower thresholds open the circuit faster (better protection, more false positive
 
 | Scenario | Recommended cooldown |
 |----------|---------------------|
-| Backend restarts quickly (container restart: <10s) | 15–30s |
+| Backend restarts quickly (container restart: less than 10s) | 15–30s |
 | Backend restarts slowly (database recovery: 60s+) | 60–120s |
 | Backend has unpredictable recovery time | 30–60s (probe frequently) |
 
